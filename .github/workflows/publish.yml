@@ -469,9 +469,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # Required to call the GitHub Models inference API with GITHUB_TOKEN.
-      models: read
       pull-requests: read
+      # Required by claude-code-action for OIDC token exchange.
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -489,23 +489,66 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      # Ask an LLM (via GitHub's free Models inference endpoint, authenticated
-      # with GITHUB_TOKEN) to turn commit messages + PR descriptions since the
-      # previous tag into structured, customer-facing release notes. The model
-      # is forced to return its answer through an `emit_release_notes` tool
-      # call so we get validated JSON rather than free-form prose.
-      - name: Generate release notes (LLM)
-        id: notes
+      # Release notes are generated in three steps: collect the commit range and
+      # PR descriptions in code, have Claude classify which changes are
+      # user-visible, then render the markdown in code. See
+      # .github/release-notes-prompt.md for the classification rules.
+      #
+      # The first two steps are continue-on-error so a note-generation problem
+      # degrades to a plain git log rather than blocking a release that has
+      # already been published to crates.io, PyPI, and npm by this point.
+      - name: Collect commit and PR context
+        id: context
+        continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          node .github/scripts/release-notes.mjs context "${{ steps.version.outputs.tag }}" \
+            > release-notes-context.txt
+
+      - name: Classify changes with Claude
+        id: classify
+        if: steps.context.outcome == 'success'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--allowedTools "Read,Write" --model claude-opus-5'
+          prompt: |
+            Read `.github/release-notes-prompt.md` and follow it exactly.
+
+            The release being documented is `${{ steps.version.outputs.tag }}`.
+            The commit and PR context is in `release-notes-context.txt`.
+
+            Write the resulting JSON to `release-notes-entries.json` in the
+            repository root. Write nothing else.
+
+      - name: Render release notes
+        id: notes
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
           TAG="${{ steps.version.outputs.tag }}"
           NOTES_FILE="$RUNNER_TEMP/release_notes.md"
-          if ! node .github/scripts/generate-release-notes.mjs "$TAG" > "$NOTES_FILE"; then
-            echo "LLM release-note generation failed; falling back to plain git log." >&2
+          rendered=0
+          if [ -s release-notes-entries.json ]; then
+            echo "----- entries -----"
+            cat release-notes-entries.json
+            echo "-------------------"
+            if node .github/scripts/release-notes.mjs render "$TAG" \
+                 --entries release-notes-entries.json > "$NOTES_FILE"; then
+              rendered=1
+            else
+              echo "::warning::Rendering the generated entries failed." >&2
+            fi
+          else
+            echo "::warning::No release-notes-entries.json was produced." >&2
+          fi
+          if [ "$rendered" -eq 0 ]; then
+            echo "::warning::Falling back to a plain git log for ${TAG}'s notes. Re-run the 'Update release notes' workflow to replace them." >&2
             PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1 || true)
             {
               echo "## What's Changed"

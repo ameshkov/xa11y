@@ -18,3 +18,8 @@ docs/site/src/content/docs/api/javascript.mdx
 # the per-directory cargo entries in .github/dependabot.yml. Leaving them
 # unpinned previously let an incompatible transitive release (alloc-no-stdlib
 # 3.0.0 via brotli) break CI on every PR.
+
+# Scratch files written by the release-note workflows (.github/workflows/
+# publish.yml and update-release-notes.yml) into the checkout root.
+/release-notes-context.txt
+/release-notes-entries.json

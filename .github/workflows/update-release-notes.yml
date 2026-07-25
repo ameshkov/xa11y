@@ -1,23 +1,19 @@
 name: Update release notes
 
-# Re-run the LLM release-note generator against an existing tag and
-# overwrite that release's notes. Useful when the generator failed during
-# the publish workflow (e.g. GitHub Models 403/429) and the release got
-# created with the plain git-log fallback.
+# Re-run the release-note generator against an existing tag and overwrite that
+# release's notes. Useful when the notes that shipped with a release turned out
+# to be wrong or thin, or when the generator failed during the publish workflow
+# and the release got created with the plain git-log fallback.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag of the release to update (e.g. v0.7.0)"
+        description: "Tag of the release to update (e.g. v0.12.0)"
         required: true
         type: string
       since:
         description: "Override the previous tag for the diff range (optional)"
-        required: false
-        type: string
-      model:
-        description: "Override the LLM model slug (e.g. openai/gpt-4o)"
         required: false
         type: string
       dry_run:
@@ -32,8 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      models: read
       pull-requests: read
+      # Required by claude-code-action for OIDC token exchange.
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,25 +52,65 @@ jobs:
             exit 1
           fi
 
-      - name: Generate release notes (LLM)
-        id: notes
+      # Deterministic half: walk the commit range and enrich each commit with
+      # its PR description. No model involved, so a bad range or a missing PR
+      # fails here rather than silently thinning the notes.
+      - name: Collect commit and PR context
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          MODEL_ID: ${{ inputs.model }}
         run: |
           set -euo pipefail
-          NOTES_FILE="$RUNNER_TEMP/release_notes.md"
-          ARGS=("${{ inputs.tag }}")
+          ARGS=(context "${{ inputs.tag }}")
           if [ -n "${{ inputs.since }}" ]; then
             ARGS+=(--since "${{ inputs.since }}")
           fi
-          # No git-log fallback here on purpose: this workflow exists to
-          # *fix* a bad release, so a silent fallback to the same plain
-          # log we are trying to replace would defeat the point. Fail
-          # loudly instead and let the operator re-run after diagnosing.
-          node .github/scripts/generate-release-notes.mjs "${ARGS[@]}" > "$NOTES_FILE"
+          node .github/scripts/release-notes.mjs "${ARGS[@]}" \
+            > release-notes-context.txt
+          echo "----- context document -----"
+          cat release-notes-context.txt
+          echo "----------------------------"
+
+      # Classification half. Claude reads the context document and decides
+      # which changes are user-visible. It only needs to read two files and
+      # write one, so the tool grant is Read + Write — no bash, no network.
+      - name: Classify changes with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--allowedTools "Read,Write" --model claude-opus-5'
+          prompt: |
+            Read `.github/release-notes-prompt.md` and follow it exactly.
+
+            The release being documented is `${{ inputs.tag }}`.
+            The commit and PR context is in `release-notes-context.txt`.
+
+            Write the resulting JSON to `release-notes-entries.json` in the
+            repository root. Write nothing else.
+
+      # Rendering is back in code: fixed section order, PR-reference
+      # deduplication, changelog link. The model's output is validated here,
+      # so a bad category or an empty description fails the run instead of
+      # vanishing from the release.
+      - name: Render release notes
+        id: notes
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ ! -s release-notes-entries.json ]; then
+            echo "::error::Claude did not write release-notes-entries.json. Check the previous step's log." >&2
+            exit 1
+          fi
+          echo "----- entries -----"
+          cat release-notes-entries.json
+          echo "-------------------"
+          NOTES_FILE="$RUNNER_TEMP/release_notes.md"
+          ARGS=(render "${{ inputs.tag }}" --entries release-notes-entries.json)
+          if [ -n "${{ inputs.since }}" ]; then
+            ARGS+=(--since "${{ inputs.since }}")
+          fi
+          node .github/scripts/release-notes.mjs "${ARGS[@]}" > "$NOTES_FILE"
           echo "notes-file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
           echo "----- release notes -----"
           cat "$NOTES_FILE"
