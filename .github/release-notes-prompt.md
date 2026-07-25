@@ -80,8 +80,16 @@ Two concrete traps:
 - Write from the user's perspective — what changed *for them*.
 - For a bug fix, name the observable symptom and that it is fixed: what was
   wrong, on which platform or toolkit, and what now happens instead. Prefer
-  "cells in Qt tables on Windows reported `unknown` instead of `table_cell`,
+  "cells in Qt tables on Windows reported `table_row` instead of `table_cell`,
   so `table_cell` selectors never matched" over "fixed Qt table support".
+- **State the value that was actually reported before, and do not assume it was
+  `unknown`.** Reporting the wrong value and reporting no value are different
+  bugs with different consequences for a user's selectors, and the context
+  usually says which one it was — an unmapped role gives `unknown`, but a role
+  that fell through to a sibling's branch gives that sibling's value. If a
+  single entry covers several providers whose previous values differed, say so
+  per provider or describe the symptom without naming a value. Never round a
+  mixed set up to "reported `unknown`".
 - Name the platform and UI toolkit whenever a change is specific to one.
   "on Windows", "in Qt apps", "on macOS with Qt" — users are filtering for
   their own stack.
