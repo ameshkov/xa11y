@@ -25,12 +25,23 @@ import { existsSync, readFileSync } from "node:fs";
 import { argv, env, exit, stderr, stdout } from "node:process";
 
 // Per-commit caps. These are deliberately generous: the substance of a fix is
-// routinely 2000+ characters into a PR body ("root cause", "the fix"), and
-// truncating before it is how a release ends up describing a provider bug fix
-// as a testing change. Claude's context window is not the binding constraint
-// here, so cap only to bound pathological inputs.
+// routinely thousands of characters into a PR body ("root cause", "the fix"),
+// and truncating before it is how a release ends up describing a provider bug
+// fix as a testing change. Claude's context window is not the binding
+// constraint here, so cap only to bound pathological inputs.
+//
+// The commit-body cap matters more than it looks. Squash-merged commits bundle
+// every section of a multi-commit PR, and the section describing the
+// user-visible change is frequently the *last* one — #325 in v0.12.0 opens with
+// "add a WinForms test app" and only reaches "read MSAA role and selection where
+// UIA publishes neither", the two actual provider fixes, at character 1928 of
+// 4055. Every substantive commit in that release ran past 2000 characters, one
+// to 6001. Size this well above the longest body you expect, not near it: a cap
+// that lands mid-section is worse than one that truncates cleanly, because the
+// model then sees a section heading with no content under it and has to guess
+// what it said.
 const PR_DESCRIPTION_MAX_CHARS = 12_000;
-const COMMIT_BODY_MAX_CHARS = 2_000;
+const COMMIT_BODY_MAX_CHARS = 16_000;
 
 // Commits whose PR body is never worth fetching. Dependabot bumps and release
 // chores are excluded from the notes by definition, and their PR bodies are
