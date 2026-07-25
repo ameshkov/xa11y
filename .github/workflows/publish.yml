@@ -545,7 +545,10 @@ jobs:
               echo "::warning::Rendering the generated entries failed." >&2
             fi
           else
-            echo "::warning::No release-notes-entries.json was produced." >&2
+            echo "::warning::No release-notes-entries.json was produced. Either the Claude step" >&2
+            echo "skipped itself because this workflow file differs from the default branch's copy" >&2
+            echo "(it logs 'Workflow validation failed'), or CLAUDE_CODE_OAUTH_TOKEN is missing or" >&2
+            echo "expired. Check the 'Classify changes with Claude' step's log." >&2
           fi
           if [ "$rendered" -eq 0 ]; then
             echo "::warning::Falling back to a plain git log for ${TAG}'s notes. Re-run the 'Update release notes' workflow to replace them." >&2

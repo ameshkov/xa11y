@@ -99,7 +99,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -s release-notes-entries.json ]; then
-            echo "::error::Claude did not write release-notes-entries.json. Check the previous step's log." >&2
+            echo "::error::No release-notes-entries.json was produced, so there is nothing to render." >&2
+            echo "The 'Classify changes with Claude' step exits 0 without doing any work in two cases:" >&2
+            echo "  1. This workflow file differs from the copy on the default branch." >&2
+            echo "     claude-code-action refuses to run then — otherwise a branch could rewrite a" >&2
+            echo "     workflow that has access to secrets — logs 'Workflow validation failed', and" >&2
+            echo "     skips itself. Grep the previous step for that line. A branch run can never" >&2
+            echo "     get past this point: the workflow has to be on the default branch first." >&2
+            echo "  2. CLAUDE_CODE_OAUTH_TOKEN is missing or expired. Regenerate it with" >&2
+            echo "     'claude setup-token' and update the repository secret." >&2
             exit 1
           fi
           echo "----- entries -----"
