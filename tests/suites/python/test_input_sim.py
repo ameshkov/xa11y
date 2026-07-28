@@ -36,7 +36,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 HIT_TARGET = 'button[name="Hit target"]'
-EVENT_LOG = 'text_area[name="Event log"]'
+# UIA has no distinct multiline text role, so WebView2's <textarea> collapses to
+# UIA_EditControlTypeId, which xa11y maps to `text_field`; WebKitGTK and
+# WKWebView both expose it as `text_area`. Same collapse the egui entry in
+# conftest.py records for AccessKit's MultilineTextInput. The role has to be in
+# the selector rather than dropped: the enclosing <fieldset> takes its name from
+# the <legend>, so a role-less `[name="Event log"]` matches two elements.
+EVENT_LOG = (
+    'text_field[name="Event log"]'
+    if sys.platform == "win32"
+    else 'text_area[name="Event log"]'
+)
 TYPED_FIELD = 'text_field[name="Typed text"]'
 CLEAR_BUTTON = 'button[name="Clear log"]'
 
@@ -369,6 +379,16 @@ def test_platform_meta_chord(tauri_input_app, sim):
 def test_type_text_writes_to_focused_input(tauri_input_app, sim):
     _clear_log(tauri_input_app)
     _focus_typed_field(tauri_input_app)
+    # Focus the field with a real pointer click as well, not only a11y .focus().
+    # Under WebView2 a UIA SetFocus does not reliably move DOM focus, so the
+    # KEYEVENTF_UNICODE characters type_text injects would land on no focused
+    # element and the field would stay empty — the key-event tests above pass
+    # only because their listener is on `window`, which fires regardless of
+    # focus. A synthesised click sets real DOM focus on every platform.
+    field = tauri_input_app.locator(TYPED_FIELD).element()
+    fr = field.bounds
+    assert fr is not None, "typed field has no bounds"
+    sim.click((fr.x + fr.width // 2, fr.y + fr.height // 2))
     sim.type_text("hello xa11y")
     # Poll the typed-text input's value (not the event log) — type_text uses
     # Unicode / scancode paths that don't always generate synthetic key events

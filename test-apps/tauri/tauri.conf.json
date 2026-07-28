@@ -10,7 +10,7 @@
     "windows": [
       {
         "title": "xa11y-tauri-test-app",
-        "width": 800,
+        "width": 1000,
         "height": 700,
         "resizable": true,
         "fullscreen": false,
