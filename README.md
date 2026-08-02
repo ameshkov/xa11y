@@ -59,7 +59,7 @@ safari.locator("text_field[name^='Search']").set_value("hello world")
 <!-- rust-only -->
 ```toml
 [dependencies]
-xa11y = "0.4"
+xa11y = "0.12"
 ```
 <!-- /rust-only -->
 
@@ -125,7 +125,7 @@ cargo build --workspace
 cargo xtask check   # fmt, lint, test, python bindings
 ```
 
-See the [development docs](https://xa11y.dev/guides/overview/) for architecture and setup.
+See the [development docs](https://xa11y.dev/explanation/design/) for architecture and setup.
 
 ## License
 

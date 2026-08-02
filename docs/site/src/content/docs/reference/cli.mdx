@@ -1,0 +1,218 @@
+---
+title: CLI
+description: Command reference for the xa11y CLI, covering apps, tree, find, action, and events, plus the available actions and target flags.
+pageType: reference
+---
+
+{/* DIATAXIS: reference — a factual description of the machinery, structured
+    for lookup rather than for reading through. Neutral and complete. No task
+    narratives, no rationale, no teaching. */}
+
+The `xa11y` command-line tool mirrors the library API. It is the fastest way to
+inspect an application before writing code against it.
+
+Install it with `cargo install xa11y` or `pip install xa11y`, both of which
+provide the same binary. See [Install xa11y](/guides/install/#install-the-cli).
+
+For the task of arriving at a working selector, see
+[Find the right selector](/guides/debug-selectors/). If you're looking to build
+agents that control desktop applications, see
+[agent-desktop.dev](https://agent-desktop.dev), a purpose-built tool for that,
+built on xa11y.
+
+## Commands
+
+### `xa11y apps`
+
+List running applications with their PIDs.
+
+```bash
+xa11y apps
+```
+
+```
+1234	Calculator	focused
+5678	Slack
+9012	Firefox
+```
+
+Columns are tab-separated: process ID, then name. The foreground application
+carries a third column, the literal token `focused`. An application whose
+process ID cannot be resolved shows `-` in the first column.
+
+### `xa11y tree`
+
+Print the full accessibility tree for an application.
+
+```bash
+xa11y tree --app Calculator
+```
+
+```
+application "Calculator" [enabled visible] bounds=(0,0,400,600)
+├── window "Calculator" [enabled visible] bounds=(0,0,400,600)
+│   ├── group "Display" [enabled visible]
+│   │   └── static_text "Result" value="42" [enabled visible]
+│   └── group "Keypad" [enabled visible]
+│       ├── button "7" [enabled visible focusable] actions=[press,focus]
+│       ├── button "8" [enabled visible focusable] actions=[press,focus]
+│       └── button "+" [enabled visible focusable] actions=[press,focus]
+└── menu_bar [enabled visible]
+```
+
+This is the fastest way to understand an app's structure. Every element shows its role, name, value, states, bounds, and available actions.
+
+The same output is available in-code via `Element.dump()` (and `Element.tree()` for a structured snapshot) in every language binding. See [Find the right selector](/guides/debug-selectors/#read-the-tree-from-code-instead) for examples.
+
+### `xa11y find`
+
+Find elements matching a CSS-like selector.
+
+```bash
+xa11y find "button" --app Calculator
+```
+
+```
+button "7" [enabled visible focusable] actions=[press,focus]
+button "8" [enabled visible focusable] actions=[press,focus]
+button "+" [enabled visible focusable] actions=[press,focus]
+(3 matches)
+```
+
+A selector that matches nothing is an **error**, not an empty result. The
+command prints `no elements matched selector: <selector>` and exits non-zero,
+which is what makes it usable as a shell assertion.
+
+Use this to test selectors before putting them in code:
+
+```bash
+# Does this selector match what I expect?
+xa11y find "text_field[name^='Message']" --app Slack
+
+# How many list items are there?
+xa11y find "list > list_item" --app Finder
+```
+
+`-o` selects the output format: `pretty` (the default, shown above), `bounds`,
+or `center`.
+
+### `xa11y action`
+
+Perform an action on the first element matching a selector.
+
+```bash
+xa11y action press "button[name='7']" --app Calculator
+```
+
+```
+ok
+```
+
+Actions that need a value use `--value`:
+
+```bash
+xa11y action set-value "text_field[name='Search']" --app Safari --value "hello"
+xa11y action type-text "text_field[name='Message']" --app Slack --value "ship it"
+xa11y action select-text "text_field" --app TextEdit --value "0,5"
+```
+
+#### Available actions
+
+| Action | Description |
+| --- | --- |
+| `press` | Press a button or activate a control |
+| `focus` | Move focus to the element |
+| `blur` | Remove focus from the element |
+| `toggle` | Toggle a checkbox or switch |
+| `expand` | Expand a disclosure or menu |
+| `collapse` | Collapse a disclosure or menu |
+| `select` | Select an item |
+| `show-menu` | Show a context menu |
+| `scroll-into-view` | Scroll the element into view |
+| `increment` | Increment a numeric value |
+| `decrement` | Decrement a numeric value |
+| `set-value` | Set text value (requires `--value`) |
+| `type-text` | Type text as keystrokes (requires `--value`) |
+| `select-text` | Select a text range (requires `--value START,END`) |
+
+### `xa11y events`
+
+Stream accessibility events in real time. Runs until you press ctrl-c.
+
+```bash
+xa11y events --app Calculator
+```
+
+```
+[focus_changed] button "7"
+[value_changed] static_text "Result"
+[focus_changed] button "+"
+[state_changed] check_box "Wrap" Checked=true
+[value_changed] static_text "Result"
+```
+
+Event type names are `snake_case`, matching the roles in the same output and
+the `event_type` strings the Python binding reports. See
+[Events](/reference/events/) for the full list. A target that could not be
+resolved prints as `-`, and a `state_changed` line appends the flag and its
+new value.
+
+Useful for understanding what events fire when you interact with an app, or for debugging event subscriptions in your code.
+
+## Input simulation
+
+These synthesise OS-level events at screen coordinates. They take no selector
+and read no accessibility data, so they need no target application. See
+[Simulate input](/guides/input/) for when to prefer an accessibility action.
+
+| Command | Flags |
+| --- | --- |
+| `xa11y click` | `--at X,Y` `[--button left\|right\|middle]` `[--count N]` `[--held K,K]` |
+| `xa11y move` | `--at X,Y` |
+| `xa11y drag` | `--from X,Y` `--to X,Y` `[--button B]` `[--duration-ms MS]` `[--held K,K]` |
+| `xa11y scroll` | `--at X,Y` `[--dx N]` `[--dy N]` |
+| `xa11y key` | `KEY` `[--held K,K]` |
+| `xa11y type` | `TEXT` |
+
+## `xa11y screenshot`
+
+Captures a region, or the whole primary display when `--region` is omitted.
+`--out -` writes PNG bytes to stdout.
+
+```bash
+xa11y screenshot --region X,Y,W,H --out PATH
+```
+
+## Composing the two halves
+
+`find -o bounds` and `find -o center` emit coordinates in the form the input
+and screenshot commands take, which is how an accessibility query drives a
+pixel operation:
+
+```bash
+region=$(xa11y find 'button[name="OK"]' --app Safari -o bounds)
+xa11y screenshot --region "$region" --out button.png
+
+xa11y click --at "$(xa11y find 'button[name="OK"]' --app Safari -o center)"
+```
+
+## Flags
+
+The accessibility commands other than `apps` require a target application. The
+input-simulation and screenshot commands take neither flag.
+
+| Flag | Description |
+| --- | --- |
+| `--app NAME` | Target application by name (substring match) |
+| `--pid PID` | Target application by process ID |
+
+## Selectors
+
+`xa11y find` and `xa11y action` take the same selector syntax as the library.
+See [Selectors](/reference/selectors/) for operators, combinators, and
+attributes. Note that the syntax has no `*` wildcard, so "any element with this
+state" is written as an attribute-only selector:
+
+```bash
+xa11y find "[focusable='true']" --app Slack
+```

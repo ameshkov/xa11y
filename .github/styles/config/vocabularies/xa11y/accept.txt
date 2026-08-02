@@ -10,6 +10,7 @@
 # ── Accessibility APIs ──────────────────────────────────────────────
 APIs
 AX[A-Z][A-Za-z]+
+PIDs
 QObject
 UIs
 input_sim
@@ -68,20 +69,24 @@ serde
 
 # ── Software-writing vocabulary ─────────────────────────────────────
 antialiasing
+[Bb]oolean
 combinators?
 compat
 deduplicated
+enum
 env
 fuzzers?
 greppable
 [Ii]nteg
 lookups
+lossy
 memoization
 outer
 readback
 renderers
 repo
 runtime
+stdout
 subprocess
 substring
 surfaceably
@@ -89,6 +94,7 @@ teardown
 tearoff
 typechecks
 uncheck
+unparsable
 unstripped
 upscaled
 viewport
