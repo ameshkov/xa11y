@@ -1,0 +1,211 @@
+name: Publish pytest-xa11y
+
+# pytest-xa11y releases on its own cadence and its own version line. It is a
+# pure-Python package outside the cargo workspace, so cargo-release's
+# shared-version scheme (which moves every crate in lockstep) deliberately
+# does not reach it — see pytest-xa11y/RELEASING.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Version bump level"
+        required: true
+        type: choice
+        options:
+          - release # publish the current version without bumping
+          - patch
+          - minor
+          - major
+
+# Two concurrent publishes would race on the tag and on PyPI.
+concurrency:
+  group: publish-pytest-xa11y
+  cancel-in-progress: false
+
+jobs:
+  version-bump:
+    name: Bump version
+    if: inputs.level != 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Bump version
+        id: bump
+        run: |
+          VERSION=$(python .github/scripts/bump_pytest_xa11y.py --level "${{ inputs.level }}")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=pytest-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pytest-xa11y/pyproject.toml
+          git commit -m "chore(pytest-xa11y): release ${{ steps.bump.outputs.version }}"
+          git tag -a "pytest-xa11y-v${{ steps.bump.outputs.version }}" \
+            -m "pytest-xa11y ${{ steps.bump.outputs.version }}"
+          git push origin HEAD:main
+          git push origin "pytest-xa11y-v${{ steps.bump.outputs.version }}"
+
+  build:
+    name: Build sdist and wheel
+    needs: [version-bump]
+    # version-bump is skipped for level=release, which would otherwise skip
+    # every descendant job.
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      # The tag when there was a bump, else main. Checking out `main`
+      # unconditionally would publish whatever else had landed there between
+      # the bump push and this checkout — the sdist would then not be the tree
+      # the tag points at.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version-bump.outputs.tag || 'main' }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build
+
+      # The floor in pyproject.toml deliberately understates the real
+      # requirement while no released xa11y carries the GIL fix (#359), so
+      # that CI can install the package at all. Publishing with it still in
+      # place would ship metadata permitting an xa11y that freezes the
+      # consumer's threads. RELEASING.md describes this as a human gate; a
+      # human gate is not a gate, so it is checked here.
+      - name: Refuse to publish with a placeholder dependency floor
+        run: |
+          FLOOR=$(grep -oE '"xa11y>=[0-9.]+"' pytest-xa11y/pyproject.toml)
+          echo "declared floor: $FLOOR"
+          if [ "$FLOOR" = '"xa11y>=0.12"' ]; then
+            echo "::error::pytest-xa11y still declares the placeholder floor xa11y>=0.12."
+            echo "Raise it to the first released xa11y containing the App.find GIL fix"
+            echo "(xa11y/xa11y#359) before publishing. See pytest-xa11y/RELEASING.md."
+            exit 1
+          fi
+
+      # Note this resolves xa11y from PyPI, not from this workspace: the job
+      # has no Rust toolchain. It therefore verifies the plugin against the
+      # released library a consumer would actually get, which is the right
+      # thing for a publish gate — and the reason the floor check above has
+      # to come first, since the tests fake App.find and would pass happily
+      # against a version without the fix.
+      - name: Verify the plugin's own tests pass before publishing
+        run: |
+          python -m pip install -e ./pytest-xa11y
+          python -m pip install pytest
+          python -m pytest pytest-xa11y/tests -q
+          python -c "import xa11y, sys; print('resolved xa11y', xa11y.__version__ if hasattr(xa11y, '__version__') else '(unknown)')"
+
+      - name: Build
+        working-directory: pytest-xa11y
+        run: python -m build --sdist --wheel --outdir dist
+
+      # Named for this package: the xa11y wheel jobs upload as `wheels-*` and
+      # its publish step downloads that pattern with merge-multiple, so a
+      # `wheels-` prefix here would push pytest-xa11y into the xa11y release.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pytest-xa11y-dist
+          path: pytest-xa11y/dist/*
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    environment: pypi-pytest-xa11y
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: pytest-xa11y-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+  create-release:
+    name: Create GitHub Release
+    needs: [version-bump, publish-pypi]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version-bump.outputs.tag || 'main' }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pytest-xa11y-dist
+          path: dist
+
+      # On the bump path the version comes from the job that did the bumping.
+      # On level=release there was no bump, so read it from the checked-out
+      # tree — and note the tag does not exist yet there; `gh release create`
+      # creates it at this commit.
+      - name: Resolve tag
+        id: tag
+        run: |
+          VERSION="${{ needs.version-bump.outputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(python .github/scripts/bump_pytest_xa11y.py --show)
+          fi
+          echo "tag=pytest-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Auto-generated notes rather than the AI-classified pipeline the xa11y
+      # release uses: that prompt is written about the xa11y public API
+      # (App, locators, roles, actions, events) and would misclassify plugin
+      # changes. Revisit if this package's changelog gets busy enough to
+      # deserve its own prompt.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # Anchor the generated notes to the previous pytest-xa11y tag.
+          # Without it GitHub compares against the newest release in the repo,
+          # which is normally an xa11y `v*` release, and the notes would list
+          # every xa11y commit since then.
+          PREV=$(git tag --list 'pytest-xa11y-v*' --sort=-v:refname \
+                   | grep -v "^$TAG$" | head -n1)
+          if [ -n "$PREV" ]; then
+            gh release create "$TAG" \
+              --title "pytest-xa11y ${{ steps.tag.outputs.version }}" \
+              --generate-notes --notes-start-tag "$PREV" \
+              dist/*
+          else
+            gh release create "$TAG" \
+              --title "pytest-xa11y ${{ steps.tag.outputs.version }}" \
+              --generate-notes \
+              dist/*
+          fi
