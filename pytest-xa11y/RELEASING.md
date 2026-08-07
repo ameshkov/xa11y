@@ -21,31 +21,30 @@ pytest-xa11y releases or a version number that says nothing.
 The dependency is a lower bound, not a pin, so a consumer can upgrade either
 package on its own schedule.
 
-### Release gate: raise the xa11y floor first
+### Release gate: the xa11y floor
 
-The declared floor is `xa11y>=0.12`, and that **understates the real
-requirement**. The launch path makes one long `App.find` call instead of
-polling it in chunks, which needs the GIL fix from xa11y/xa11y#359. On any
-release without it, that call holds the GIL for the whole startup wait and
-freezes every other thread in the consumer's process.
+The declared floor is `xa11y>=0.13.0`. The launch path makes one long
+`App.find` call instead of polling it in chunks, which needs the GIL fix from
+xa11y/xa11y#359. On any release without it, that call holds the GIL for the
+whole startup wait and freezes every other thread in the consumer's process.
+0.13.0 is the first release carrying the fix, so it is the first version this
+package can honestly depend on.
 
-The fix is on `main` but in no released version. Declaring the honest floor
-today would be unsatisfiable — CI installs xa11y from source at 0.12.1, which
-*carries* the fix while its version number does not yet say so — so
-`pip install -e pytest-xa11y` would fail in every cell.
+That floor was `>=0.12` up to the first publish. The fix was on `main` but in
+no released version, and declaring the honest floor while it was unsatisfiable
+would have broken `pip install -e pytest-xa11y` in every CI cell — CI installs
+xa11y from source, which *carried* the fix while its version number did not
+yet say so. The placeholder bought an installable tree; the gate below stopped
+it reaching PyPI.
 
-**Before the first publish:**
+The publish workflow still fails if the placeholder is re-declared. Keep that
+check: the workflow is `workflow_dispatch`, anyone can run it, and the
+plugin's own tests fake `App.find`, so they pass against a released xa11y
+without the fix. The floor check is the only thing that would catch a revert.
 
-1. Confirm the xa11y release carrying #359 exists on PyPI.
-2. Raise the floor in `pyproject.toml` to that version.
-3. Only then run the workflow.
-
-The publish workflow enforces step 2: it fails if the placeholder floor is
-still declared. That check exists because the earlier wording here — that
-nothing *could* ship the bad combination — was wrong. The workflow is
-`workflow_dispatch`, anyone can run it today, and the plugin's own tests fake
-`App.find`, so they pass against a released xa11y without the fix. Only the
-floor check stands between that and PyPI.
+**When raising the floor again**, the same order applies: confirm the xa11y
+release exists on PyPI, raise the bound in `pyproject.toml`, and only then run
+the workflow. Raising it ahead of the release breaks every CI cell.
 
 Note also that the publish job resolves xa11y from PyPI rather than from this
 workspace, because it has no Rust toolchain. That is deliberate — a publish

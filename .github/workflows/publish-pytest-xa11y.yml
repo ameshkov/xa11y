@@ -85,12 +85,13 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade build
 
-      # The floor in pyproject.toml deliberately understates the real
-      # requirement while no released xa11y carries the GIL fix (#359), so
-      # that CI can install the package at all. Publishing with it still in
-      # place would ship metadata permitting an xa11y that freezes the
-      # consumer's threads. RELEASING.md describes this as a human gate; a
-      # human gate is not a gate, so it is checked here.
+      # The floor is now `xa11y>=0.13.0`, the first release carrying the GIL
+      # fix (#359). It stood at `>=0.12` while that fix was on main but in no
+      # released version, so that CI could install the package at all.
+      # Publishing with the placeholder back in place would ship metadata
+      # permitting an xa11y that freezes the consumer's threads, and the
+      # plugin's own tests below cannot catch it — they fake `App.find`. This
+      # check is what stands between a revert and PyPI, so it stays.
       - name: Refuse to publish with a placeholder dependency floor
         run: |
           FLOOR=$(grep -oE '"xa11y>=[0-9.]+"' pytest-xa11y/pyproject.toml)
