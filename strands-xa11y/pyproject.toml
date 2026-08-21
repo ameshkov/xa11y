@@ -14,7 +14,7 @@ name = "strands-xa11y"
 # those tags belong to xa11y, so hatch-vcs would stamp the wheel with xa11y's
 # version. The tag scheme here is `strands-xa11y-v*`, and this line is the
 # source of truth that .github/scripts/bump_python_package.py rewrites.
-version = "0.1.0"
+version = "0.1.1"
 description = "Drive native macOS, Windows, and Linux desktop apps from a Strands agent through the accessibility tree."
 readme = "README.md"
 requires-python = ">=3.10"
