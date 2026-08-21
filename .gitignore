@@ -29,3 +29,14 @@ docs/site/src/content/docs/api/javascript.mdx
 # publish.yml and update-release-notes.yml) into the checkout root.
 /release-notes-context.txt
 /release-notes-entries.json
+
+# Build and test artefacts from the pure-Python packages (pytest-xa11y,
+# strands-xa11y, xa11y-python). `**/target` above covers the Rust side only.
+dist/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

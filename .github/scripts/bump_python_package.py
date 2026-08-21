@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Bump the version in pytest-xa11y/pyproject.toml.
+"""Bump the version in a pure-Python sibling package's pyproject.toml.
 
-pytest-xa11y versions independently of xa11y, so it is deliberately outside
-cargo-release's shared-version scheme. This script is the whole mechanism:
-read the current version, apply the requested level, write it back, print the
-new version.
+`pytest-xa11y` and `strands-xa11y` each version independently of xa11y, so
+they are deliberately outside cargo-release's shared-version scheme. This
+script is the whole mechanism: read the current version, apply the requested
+level, write it back, print the new version.
 
 Usage:
-    python .github/scripts/bump_pytest_xa11y.py --level patch
-    python .github/scripts/bump_pytest_xa11y.py --show
+    python .github/scripts/bump_python_package.py --package strands-xa11y --level patch
+    python .github/scripts/bump_python_package.py --package pytest-xa11y --show
 """
 
 from __future__ import annotations
@@ -18,18 +18,27 @@ import re
 import sys
 from pathlib import Path
 
-PYPROJECT = Path(__file__).resolve().parents[2] / "pytest-xa11y" / "pyproject.toml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Only the packages that carry their own version line. Naming them explicitly,
+# rather than accepting any path, means a typo fails here instead of writing a
+# version into some unrelated pyproject.toml.
+PACKAGES = ("pytest-xa11y", "strands-xa11y")
 
 # Matches the version line inside [project]. Deliberately anchored to the
 # line start so a version string elsewhere in the file cannot be picked up.
 VERSION_RE = re.compile(r'^version = "(\d+)\.(\d+)\.(\d+)"$', re.MULTILINE)
 
 
-def read_version(text: str) -> tuple[int, int, int]:
+def pyproject_for(package: str) -> Path:
+    return REPO_ROOT / package / "pyproject.toml"
+
+
+def read_version(text: str, path: Path) -> tuple[int, int, int]:
     matches = VERSION_RE.findall(text)
     if len(matches) != 1:
         raise SystemExit(
-            f"Expected exactly one `version = \"X.Y.Z\"` line in {PYPROJECT}, "
+            f"Expected exactly one `version = \"X.Y.Z\"` line in {path}, "
             f"found {len(matches)}."
         )
     major, minor, patch = matches[0]
@@ -49,6 +58,7 @@ def bump(version: tuple[int, int, int], level: str) -> tuple[int, int, int]:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", choices=PACKAGES, required=True)
     parser.add_argument("--level", choices=["major", "minor", "patch"])
     parser.add_argument(
         "--show",
@@ -57,8 +67,9 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    text = PYPROJECT.read_text(encoding="utf-8")
-    current = read_version(text)
+    pyproject = pyproject_for(args.package)
+    text = pyproject.read_text(encoding="utf-8")
+    current = read_version(text, pyproject)
 
     if args.show or args.level is None:
         print(".".join(str(part) for part in current))
@@ -66,7 +77,7 @@ def main(argv: list[str]) -> int:
 
     new = bump(current, args.level)
     new_str = ".".join(str(part) for part in new)
-    PYPROJECT.write_text(
+    pyproject.write_text(
         VERSION_RE.sub(f'version = "{new_str}"', text, count=1), encoding="utf-8"
     )
     print(new_str)

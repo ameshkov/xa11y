@@ -1,0 +1,109 @@
+---
+title: Drive a desktop from a Strands agent
+description: Give a Strands agent control of native macOS, Windows, and Linux apps through the accessibility tree.
+pageType: how-to
+---
+
+{/* DIATAXIS: how-to — a goal-oriented recipe for a reader who already knows
+    what they want. Steps and decisions only. Concepts go to explanation/,
+    exhaustive option lists go to reference/. */}
+
+[Strands](https://strandsagents.com) is AWS's open-source SDK for building agents. A capability there is a tool: a function whose schema the model sees and calls when it decides to.
+
+`strands-xa11y` is the desktop in that shape. It packages xa11y as a single `use_desktop` tool, so an agent gains desktop control by listing it in `tools=[...]`.
+
+The package lives in this repository under [`strands-xa11y/`](https://github.com/xa11y/xa11y/tree/main/strands-xa11y), and its README is the reference for the full action list.
+
+## Install
+
+```bash
+pip install strands-xa11y
+```
+
+Python 3.10+. The `xa11y` wheel comes with it, so the [platform permissions](/guides/install/) apply as they do to any other xa11y consumer: Accessibility on macOS, AT-SPI2 on Linux, nothing to grant on Windows.
+
+## Give an agent the tool
+
+```python
+from strands import Agent
+from strands_xa11y import use_desktop
+
+agent = Agent(tools=[use_desktop])
+agent("Open TextEdit, type 'hello' into the document, and save it as notes.txt")
+```
+
+## The loop the model runs
+
+**1. Snapshot.** Each line is one node, carrying a ref.
+
+```python
+use_desktop({"action": {"type": "snapshot", "app": "TextEdit"}})
+```
+
+```
+TextEdit (pid 4242)
+e1 application "TextEdit"
+  e2 window "Untitled" [active]
+    e3 toolbar
+      e4 button "Bold"
+      e5 button "Italic" [disabled]
+    e7 group
+      e8 text_field "File name" value="untitled"
+      e9 check_box "Wrap lines" [unchecked]
+    e10 text_area "document" value="Dear Alice,"
+```
+
+**2. Act on a ref.**
+
+```python
+use_desktop({"action": {"type": "click", "target": {"ref": "e4"}}})
+use_desktop({"action": {"type": "type", "target": {"ref": "e8"}, "text": "notes.txt", "replace": True}})
+```
+
+**3. Re-snapshot once the UI has changed.** Refs are never reused, so a stale one fails loudly instead of hitting whatever moved into its place.
+
+A ref re-resolves through the platform's `stable_id` where one exists, otherwise through a structural selector path, and only falls back to a captured handle as a last resort. The first two paths auto-wait and survive a re-render.
+
+Refs are optional. An element can be addressed directly with a [selector](/reference/selectors/):
+
+```python
+use_desktop({"action": {"type": "click", "target": {"app": "TextEdit", "selector": "button[name='Save']"}}})
+```
+
+## Restrict an agent to reading
+
+`inspect_desktop` is the same tool with the acting half removed from the schema. It keeps `list_apps`, `snapshot`, `find`, `read`, `wait`, and `screenshot`.
+
+```python
+from strands_xa11y import inspect_desktop
+
+agent = Agent(tools=[inspect_desktop])
+```
+
+The restriction is in the schema rather than a runtime check, so there is no acting action for the model to reach for.
+
+## Decide how actions get approved
+
+Anything that changes the machine (clicking, typing, launching, terminating) asks for confirmation on the terminal first. Set `BYPASS_TOOL_CONSENT=true` to hand approval to your agent runtime instead, which is what you want when the runtime has its own approval UX or when the agent runs unattended. With no terminal to ask on and no bypass set, the action is refused rather than assumed.
+
+Reading the tree never prompts. `screenshot` prompts when the capture leaves the process: `send_image=true` puts whatever is on the user's screen into the transcript, and `save_path` writes it to disk.
+
+## Read the errors before falling back to pixels
+
+xa11y reports what a failed call was waiting for, what it last observed, and which elements nearly matched. The tool passes that through verbatim:
+
+```
+TimeoutError: timed out
+  condition: visible
+  selector: button[name='Sav']
+  last observed: selector never matched
+  near misses: button 'Save'; button 'Save As…'
+```
+
+That is usually enough for the model to correct its own selector without reaching for a screenshot. See [Errors & Diagnosis](/explanation/errors-and-diagnosis/) for what xa11y attaches and why.
+
+## Related
+
+- [`strands-xa11y/README.md`](https://github.com/xa11y/xa11y/tree/main/strands-xa11y#readme) lists every action, its fields, and the known platform limits.
+- [Compare to other tools](/compare/) places this next to the CLI and the other agent-facing surfaces.
+- [Selectors](/reference/selectors/) is the syntax the `selector` field takes.

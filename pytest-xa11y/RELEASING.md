@@ -100,8 +100,8 @@ and say so in the release notes.
 
 The version lives in one place, `pyproject.toml`. `pytest_xa11y.__version__`
 reads it back through `importlib.metadata`, so there is no second copy to
-drift. `.github/scripts/bump_pytest_xa11y.py` is what edits it; run it with
-`--show` to print the current version.
+drift. `.github/scripts/bump_python_package.py` is what edits it; run it
+with `--package pytest-xa11y --show` to print the current version.
 
 ## Release notes
 

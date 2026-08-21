@@ -132,6 +132,44 @@ rename = [
 
 A `rename` naming a member no longer present in its source is reported as stale, same as a stale `[types]` entry.
 
+## Sibling Python packages
+
+Two pure-Python packages live in this repository without being part of the
+xa11y release. Both are outside the cargo workspace, both version on their own
+line with their own `<name>-v*` tag series, and both publish from their own
+`workflow_dispatch` workflow. `.github/scripts/bump_python_package.py` is what
+edits either version; `release.toml`'s `shared-version = true` deliberately
+does not reach them.
+
+| | `pytest-xa11y/` | `strands-xa11y/` |
+|---|---|---|
+| What it is | pytest fixtures, markers, failure diagnostics | a `use_desktop` tool for [Strands](https://strandsagents.com) agents |
+| xa11y dependency | a floor (`>=0.13.0`) | a bounded minor range (`>=0.13.0,<0.14.0`) |
+| Tests need a desktop? | no — `App.find` is faked | no — the whole `xa11y` module is faked |
+| CI | rides along in the `python` job | its own `strands` / `strands-package` jobs |
+| Release notes | `RELEASING.md` in the package | `RELEASING.md` in the package |
+
+**The faked-backend trap.** Neither suite would notice xa11y renaming an
+exception class, dropping a diagnosis attribute, or moving a method: the fake
+keeps answering and the suite stays green while every real call fails.
+`strands-xa11y` reads xa11y *by string* — `_errors.py` keys its guidance off
+exception class names and reads diagnosis fields with `getattr(exc, field,
+None)` — so that drift raises nothing at all. It silently degrades the tool
+result a model sees.
+
+`strands-xa11y/tests/check_real_surface.py` is the guard, and it is the reason
+the package was moved into this repository rather than left in its own. It
+runs in the `python` CI job, against the bindings just built from this tree,
+so a breaking change to xa11y's Python surface and the tool that reads it fail
+in the same pull request. **If you change an exception name, a diagnosis
+attribute, or an `Element` / `Locator` / `App` method in `xa11y-python`, expect
+that check to fail and fix the package in the same change.**
+
+It is deliberately not a `test_*.py` (pytest would apply the conftest that
+installs the fake and verify the fake against itself), and it imports
+`_errors.py` by path rather than importing the package (whose `__init__`
+pulls in pydantic and the Strands SDK, neither of which the `python` job has).
+
 ## Public API Extensibility
 
 Every public struct and enum in `xa11y-core` must make an explicit choice about
@@ -402,9 +440,10 @@ CI runs with `RUSTFLAGS: -Dwarnings`, so all warnings are errors. Individual che
 4. **Integration tests** (if touching provider/test-app code) — `cargo xtask test-integ`
 5. **Python bindings** — `cargo xtask test-python`
 6. **pytest plugin** (if touching `pytest-xa11y/`) — `cargo xtask test-pytest-plugin`
-7. **Docs prose** (if touching `README.md` or `docs/site/src/content/docs/`) — `cargo xtask lint-docs`
-8. **Docs site** (if touching `docs/site/src/content/docs/`) — `python docs/check_page_types.py`, `docs/check_tables.py`, `docs/check_links.py`
-9. **No new `#[allow(...)]` without justification** — if you must suppress a warning, add a comment explaining why. The `clippy::exhaustive_*` allows in `xa11y-core` use the `reason = "..."` form; see [Public API Extensibility](#public-api-extensibility).
+7. **Strands tool** (if touching `strands-xa11y/`, or xa11y's Python error surface) — `cargo xtask test-strands`
+8. **Docs prose** (if touching `README.md` or `docs/site/src/content/docs/`) — `cargo xtask lint-docs`
+9. **Docs site** (if touching `docs/site/src/content/docs/`) — `python docs/check_page_types.py`, `docs/check_tables.py`, `docs/check_links.py`
+10. **No new `#[allow(...)]` without justification** — if you must suppress a warning, add a comment explaining why. The `clippy::exhaustive_*` allows in `xa11y-core` use the `reason = "..."` form; see [Public API Extensibility](#public-api-extensibility).
 
 Common CI failures:
 - `unused import` / `dead_code` — remove the unused code or add `#[allow(dead_code)]` with a reason
@@ -426,6 +465,7 @@ cargo xtask lint                              # clippy + ruff + Python Rust chec
 cargo xtask test                              # unit tests
 cargo xtask test-python                       # build + test Python bindings
 cargo xtask test-pytest-plugin                # install + test pytest-xa11y
+cargo xtask test-strands                      # install + test strands-xa11y
 cargo xtask test-integ                        # integration tests (auto-detects OS)
 cargo xtask test-integ-container              # Linux integration tests via Finch
 cargo xtask test-integ-container tree_has_buttons  # single test in container

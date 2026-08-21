@@ -65,6 +65,7 @@ export default defineConfig({
             { label: "Test in CI", slug: "guides/ci" },
             { label: "Simulate input", slug: "guides/input" },
             { label: "Capture screenshots", slug: "guides/screenshots" },
+            { label: "Drive a desktop from a Strands agent", slug: "guides/strands" },
           ],
         },
         {

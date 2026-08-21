@@ -153,6 +153,14 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace
 
+      # strands-xa11y claims macOS, Windows and Linux. A headless runner
+      # cannot drive a desktop, but it can prove the package imports and that
+      # both tool schemas build here. Linux is covered by the `strands` job.
+      - name: Import the strands-xa11y tools
+        run: |
+          python -m pip install ./strands-xa11y
+          python -c "from strands_xa11y import use_desktop, inspect_desktop; assert use_desktop.tool_spec['inputSchema']"
+
       # macOS Rust integration tests (including the AX-call-count regression
       # tests in `xa11y-macos/src/ax.rs`) are intentionally NOT wired into CI.
       # They require kTCCServiceAccessibility to be granted to the Rust test
@@ -184,6 +192,14 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --workspace
+
+      # strands-xa11y claims macOS, Windows and Linux. A headless runner
+      # cannot drive a desktop, but it can prove the package imports and that
+      # both tool schemas build here. Linux is covered by the `strands` job.
+      - name: Import the strands-xa11y tools
+        run: |
+          python -m pip install ./strands-xa11y
+          python -c "from strands_xa11y import use_desktop, inspect_desktop; assert use_desktop.tool_spec['inputSchema']"
 
       # Rust integration tests, including the UIA event subscriptions.
       # Hosted windows-latest runners DO have an interactive desktop session
@@ -745,6 +761,115 @@ jobs:
 
       - name: Run pytest-xa11y tests
         run: .venv/bin/pytest pytest-xa11y/tests -v
+
+      # strands-xa11y's own suite runs in the `strands` job below, against a
+      # fake accessibility backend — which is what lets it run anywhere, and
+      # also what means it would not notice xa11y renaming an exception or
+      # dropping a diagnosis field. This check closes that gap against the
+      # bindings just built above, and is the reason the package was moved
+      # into this repository: a breaking change to xa11y's Python surface and
+      # the agent tool that reads it now fail in the same pull request.
+      - name: Check strands-xa11y against the real xa11y surface
+        run: .venv/bin/python strands-xa11y/tests/check_real_surface.py
+
+  # ── strands-xa11y: the Strands agent tool ───────────────────────
+  #
+  # A pure-Python sibling package, like pytest-xa11y, but with its own job
+  # rather than a ride-along in `python`: it needs no bindings build (its
+  # suite swaps in a fake accessibility backend), and it holds a 100% cover
+  # gate that would be awkward to express as extra steps on another job.
+  #
+  # The half that *does* need the real bindings — tests/check_real_surface.py
+  # — runs in the `python` job above, where they have just been built.
+  strands:
+    name: strands-xa11y - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - run: pip install hatch
+
+      # The fake accessibility backend makes every branch reachable on a
+      # headless runner, so the suite is held at full statement and branch
+      # cover rather than a floor that drifts down. `cov` fails below 100%.
+      - name: Test with coverage
+        working-directory: strands-xa11y
+        run: hatch run cov
+
+  strands-package:
+    name: strands-xa11y - lint and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - run: pip install hatch twine
+
+      - name: Check formatting
+        working-directory: strands-xa11y
+        run: hatch run format --check
+
+      - name: Lint
+        working-directory: strands-xa11y
+        run: hatch run lint
+
+      - name: Typecheck
+        working-directory: strands-xa11y
+        run: hatch run typecheck
+
+      # The tests import from src/ via pythonpath, so nothing above would
+      # notice a packaging mistake — a module left out of the wheel, or a
+      # README that breaks the PyPI render. The publish workflow finds those
+      # at release time, which is too late to be useful. It matters more here
+      # than it did in the package's own repository: hatchling now runs with
+      # the whole monorepo above it, so a wrong `sdist.include` would sweep in
+      # every sibling directory.
+      - name: Build
+        working-directory: strands-xa11y
+        run: hatch build
+
+      - name: Check distribution metadata
+        working-directory: strands-xa11y
+        run: twine check dist/*
+
+      - name: Import from the built wheel
+        working-directory: strands-xa11y
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/pip install dist/*.whl
+          /tmp/wheel-check/bin/python -c "
+          from strands_xa11y import use_desktop, inspect_desktop
+          from strands_xa11y import _actions, _errors, _refs, _session, _snapshot, models
+          assert {'use_desktop', 'inspect_desktop'} == {use_desktop.tool_name, inspect_desktop.tool_name}
+          "
+
+      # An sdist that carried the rest of the monorepo would still install and
+      # still pass every check above, just at a hundred times the size. The
+      # package is a few hundred KB; a megabyte means the include list broke.
+      - name: Refuse an sdist that swept in the monorepo
+        working-directory: strands-xa11y
+        run: |
+          SDIST=$(ls dist/*.tar.gz)
+          SIZE=$(wc -c < "$SDIST")
+          echo "$SDIST is $SIZE bytes"
+          if [ "$SIZE" -gt 1000000 ]; then
+            echo "::error::$SDIST is $SIZE bytes; the sdist include list has broken."
+            tar tzf "$SDIST" | head -50
+            exit 1
+          fi
 
   # ── Docs build ──────────────────────────────────────────────────
   docs:

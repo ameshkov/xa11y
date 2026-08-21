@@ -66,7 +66,7 @@ function runGit(...args) {
 }
 
 // The xa11y release series. Sibling packages in this repo tag their own
-// series (pytest-xa11y-v*), and those tags must never appear in an xa11y
+// series (pytest-xa11y-v*, strands-xa11y-v*), and those tags must never appear in an xa11y
 // commit range — an unfiltered tag list would make the previous tag of
 // v0.13.0 whatever sorted next, producing notes for the wrong range.
 const RELEASE_TAG_PATTERN = /^v\d+\.\d+\.\d+/;

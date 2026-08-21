@@ -38,6 +38,7 @@ COMMANDS:
     test-matrix-check   Validate the tests/matrix.yaml coverage index
     test-harness        Unit-test the shared integ harness (tests/harness/)
     test-pytest-plugin  Install and test the pytest-xa11y plugin package
+    test-strands        Test the strands-xa11y agent-tool package
     docs                Build documentation
     lint-docs           Lint README + docs prose with Vale (requires the `vale` binary)
     coverage            Generate code coverage report
@@ -45,7 +46,7 @@ COMMANDS:
     sync-readmes [--check]  Generate crates.io/PyPI READMEs from root README.md
     check-macos-ffi     Verify xa11y-macos/src/ax.rs only uses safe_* CF/AX wrappers
     check-bindings-parity  Verify Python/JS bindings mirror xa11y-core's public API
-    check               Run ALL pre-PR checks (fmt, lint, test, test-python, test-js, test-harness, test-pytest-plugin)
+    check               Run ALL pre-PR checks (fmt, lint, test, test-python, test-js, test-harness, test-pytest-plugin, test-strands)
     help                Show this help
 ";
 
@@ -79,6 +80,7 @@ fn main() -> ExitCode {
         "test-matrix-check" => do_test_matrix_check(),
         "test-harness" => do_test_harness(),
         "test-pytest-plugin" => do_test_pytest_plugin(),
+        "test-strands" => do_test_strands(),
         "docs" => do_docs(),
         "lint-docs" => do_lint_docs(),
         "coverage" => do_coverage(),
@@ -189,7 +191,19 @@ fn do_fmt(args: &[String]) -> bool {
         run_in("ruff", &["format", "src/", "tests/"], &plugin_dir)
     };
 
-    rust_ok && python_ok && plugin_ok
+    heading("strands-xa11y format (ruff)");
+    let strands_dir = project_root().join("strands-xa11y");
+    let strands_ok = if check {
+        run_in(
+            "ruff",
+            &["format", "--check", "src/", "tests/"],
+            &strands_dir,
+        )
+    } else {
+        run_in("ruff", &["format", "src/", "tests/"], &strands_dir)
+    };
+
+    rust_ok && python_ok && plugin_ok && strands_ok
 }
 
 fn do_lint() -> bool {
@@ -222,7 +236,25 @@ fn do_lint() -> bool {
     let plugin_dir = project_root().join("pytest-xa11y");
     let plugin_ok = run_in("ruff", &["check", "src/", "tests/"], &plugin_dir);
 
-    clippy_ok && ruff_ok && py_cargo_ok && py_fmt_ok && js_cargo_ok && js_fmt_ok && plugin_ok
+    // Run from the package directory so ruff picks up its own `[tool.ruff]`
+    // config (line-length 120, isort and bugbear on) rather than the root's.
+    //
+    // Its mypy pass is not here: mypy is not otherwise needed to work on this
+    // repository, and requiring it would make `cargo xtask lint` fail for
+    // anyone who has not installed it. It runs in the `strands-package` CI
+    // job and in `hatch run prepare` from the package directory.
+    heading("strands-xa11y: ruff check");
+    let strands_dir = project_root().join("strands-xa11y");
+    let strands_ok = run_in("ruff", &["check", "src/", "tests/"], &strands_dir);
+
+    clippy_ok
+        && ruff_ok
+        && py_cargo_ok
+        && py_fmt_ok
+        && js_cargo_ok
+        && js_fmt_ok
+        && plugin_ok
+        && strands_ok
 }
 
 fn do_test() -> bool {
@@ -550,6 +582,33 @@ fn do_test_pytest_plugin() -> bool {
 
     heading("pytest-xa11y: test");
     run_in("python", &["-m", "pytest", "tests/", "-v"], &plugin_dir)
+}
+
+/// Test `strands-xa11y`, the Strands agent-tool package.
+///
+/// Its own suite swaps in a fake accessibility backend, so it needs no
+/// display and no bus. `check_real_surface.py` is the other half: it runs
+/// against the real bindings and is what would notice xa11y renaming an
+/// exception or dropping a diagnosis field. Running only the first would
+/// leave the package green while every real call failed, so both run here.
+fn do_test_strands() -> bool {
+    heading("strands-xa11y: install");
+    let root = project_root();
+    let package_dir = root.join("strands-xa11y");
+    if !run_in("pip", &["install", "-e", "."], &package_dir) {
+        return false;
+    }
+
+    heading("strands-xa11y: test");
+    if !run_in("python", &["-m", "pytest", "tests/", "-v"], &package_dir) {
+        return false;
+    }
+
+    heading("strands-xa11y: xa11y surface check");
+    // From the repository root, by path: an invocation that puts the root on
+    // sys.path would import the `xa11y/` crate directory as a namespace
+    // package instead of the bindings.
+    run("python", &["strands-xa11y/tests/check_real_surface.py"])
 }
 
 /// Unit-test the shared integration harness and the coverage-index checker.
@@ -1158,6 +1217,12 @@ fn do_check() -> bool {
     heading("PRE-PR CHECK: test-pytest-plugin");
     if !do_test_pytest_plugin() {
         eprintln!("!! pytest-xa11y tests failed.");
+        ok = false;
+    }
+
+    heading("PRE-PR CHECK: test-strands");
+    if !do_test_strands() {
+        eprintln!("!! strands-xa11y tests failed.");
         ok = false;
     }
 

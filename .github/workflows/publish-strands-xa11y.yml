@@ -1,9 +1,13 @@
-name: Publish pytest-xa11y
+name: Publish strands-xa11y
 
-# pytest-xa11y releases on its own cadence and its own version line. It is a
+# strands-xa11y releases on its own cadence and its own version line. It is a
 # pure-Python package outside the cargo workspace, so cargo-release's
 # shared-version scheme (which moves every crate in lockstep) deliberately
-# does not reach it — see pytest-xa11y/RELEASING.md.
+# does not reach it — see strands-xa11y/RELEASING.md.
+#
+# Shaped after publish-pytest-xa11y.yml, the other sibling package in this
+# repository. The differences are the tag series, the PyPI environment, and
+# the dependency-bound check below.
 
 on:
   workflow_dispatch:
@@ -20,7 +24,7 @@ on:
 
 # Two concurrent publishes would race on the tag and on PyPI.
 concurrency:
-  group: publish-pytest-xa11y
+  group: publish-strands-xa11y
   cancel-in-progress: false
 
 jobs:
@@ -47,20 +51,20 @@ jobs:
         id: bump
         run: |
           VERSION=$(python .github/scripts/bump_python_package.py \
-            --package pytest-xa11y --level "${{ inputs.level }}")
+            --package strands-xa11y --level "${{ inputs.level }}")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=pytest-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=strands-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pytest-xa11y/pyproject.toml
-          git commit -m "chore(pytest-xa11y): release ${{ steps.bump.outputs.version }}"
-          git tag -a "pytest-xa11y-v${{ steps.bump.outputs.version }}" \
-            -m "pytest-xa11y ${{ steps.bump.outputs.version }}"
+          git add strands-xa11y/pyproject.toml
+          git commit -m "chore(strands-xa11y): release ${{ steps.bump.outputs.version }}"
+          git tag -a "strands-xa11y-v${{ steps.bump.outputs.version }}" \
+            -m "strands-xa11y ${{ steps.bump.outputs.version }}"
           git push origin HEAD:main
-          git push origin "pytest-xa11y-v${{ steps.bump.outputs.version }}"
+          git push origin "strands-xa11y-v${{ steps.bump.outputs.version }}"
 
   build:
     name: Build sdist and wheel
@@ -84,63 +88,67 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tooling
-        run: python -m pip install --upgrade build
+        run: python -m pip install --upgrade build twine
 
-      # The floor is now `xa11y>=0.13.0`, the first release carrying the GIL
-      # fix (#359). It stood at `>=0.12` while that fix was on main but in no
-      # released version, so that CI could install the package at all.
-      # Publishing with the placeholder back in place would ship metadata
-      # permitting an xa11y that freezes the consumer's threads, and the
-      # plugin's own tests below cannot catch it — they fake `App.find`. This
-      # check is what stands between a revert and PyPI, so it stays.
-      - name: Refuse to publish with a placeholder dependency floor
+      # The xa11y bound is a minor range, not a floor: this package reads
+      # xa11y's structured diagnosis fields and its exception class names by
+      # string (strands_xa11y/_errors.py), and pre-1.0 those can move in a
+      # minor release. A bound that had drifted open would ship metadata
+      # promising compatibility with an xa11y this package has never been run
+      # against — and the tests below cannot catch it, because they swap in a
+      # fake xa11y. This check is what stands between that and PyPI.
+      - name: Refuse to publish without an upper bound on xa11y
         run: |
-          FLOOR=$(grep -oE '"xa11y>=[0-9.]+"' pytest-xa11y/pyproject.toml)
-          echo "declared floor: $FLOOR"
-          if [ "$FLOOR" = '"xa11y>=0.12"' ]; then
-            echo "::error::pytest-xa11y still declares the placeholder floor xa11y>=0.12."
-            echo "Raise it to the first released xa11y containing the App.find GIL fix"
-            echo "(xa11y/xa11y#359) before publishing. See pytest-xa11y/RELEASING.md."
+          BOUND=$(grep -oE '"xa11y>=[0-9.]+,<[0-9.]+"' strands-xa11y/pyproject.toml || true)
+          echo "declared bound: $BOUND"
+          if [ -z "$BOUND" ]; then
+            echo "::error::strands-xa11y must declare xa11y as a bounded minor range"
+            echo "(for example \"xa11y>=0.13.0,<0.14.0\"), not a bare floor."
+            echo "See strands-xa11y/RELEASING.md."
             exit 1
           fi
 
       # Note this resolves xa11y from PyPI, not from this workspace: the job
-      # has no Rust toolchain. It therefore verifies the plugin against the
+      # has no Rust toolchain. It therefore verifies the package against the
       # released library a consumer would actually get, which is the right
-      # thing for a publish gate — and the reason the floor check above has
-      # to come first, since the tests fake App.find and would pass happily
-      # against a version without the fix.
-      - name: Verify the plugin's own tests pass before publishing
+      # thing for a publish gate. The CI job does the reverse — it runs the
+      # surface check against the freshly built bindings — and the two
+      # together are what the bound check above depends on.
+      - name: Verify the tests pass before publishing
         run: |
-          python -m pip install -e ./pytest-xa11y
+          python -m pip install -e ./strands-xa11y
           python -m pip install pytest
-          python -m pytest pytest-xa11y/tests -q
-          python -c "import xa11y, sys; print('resolved xa11y', xa11y.__version__ if hasattr(xa11y, '__version__') else '(unknown)')"
+          python -m pytest strands-xa11y/tests -q
+          python strands-xa11y/tests/check_real_surface.py
 
       - name: Build
-        working-directory: pytest-xa11y
+        working-directory: strands-xa11y
         run: python -m build --sdist --wheel --outdir dist
+
+      - name: Check distribution metadata
+        working-directory: strands-xa11y
+        run: twine check dist/*
 
       # Named for this package: the xa11y wheel jobs upload as `wheels-*` and
       # its publish step downloads that pattern with merge-multiple, so a
-      # `wheels-` prefix here would push pytest-xa11y into the xa11y release.
+      # `wheels-` prefix here would push strands-xa11y into the xa11y release.
       - uses: actions/upload-artifact@v7
         with:
-          name: pytest-xa11y-dist
-          path: pytest-xa11y/dist/*
+          name: strands-xa11y-dist
+          path: strands-xa11y/dist/*
 
   publish-pypi:
     name: Publish to PyPI
     needs: [build]
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
-    environment: pypi-pytest-xa11y
+    environment: pypi-strands-xa11y
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: pytest-xa11y-dist
+          name: strands-xa11y-dist
           path: dist
 
       - uses: pypa/gh-action-pypi-publish@release/v1
@@ -167,7 +175,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: pytest-xa11y-dist
+          name: strands-xa11y-dist
           path: dist
 
       # On the bump path the version comes from the job that did the bumping.
@@ -179,35 +187,34 @@ jobs:
         run: |
           VERSION="${{ needs.version-bump.outputs.version }}"
           if [ -z "$VERSION" ]; then
-            VERSION=$(python .github/scripts/bump_python_package.py --package pytest-xa11y --show)
+            VERSION=$(python .github/scripts/bump_python_package.py --package strands-xa11y --show)
           fi
-          echo "tag=pytest-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=strands-xa11y-v$VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # Auto-generated notes rather than the AI-classified pipeline the xa11y
       # release uses: that prompt is written about the xa11y public API
-      # (App, locators, roles, actions, events) and would misclassify plugin
-      # changes. Revisit if this package's changelog gets busy enough to
-      # deserve its own prompt.
+      # (App, locators, roles, actions, events) and would misclassify a change
+      # to this package's tool schema.
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          # Anchor the generated notes to the previous pytest-xa11y tag.
+          # Anchor the generated notes to the previous strands-xa11y tag.
           # Without it GitHub compares against the newest release in the repo,
           # which is normally an xa11y `v*` release, and the notes would list
           # every xa11y commit since then.
-          PREV=$(git tag --list 'pytest-xa11y-v*' --sort=-v:refname \
+          PREV=$(git tag --list 'strands-xa11y-v*' --sort=-v:refname \
                    | grep -v "^$TAG$" | head -n1)
           if [ -n "$PREV" ]; then
             gh release create "$TAG" \
-              --title "pytest-xa11y ${{ steps.tag.outputs.version }}" \
+              --title "strands-xa11y ${{ steps.tag.outputs.version }}" \
               --generate-notes --notes-start-tag "$PREV" \
               dist/*
           else
             gh release create "$TAG" \
-              --title "pytest-xa11y ${{ steps.tag.outputs.version }}" \
+              --title "strands-xa11y ${{ steps.tag.outputs.version }}" \
               --generate-notes \
               dist/*
           fi
