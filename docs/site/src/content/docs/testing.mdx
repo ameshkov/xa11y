@@ -28,9 +28,10 @@ JavaScript, and the CLI. Roughly:
 | Rust integration | ~150 | `xa11y/tests/integ/` | Live tree reads, action dispatch, events, screenshots against a running app |
 | Python binding unit | ~240 | `xa11y-python/tests/` | The PyO3 surface: types, actions, exceptions, GIL release, subscriptions |
 | Python integration | ~100 | `tests/suites/python/` | Per-app compat, actions, events, errors, input simulation, screenshots |
-| CLI integration | ~30 | `tests/suites/cli/` | The `xa11y` CLI end-to-end against running apps |
+| CLI integration | ~70 | `tests/suites/cli/` | The `xa11y` CLI end-to-end against running apps, plus the MCP server over every CLI launcher |
 | JavaScript unit | ~115 | `xa11y-js/__test__/unit/` | The napi-rs binding surface |
 | JavaScript integration | ~40 | `tests/suites/js/` | Per-app compat, actions, input simulation, screenshots |
+| MCP client interop | ~30 | `tests/mcp_client/` | `xa11y mcp` driven by the official MCP Python SDK, in both protocol eras |
 
 Counts are approximate and grow over time, so read the figures above as a rough
 shape. The authoritative coverage index, recording which app is tested in which
@@ -105,6 +106,50 @@ input simulation, screenshots) against the *same* running app, driven by a
 shared harness (`tests/harness/launch.py`). Binding parity is proven by every
 binding passing identical scenarios against an identical target, rather than
 asserted by hand.
+
+## Checked against a real MCP client
+
+The MCP server has two test suites, and the split is deliberate.
+`tests/suites/cli/test_mcp.py` speaks raw JSON-RPC and asserts the shapes this
+project believes the specification asks for. `tests/mcp_client/` drives the
+same server with the official MCP Python SDK and asserts that a real client
+agrees.
+
+Those are different questions. The SDK validates responses against wire models
+pinned to each protocol revision, and those models mark as required several
+fields the prose describes as MUST. The server returned `tools/list` and
+`server/discover` without their mandatory caching hints, and the raw-JSON
+suite passed the whole time, because it was checking one reading of the spec
+against itself. The SDK rejected the response outright on first contact.
+
+Each suite covers what the other cannot. The SDK exercises what a real client
+actually sends, in both protocol eras. The raw-JSON suite exercises what the
+SDK refuses to send: malformed lines, unsupported protocol versions,
+notifications out of order.
+
+The interop job runs on Linux only. The server is hand-rolled JSON-RPC over
+standard streams with no platform-specific code in it, so the answer does not
+vary by operating system; the accessibility layer beneath it is what does, and
+the integration matrix covers that.
+
+## One CLI, three launchers
+
+The `xa11y` command comes with all three packages, and all three run the same
+Rust code: `cargo install xa11y` produces the binary, `pip install xa11y`
+installs a console script into it, and the npm package installs a Node bin
+that does the same. Nothing checked that they agreed until the MCP suite
+(`tests/suites/cli/test_mcp.py`), which runs every one of its tests once per
+launcher.
+
+That parametrization found real drift on its first run: the Python wrapper
+mapped every failure to exit code 1, losing the documented 2 for usage errors,
+and prefixed those messages twice. The exit-code contract now lives in one
+Rust function that all three launchers call.
+
+The integration cells set `XA11Y_REQUIRE_ALL_CLI`, which turns a missing
+launcher into a failure. A suite that quietly narrowed itself to whichever
+launcher happened to be built would look exactly like one that tested all
+three.
 
 ## The CI matrix
 

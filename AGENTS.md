@@ -75,6 +75,100 @@ These tenets are firm defaults, not absolutes. If a situation genuinely requires
 
 All raw CoreFoundation / AX FFI calls in `xa11y-macos/src/ax.rs` must go through the wrappers in `xa11y-macos/src/exception_safe.m`. That file wraps calls like `CFRetain`, `CFRelease`, `CFGetTypeID`, `CFNumberGetValue`, `CFBooleanGetValue`, `CFArrayGetCount`, `CFArrayGetValueAtIndex`, and `CFDictionaryGetValue` in `@try`/`@catch`. A misbehaving AX value's `-release` / `-getTypeID` can throw an `NSException` that unwinds through `extern "C"` → process abort. When adding a new CF or AX interop call, go through the `safe_*` wrapper; if one doesn't exist, add it to `exception_safe.m` first. Enforced by `cargo xtask check-macos-ffi` (run automatically as part of `cargo xtask check`), which fails the build if any raw CF/AX symbol is referenced outside a `//` comment in `ax.rs`.
 
+## MCP Server
+
+`xa11y mcp` (`xa11y/src/mcp/`) serves the CLI's operations as Model Context
+Protocol tools over stdio. Two rules govern it.
+
+**stdout is the wire.** The stdio transport reserves stdout for protocol
+messages. A stray `println!` anywhere reachable from a tool handler corrupts
+the session, and it surfaces on the client's side as a parse error that points
+nowhere near the cause. `cargo xtask check-mcp-stdout` (part of `cargo xtask
+check`) fails the build on any print macro under `src/mcp/`. Diagnostics go to
+`eprintln!`, which the spec leaves free.
+
+This is why the MCP handlers reuse `cli`'s *parsers and dispatchers*
+(`resolve_app`, `perform_action`, `parse_key_name`, `parse_button`) but never
+its `cmd_*` functions: those print. When a new operation needs to exist on both
+surfaces, split it into a value-producing half both call and a printing half
+only the CLI calls.
+
+**Results are bounded.** Every tool result lands in a model's context window.
+`tree` is depth- and node-limited, `find` is count-limited, and diagnosis
+candidate lists are truncated — and each of them reports that it truncated. A
+silently shortened result reads as a complete one, which is worse than no
+result.
+
+**A tool description is a contract the handler keeps.** `action` advertises
+"must match exactly one element" and used to act on the first of however many
+matched, which is what `Locator` does by design — the tool inherited the
+behaviour and promised something stricter. A model reading "exactly one"
+cannot tell that it pressed the wrong control, so the tool counts the matches
+and refuses with `ambiguous_selector` and the candidate list. When a
+description states a precondition, the handler enforces it or the description
+stops making the claim. The same rule applies to what a description *omits*:
+the auto-wait, the default timeout, and the fact that `ok: true` means the
+platform accepted the call rather than that anything changed are all in the
+`action` description, because an agent that has to discover them by
+experiment spends calls doing it.
+
+The server is dual-era: it answers `server/discover` for the stateless
+revisions (`2026-07-28` and later) and `initialize` for the handshake ones. The
+era is latched per session from the first request that identifies one, and it
+decides whether results carry `resultType` and the caching hints.
+
+**Test against the real SDK, not only against our reading of the spec.**
+`tests/mcp_client/` drives the server with the official MCP Python SDK
+(`cargo xtask test-mcp-client`, and the `mcp-client` CI job on Linux only). Its
+revision-pinned wire models mark as required several fields the prose describes
+as MUST, so it catches what a hand-rolled assertion cannot: `tools/list` and
+`server/discover` were missing their mandatory `ttlMs` / `cacheScope` hints,
+and `tests/suites/cli/test_mcp.py` passed throughout — it was checking one
+reading of the spec against itself.
+
+Keep the two suites split by what each can reach. The SDK suite covers what a
+real client sends; the raw-JSON suite covers what the SDK refuses to send
+(malformed lines, unsupported protocol versions, notifications out of order),
+which it rejects client-side before anything reaches a socket. When you add a
+protocol feature, add to both.
+
+The SDK version is pinned exactly in `tests/mcp_client/requirements.txt`, for
+the reason `.vale.ini` pins its style package: an upstream release must not be
+able to turn CI red without a commit here. Bumping it is how you find out that
+a new revision demands something new.
+
+`failure_kind` in `xa11y/src/mcp/tools.rs` hand-maps every `Error` variant to a
+stable tag, so that file is listed under `[[types.variant_coverage]]` for
+`Error` in `bindings/parity_allowlist.toml`. A new variant fails the parity
+check until it is named there.
+
+## One CLI, Three Launchers
+
+`xa11y/src/cli.rs` is the only CLI implementation. Three launchers forward
+`argv` into `cli::run_main`:
+
+| Launcher | Entry point |
+|---|---|
+| `cargo install xa11y` | `xa11y/src/bin/xa11y.rs` |
+| `pip install xa11y` | `xa11y._cli` → `_cli_main` (PyO3) |
+| `npm install @crowecawcaw/xa11y` | `xa11y-js/bin/xa11y.js` → `cliMain` (napi) |
+
+`run_main` owns both the error rendering and the exit code (0 success, 1
+operation failed, 2 usage error), because those had already drifted when each
+launcher owned its own: the Python wrapper mapped every failure to 1 and
+double-prefixed usage messages. Both binding entry points **return** the code
+rather than throwing — a thrown napi `Error` cannot carry one without
+re-encoding it in the message.
+
+`tests/suites/cli/test_mcp.py` runs every test once per launcher, discovered
+through `cli_entry_points()` in `tests/harness/launch.py`. The integ cells set
+`XA11Y_REQUIRE_ALL_CLI`, which makes a missing launcher an error rather than a
+quietly narrower run.
+
+Both `cli` and `mcp` sit behind the default-on `cli` feature, so a library
+consumer can drop them with `default-features = false`. `cargo xtask lint`
+builds that configuration, since nothing else would.
+
 ## Bindings Parity
 
 `cargo xtask check-bindings-parity` verifies that the Python and JS bindings mirror `xa11y-core`'s public API. It reads core's real public surface from **rustdoc JSON**, so new public API is discovered automatically rather than needing to be added to a hardcoded list.
@@ -440,6 +534,7 @@ CI runs with `RUSTFLAGS: -Dwarnings`, so all warnings are errors. Individual che
 4. **Integration tests** (if touching provider/test-app code) — `cargo xtask test-integ`
 5. **Python bindings** — `cargo xtask test-python`
 6. **pytest plugin** (if touching `pytest-xa11y/`) — `cargo xtask test-pytest-plugin`
+6b. **MCP interop** (if touching `xa11y/src/mcp/`) — `cargo xtask test-mcp-client`. Not part of `cargo xtask check`: it installs the MCP SDK's dependency tree (pydantic and friends), which the rest of the checks don't need.
 7. **Strands tool** (if touching `strands-xa11y/`, or xa11y's Python error surface) — `cargo xtask test-strands`
 8. **Docs prose** (if touching `README.md` or `docs/site/src/content/docs/`) — `cargo xtask lint-docs`
 9. **Docs site** (if touching `docs/site/src/content/docs/`) — `python docs/check_page_types.py`, `docs/check_tables.py`, `docs/check_links.py`
@@ -466,6 +561,7 @@ cargo xtask test                              # unit tests
 cargo xtask test-python                       # build + test Python bindings
 cargo xtask test-pytest-plugin                # install + test pytest-xa11y
 cargo xtask test-strands                      # install + test strands-xa11y
+cargo xtask test-mcp-client                   # drive `xa11y mcp` with the official MCP SDK
 cargo xtask test-integ                        # integration tests (auto-detects OS)
 cargo xtask test-integ-container              # Linux integration tests via Finch
 cargo xtask test-integ-container tree_has_buttons  # single test in container
