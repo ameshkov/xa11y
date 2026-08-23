@@ -32,6 +32,7 @@ mirrored = [
     "InputSim",
     "Locator",
     "Screenshot",
+    "ShellSurface",
     "Subscription",
 ]
 
@@ -39,6 +40,7 @@ mirrored = [
 # it becomes a primitive, a plain object, or a set of exception classes.
 opaque = [
     { type = "Role", reason = "Roles cross the boundary as strings (`button`, `text_field`); the enum's variants are not mirrored as binding members." },
+    { type = "ShellSurfaceKind", reason = "Shell-surface kinds cross the boundary as strings (`taskbar`, `status_items`) — identically spelled in both bindings, like Role, and converted mechanically via to_snake_case; the enum's variants are not mirrored as binding members." },
     { type = "Error", reason = "Mapped to a hierarchy of native exception classes (XA11yError, TimeoutError, ...) rather than a single mirrored type." },
     { type = "Diagnosis", reason = "Surfaced as structured attributes on the raised exception (selector, condition, candidates, ...), not as its own class." },
     { type = "EventKind", reason = "Exposed as string constants (Python `EventType.FOCUS_CHANGED`, JS `EventTypeName` union) rather than a mirrored enum." },
@@ -183,6 +185,25 @@ files = [
     { path = "xa11y-js/scripts/patch-native-dts.mjs", spelling = "snake", within = "CheckedState" },
 ]
 
+# Every Rust-side list of kind spellings — the CLI's `--shell` help and error
+# message, MCP's `shell` enum, and both bindings' parse errors — is now derived
+# from `ShellSurfaceKind::ALL`, which core's `every_variant_is_in_all` test
+# guards with an exhaustive match. The two lists below cannot be: they are the
+# hand-written type declarations, where a missing kind is a literal a consumer's
+# type checker rejects even though the runtime accepts it.
+[[types.variant_coverage]]
+type = "ShellSurfaceKind"
+reason = "Kinds cross as identically-spelled snake_case string literals; the Python Literal and the TypeScript union are hand-maintained and would silently narrow a kind out of the typed API."
+files = [
+    # No `within`: a Python assignment has no `;` for the slicer to stop at,
+    # so this is whole-file — the same scope the EventKind entry above uses.
+    # It catches the case that matters (a new kind named nowhere in the stub);
+    # a kind deleted from the Literal while a docstring still quotes it can
+    # slip, which is why by_kind's docstring no longer lists them.
+    { path = "xa11y-python/python/xa11y/_native.pyi", spelling = "snake" },
+    { path = "xa11y-js/scripts/patch-native-dts.mjs", spelling = "snake", within = "ShellSurfaceKindName" },
+]
+
 [[types.variant_coverage]]
 type = "StateFlag"
 reason = "Each variant maps to a distinct state-name string in both bindings; an unmapped one would surface as 'unknown'."
@@ -229,6 +250,12 @@ rust_only = [
     { method = "App::try_find_with", reason = "Fallible-predicate variant of find_with; `App.find` routes through it and re-raises predicate errors." },
     { method = "App::provider", reason = "Internal plumbing for provider implementors, not user API." },
     { method = "App::data", reason = "Internal plumbing for provider implementors, not user API." },
+
+    # ShellSurface: same singleton fold as App. `ShellSurface.list()` /
+    # `.by_kind()` in the binding are the `xa11y::ShellSurfaceExt` methods.
+    { method = "ShellSurface::list_with", reason = "Binding uses the singleton provider; `_with` variants are Rust-only plumbing for explicit provider injection." },
+    { method = "ShellSurface::by_kind_with", reason = "Binding uses the singleton provider; `_with` variants are Rust-only plumbing for explicit provider injection." },
+    { method = "ShellSurface::data", reason = "Internal plumbing for provider implementors, not user API." },
 
     # Internal Rust constructors / accessors.
     { method = "Locator::new", reason = "Internal Rust constructor; bindings build Locators via App.locator() / module-level locator()." },
@@ -285,6 +312,8 @@ python_only = [
     { method = "App::foreground", reason = "Binding-level convenience over App::foreground_with; mirrors `xa11y::AppExt::foreground`." },
     { method = "App::list", reason = "Binding-level convenience over App::list_with; mirrors `xa11y::AppExt::list`." },
     { method = "App::find", reason = "Binding-level convenience over App::try_find_with; mirrors `xa11y::AppExt::find`." },
+    { method = "ShellSurface::list", reason = "Binding-level convenience over ShellSurface::list_with; mirrors `xa11y::ShellSurfaceExt::list`." },
+    { method = "ShellSurface::by_kind", reason = "Binding-level convenience over ShellSurface::by_kind_with; mirrors `xa11y::ShellSurfaceExt::by_kind`, taking the kind as a snake_case string and the timeout in seconds." },
 
     { method = "Element::subscribe", reason = "Binding convenience: subscribe to events for any element, delegating to provider.subscribe()." },
     { method = "Subscription::close", reason = "Python context-manager idiom; pairs with __enter__ / __exit__ for explicit cleanup." },
@@ -308,6 +337,12 @@ rust_only = [
     { method = "App::try_find_with", reason = "Fallible-predicate variant of find_with; the JS App.find poll loop propagates predicate errors directly." },
     { method = "App::provider", reason = "Internal plumbing for provider implementors, not user API." },
     { method = "App::data", reason = "Internal plumbing for provider implementors, not user API." },
+
+    # ShellSurface: same singleton fold as App. `ShellSurface.list()` /
+    # `.by_kind()` in the binding are the `xa11y::ShellSurfaceExt` methods.
+    { method = "ShellSurface::list_with", reason = "Binding uses the singleton provider; `_with` variants are Rust-only plumbing for explicit provider injection." },
+    { method = "ShellSurface::by_kind_with", reason = "Binding uses the singleton provider; `_with` variants are Rust-only plumbing for explicit provider injection." },
+    { method = "ShellSurface::data", reason = "Internal plumbing for provider implementors, not user API." },
 
     { method = "Locator::new", reason = "Internal Rust constructor; bindings build Locators via App.locator() / module-level locator()." },
     { method = "Element::new", reason = "Internal Rust constructor; bindings obtain Elements via Locator / navigation." },
@@ -353,6 +388,8 @@ js_only = [
     { method = "App::list", reason = "Binding-level convenience over App::list_with; mirrors `xa11y::AppExt::list`." },
     { method = "App::find", reason = "Binding-level convenience over App::try_find_with; implemented as a poll loop in index.js, declared in index.d.ts." },
     { method = "App::wait_for_event", reason = "JS-only convenience: temporary subscription + single-event wait, declared in index.d.ts." },
+    { method = "ShellSurface::list", reason = "Binding-level convenience over ShellSurface::list_with; mirrors `xa11y::ShellSurfaceExt::list`." },
+    { method = "ShellSurface::by_kind", reason = "Binding-level convenience over ShellSurface::by_kind_with; mirrors `xa11y::ShellSurfaceExt::by_kind`, taking the kind as a snake_case string and the timeout in milliseconds." },
 
     { method = "Element::subscribe", reason = "Binding convenience: subscribe to events for any element, delegating to provider.subscribe()." },
 

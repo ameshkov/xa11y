@@ -6,8 +6,8 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 use xa11y_core::{
-    ElementData, ElementParts, Error, Provider, Rect, Result, Role, StateParts, StateSet,
-    Subscription, Toggled,
+    ElementData, ElementParts, Error, Provider, Rect, Result, Role, ShellSurfaceKind, StateParts,
+    StateSet, Subscription, Toggled,
 };
 use zbus::blocking::{Connection, Proxy};
 
@@ -302,6 +302,38 @@ impl LinuxProvider {
             .map_err(|e| Error::Platform {
                 code: -1,
                 message: format!("GetState deserialize failed: {}", e),
+            })
+    }
+
+    /// Get the AT-SPI attribute set via `GetAttributes` (D-Bus `a{ss}`).
+    ///
+    /// These are the free-form toolkit attributes libatspi renders as
+    /// `"key:value"` strings — `toolkit`, `window-type`, ARIA properties on
+    /// web content, and so on. Nothing else in the provider needs them yet;
+    /// `list_shell_surfaces` reads `window-type` to recognise panels.
+    ///
+    /// `Ok(None)` means the object does not implement `GetAttributes` at all
+    /// (see [`is_absent_member`]) — an attribute set that is *absent*, not one
+    /// that could not be read. Every other D-Bus failure is an error.
+    fn get_attributes(&self, aref: &AccessibleRef) -> Result<Option<HashMap<String, String>>> {
+        let proxy = self.make_proxy(&aref.bus_name, &aref.path, "org.a11y.atspi.Accessible")?;
+        let reply = match proxy.call_method("GetAttributes", &()) {
+            Ok(reply) => reply,
+            Err(e) if is_absent_member(&e) => return Ok(None),
+            Err(e) => {
+                return Err(Error::Platform {
+                    code: -1,
+                    message: format!("GetAttributes failed: {}", e),
+                })
+            }
+        };
+        reply
+            .body()
+            .deserialize::<HashMap<String, String>>()
+            .map(Some)
+            .map_err(|e| Error::Platform {
+                code: -1,
+                message: format!("GetAttributes deserialize failed: {}", e),
             })
     }
 
@@ -1519,6 +1551,95 @@ impl Provider for LinuxProvider {
         }
     }
 
+    /// Enumerate desktop panels and docks.
+    ///
+    /// A Linux shell surface is a top-level AT-SPI frame whose attribute set
+    /// carries `window-type:dock` — how panels self-identify, from
+    /// xfce4-panel's panel and dock rows to GNOME's and KDE's shells. One
+    /// surface per such frame, so a panel process that owns two rows yields
+    /// two [`ShellSurfaceKind::Panel`] entries, each with the panel process's
+    /// pid. Panels are commonly unnamed; the frame's `name` is then `None` and
+    /// the core falls back to the kind.
+    ///
+    /// `Panel` is the only kind Linux vends: the desktop has no menu bar,
+    /// taskbar, or dock object of its own, and StatusNotifierItem *menus* live
+    /// on `com.canonical.dbusmenu`, a different subsystem from AT-SPI. Their
+    /// absence from the listing is honest scope, not failure.
+    ///
+    /// The scan runs over [`list_apps`](Self::list_apps) rather than its own
+    /// registry walk, so it inherits that enumeration's empty-name filter: a
+    /// panel that registers on the bus without a name is invisible here for
+    /// the same reason it is invisible to `App::list`.
+    ///
+    /// # Errors
+    ///
+    /// A top-level that was just enumerated but will not answer `GetRole` or
+    /// `GetAttributes` fails the listing (tenet 1). Those two calls are how a
+    /// frame is classified, and `Panel` is the only kind Linux vends — so
+    /// treating a D-Bus failure as "not a panel" turns one broken process into
+    /// an empty listing that reads exactly like a desktop with no panels. The
+    /// error names the app and object path that would not answer.
+    ///
+    /// An object that answers `GetAttributes` with `UnknownMethod` is the one
+    /// exception, and it is absence rather than failure — see the call site.
+    ///
+    /// Enumerating one app's top-levels is the one step that still skips:
+    /// [`get_atspi_children`](Self::get_atspi_children) failing is how a
+    /// process that has left the bus presents, and `focused_app` already
+    /// treats it that way.
+    fn list_shell_surfaces(&self) -> Result<Vec<(ShellSurfaceKind, ElementData)>> {
+        let mut surfaces = Vec::new();
+        for app in self.list_apps()? {
+            let app_ref = self.get_cached(app.handle)?;
+            let top_levels = match self.get_atspi_children(&app_ref) {
+                Ok(t) => t,
+                // Same policy as `focused_app`: a single app failing to
+                // enumerate its windows shouldn't abort the whole scan — skip
+                // it and keep going.
+                Err(_) => continue,
+            };
+            for top in top_levels
+                .iter()
+                .filter(|t| t.path != "/org/a11y/atspi/null")
+            {
+                // Both answer for a child the app has *just* enumerated, so a
+                // D-Bus failure here is a failure, not absence — and "not a
+                // panel" is the wrong reading of it (tenet 1). Say which
+                // top-level of which app would not answer (tenet 6).
+                //
+                // `GetRole` rather than `GetRoleName` because every AT-SPI
+                // object implements the numeric one, while AccessKit's bridge
+                // (egui, and the other AccessKit-backed toolkits) implements
+                // no `GetRoleName` at all — propagating that reply failed the
+                // whole listing for a desktop running one such app.
+                let role_number = self
+                    .get_role_number(top)
+                    .map_err(|e| classify_failure(&app, top, e))?;
+                // The same absence/failure split on the second read: an object
+                // that does not implement `GetAttributes` cannot advertise
+                // `window-type`, which is an honest "not a panel" — the answer
+                // is in the reply, not missing from it. (AccessKit does serve
+                // this one; the bridges that skip it are the reason the split
+                // is here rather than only on the role.) Every other D-Bus
+                // outcome — ServiceUnknown, NoReply, a timeout, a dropped
+                // connection — still fails the listing.
+                let Some(attributes) = self
+                    .get_attributes(top)
+                    .map_err(|e| classify_failure(&app, top, e))?
+                else {
+                    continue;
+                };
+                if is_dock_frame(role_number, &attributes) {
+                    surfaces.push((
+                        ShellSurfaceKind::Panel,
+                        self.build_element_data(top, app.pid),
+                    ));
+                }
+            }
+        }
+        Ok(surfaces)
+    }
+
     /// Enumerate top-level applications by listing direct children of the
     /// AT-SPI registry root — every running accessibility-enabled app
     /// registers a child accessible there. Apps with empty names are
@@ -2116,6 +2237,14 @@ pub(crate) fn map_atspi_role(role_name: &str) -> Role {
     }
 }
 
+/// `AtspiRole::Frame` — the numeric role a top-level window frame reports.
+///
+/// Named because `is_dock_frame` needs the number itself: the table below
+/// folds `Frame` and `Window` (69) into the same `Role::Window`, and a panel
+/// registers only as the former. `test_frame_role_number_is_the_atspi_frame_role`
+/// pins it against the AtspiRole enum the tests carry.
+const ATSPI_ROLE_FRAME: u32 = 23;
+
 /// Map AT-SPI2 numeric role (AtspiRole enum) to xa11y Role.
 /// Values from atspi-common Role enum (repr(u32)).
 pub(crate) fn map_atspi_role_number(role: u32) -> Role {
@@ -2257,6 +2386,75 @@ fn is_never_descend_atspi_role(role: &str) -> bool {
         role,
         "label" | "separator" | "image" | "icon" | "static" | "caption"
     )
+}
+
+/// Whether a top-level accessible is a desktop panel or dock: an AT-SPI2
+/// `frame` (numeric role [`ATSPI_ROLE_FRAME`]) whose attribute set carries
+/// `window-type:dock`.
+///
+/// The role arrives as the number `GetRole` reports rather than the
+/// `GetRoleName` string: the numeric method is the one every AT-SPI object
+/// implements. `map_atspi_role_number` is no help here — `Frame` (23) and
+/// `Window` (69) both map to `Role::Window`, and only the former is what a
+/// panel registers as.
+///
+/// `window-type` mirrors the window manager's `_NET_WM_WINDOW_TYPE` hint, so
+/// it is set by the panel itself rather than inferred — an ordinary
+/// application window carries `normal`, or no `window-type` at all.
+fn is_dock_frame(role_number: u32, attributes: &HashMap<String, String>) -> bool {
+    role_number == ATSPI_ROLE_FRAME && attributes.get("window-type").is_some_and(|t| t == "dock")
+}
+
+/// D-Bus error names that mean the member was never there, as opposed to the
+/// call having failed.
+///
+/// A reply of `UnknownMethod` / `UnknownInterface` / `UnknownObject` is the
+/// bus answering the question: this object does not implement that. AT-SPI
+/// bridges implement the interface partially — AccessKit's serves `GetRole`
+/// and `GetLocalizedRoleName` but no `GetRoleName` at all — so a caller that
+/// reads absence as failure fails on a perfectly healthy desktop.
+const ABSENT_MEMBER_ERRORS: [&str; 3] = [
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+    "org.freedesktop.DBus.Error.UnknownObject",
+];
+
+/// Whether a failed D-Bus call means the member is absent (see
+/// [`ABSENT_MEMBER_ERRORS`]) rather than that the call failed.
+///
+/// `Proxy::call_method` surfaces an error *reply* as
+/// `zbus::Error::MethodError`, which keeps the error name structured — so
+/// this matches the name itself, never a substring of a formatted message.
+/// Every other `zbus::Error` (no reply, a timeout, a service that left the
+/// bus, a broken connection) is a genuine failure and stays one.
+fn is_absent_member(err: &zbus::Error) -> bool {
+    match err {
+        zbus::Error::MethodError(name, ..) => ABSENT_MEMBER_ERRORS.contains(&name.as_str()),
+        _ => false,
+    }
+}
+
+/// Re-word a classification failure so it names the top-level that would not
+/// answer and the application that had just listed it.
+///
+/// The shell scan classifies a frame by two D-Bus reads, and either failing
+/// aborts the listing rather than being read as "not a panel" (tenet 1). What
+/// the raw `GetRole failed: …` does not say is *whose* window it was — which
+/// is the whole of what a consumer needs to know to go look (tenet 6).
+fn classify_failure(app: &ElementData, top: &AccessibleRef, err: Error) -> Error {
+    let name = app.name.as_deref().unwrap_or("<unnamed>");
+    let pid = app.pid.map(|p| format!(" pid={p}")).unwrap_or_default();
+    Error::Platform {
+        code: match &err {
+            Error::Platform { code, .. } => *code,
+            _ => -1,
+        },
+        message: format!(
+            "could not classify top-level {} of application \"{name}\"{pid} as a shell \
+             surface: {err}",
+            top.path
+        ),
+    }
 }
 
 /// Map an AT-SPI2 action name to its canonical `snake_case` xa11y action name.
@@ -2665,5 +2863,175 @@ mod tests {
                 "container role {role:?} must remain descendable"
             );
         }
+    }
+
+    fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// A panel frame is the `window-type:dock` attribute and nothing else —
+    /// xfce4-panel's rows are unnamed frames, so no name test can stand in
+    /// for it.
+    #[test]
+    fn test_dock_frame_detection() {
+        assert!(is_dock_frame(
+            ATSPI_ROLE_FRAME,
+            &attrs(&[("toolkit", "GTK"), ("window-type", "dock")])
+        ));
+        // An ordinary application window: same role, different window type.
+        assert!(!is_dock_frame(
+            ATSPI_ROLE_FRAME,
+            &attrs(&[("window-type", "normal")])
+        ));
+        // Most toolkits set no `window-type` at all.
+        assert!(!is_dock_frame(
+            ATSPI_ROLE_FRAME,
+            &attrs(&[("toolkit", "GTK")])
+        ));
+        assert!(!is_dock_frame(ATSPI_ROLE_FRAME, &HashMap::new()));
+    }
+
+    /// The frame role number is the one `GetRoleName` would spell "frame" —
+    /// the classification moved to `GetRole` because AccessKit's bridge
+    /// implements only the numeric method.
+    #[test]
+    fn test_frame_role_number_is_the_atspi_frame_role() {
+        let (number, name) = ATSPI_ROLE_ENUM
+            .iter()
+            .find(|(_, name)| *name == "frame")
+            .copied()
+            .expect("the AtspiRole table must carry `frame`");
+        assert_eq!(number, ATSPI_ROLE_FRAME, "{name} moved");
+    }
+
+    /// The dock attribute only makes a surface on a top-level frame. `panel`
+    /// (39) is the AT-SPI role for an ordinary grouping container (it maps to
+    /// `Role::Group`), and `window` (69) / `dialog` (16) are not what panels
+    /// register as — `Window` in particular shares `Role::Window` with
+    /// `Frame`, so only the raw number tells them apart.
+    #[test]
+    fn test_dock_frame_requires_frame_role() {
+        let dock = attrs(&[("window-type", "dock")]);
+        for (number, name) in ATSPI_ROLE_ENUM
+            .iter()
+            .filter(|(number, _)| *number != ATSPI_ROLE_FRAME)
+        {
+            assert!(
+                !is_dock_frame(*number, &dock),
+                "role {number} ({name:?}) must not be reported as a shell surface"
+            );
+        }
+    }
+
+    /// Build the `zbus::Error` a D-Bus error reply of `name` arrives as, the
+    /// way `Proxy::call_method` hands it back.
+    fn method_error(name: &str) -> zbus::Error {
+        let call = zbus::Message::method_call("/org/a11y/atspi/accessible/7", "GetAttributes")
+            .expect("method-call builder")
+            .serial(std::num::NonZeroU32::new(1).expect("nonzero"))
+            .build(&())
+            .expect("build method call");
+        let reply = zbus::Message::error(&call.header(), name)
+            .expect("error builder")
+            .serial(std::num::NonZeroU32::new(2).expect("nonzero"))
+            .build(&"boom")
+            .expect("build error reply");
+        zbus::Error::from(reply)
+    }
+
+    /// An object that does not implement the method it was asked for is
+    /// absence, not failure: AccessKit's AT-SPI bridge (egui and friends)
+    /// answers `GetRole` but has no `GetRoleName`, and reading that reply as a
+    /// platform error failed the whole shell listing for every desktop running
+    /// one such app.
+    #[test]
+    fn an_unimplemented_member_reads_as_absence() {
+        for name in ABSENT_MEMBER_ERRORS {
+            assert!(
+                is_absent_member(&method_error(name)),
+                "{name} must read as absence"
+            );
+        }
+    }
+
+    /// Everything else stays a failure — including the D-Bus errors that look
+    /// superficially similar but mean the far end is broken or gone.
+    #[test]
+    fn other_dbus_failures_are_not_absence() {
+        for name in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.Timeout",
+            "org.freedesktop.DBus.Error.Disconnected",
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.freedesktop.DBus.Error.UnknownProperty",
+        ] {
+            assert!(
+                !is_absent_member(&method_error(name)),
+                "{name} must stay a failure"
+            );
+        }
+        // A transport-level failure carries no error name at all.
+        assert!(!is_absent_member(&zbus::Error::InvalidReply));
+    }
+
+    /// A frame the scan could not classify must fail the listing, naming the
+    /// app and the object path. `Panel` is the only kind Linux vends, so
+    /// swallowing this would render a broken panel process as a desktop with
+    /// no panels at all — indistinguishable from the honest empty answer.
+    #[test]
+    fn a_classification_failure_names_the_app_and_the_top_level() {
+        let mut app = ElementData::for_role(Role::Application);
+        app.name = Some("xfce4-panel".to_string());
+        app.pid = Some(4242);
+        let top = AccessibleRef {
+            bus_name: ":1.42".to_string(),
+            path: "/org/a11y/atspi/accessible/7".to_string(),
+        };
+        let err = classify_failure(
+            &app,
+            &top,
+            Error::Platform {
+                code: -1,
+                message: "GetRole failed: connection closed".to_string(),
+            },
+        );
+        let Error::Platform { code, message } = err else {
+            panic!("a D-Bus failure must stay a platform error");
+        };
+        assert_eq!(code, -1);
+        assert!(message.contains("xfce4-panel"), "{message}");
+        assert!(message.contains("pid=4242"), "{message}");
+        assert!(
+            message.contains("/org/a11y/atspi/accessible/7"),
+            "{message}"
+        );
+        // Never masks the underlying D-Bus error (tenet 1).
+        assert!(message.contains("GetRole failed"), "{message}");
+    }
+
+    /// An unnamed application still produces a usable message — the object
+    /// path is what a consumer actually goes looking with.
+    #[test]
+    fn a_classification_failure_survives_an_unnamed_app() {
+        let app = ElementData::for_role(Role::Application);
+        let top = AccessibleRef {
+            bus_name: ":1.9".to_string(),
+            path: "/org/a11y/atspi/accessible/3".to_string(),
+        };
+        let err = classify_failure(
+            &app,
+            &top,
+            Error::Platform {
+                code: -1,
+                message: "GetAttributes failed".to_string(),
+            },
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("<unnamed>"), "{msg}");
+        assert!(msg.contains("/org/a11y/atspi/accessible/3"), "{msg}");
     }
 }
