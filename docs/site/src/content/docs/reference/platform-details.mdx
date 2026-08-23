@@ -74,6 +74,30 @@ Roles not recognized by a platform map to `Unknown`.
 | `ShowMenu` | AXShowMenu | menu, showmenu, popup | ExpandCollapsePattern |
 | `ScrollIntoView` | *(no-op, no AX equivalent)* | Component.ScrollTo | ScrollItemPattern |
 
+Window verbs map differently again, because each platform's window control
+API is separate from its element-action interface:
+
+| xa11y Action | macOS | Linux (AT-SPI) | Windows (UIA) |
+| --- | --- | --- | --- |
+| `Raise` | AXRaise | Component.GrabFocus *(same path as Focus)* | restore if minimized, then SetForegroundWindow and SetFocus |
+| `Minimize` | set AXMinimized=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Minimized) |
+| `Maximize` | set AXZoomed=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
+| `Restore` | clear AXMinimized / AXZoomed | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
+| `Close` | press the AXCloseButton | *(unsupported)* | WindowPattern.Close |
+| `MoveTo` | set AXPosition | *(unsupported)* | TransformPattern.Move *(physical pixel conversion)* |
+| `ResizeTo` | set AXSize | *(unsupported)* | TransformPattern.Resize *(physical pixel conversion)* |
+
+Window state reads follow the same split. `minimized`, `maximized`, and
+`fullscreen` are `Option<bool>`: `None` means *unknown*, either because the
+element is not a window or because the platform cannot report the state.
+macOS reads all three
+(`AXMinimized` / `AXZoomed` / `AXFullScreen`) on window-like elements;
+Windows reads `minimized` and `maximized` from
+`WindowPattern.CurrentWindowVisualState` but cannot report `fullscreen`;
+Linux reads `minimized` from the AT-SPI `ICONIFIED` bit and cannot report
+`maximized` or `fullscreen`. `modal` is `WindowPattern.CurrentIsModal` on
+Windows and `AXModal` on macOS.
+
 ## Platform caveats
 
 ### ScrollIntoView

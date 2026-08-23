@@ -260,6 +260,7 @@ def test_tools_list_is_complete_and_deterministic(mcp):
     assert first == second, "the spec asks for a deterministic order"
     assert first == [
         "apps",
+        "windows",
         "tree",
         "find",
         "action",

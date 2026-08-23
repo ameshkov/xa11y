@@ -398,6 +398,39 @@ impl App {
             .collect())
     }
 
+    /// List the top-level windows of the process owning `data`, using an
+    /// explicit provider.
+    ///
+    /// Prefer [`App::windows`], which uses this `App`'s provider.
+    ///
+    /// `data` is typically the application element from
+    /// [`list_with`](Self::list_with). On Windows the app entry *is* a
+    /// top-level window, so this returns every top-level window of the
+    /// process (main window + modal dialogs), including `data` itself if it
+    /// qualifies. The results are deduplicated by element handle.
+    pub fn windows_with(provider: Arc<dyn Provider>, data: &ElementData) -> Result<Vec<Element>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for d in provider.list_windows(data)? {
+            if seen.insert(d.handle) {
+                out.push(Element::new(d, Arc::clone(&provider)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// List the top-level windows of this application.
+    ///
+    /// Each call queries the provider — results are not cached. On Linux and
+    /// macOS these are the app's `role=Window` children; on Windows, where
+    /// each [`App`] entry is itself a top-level window, this returns all
+    /// top-level windows of the process (including the entry this `App`
+    /// represents). Duplicate handles (an app entry that is also returned by
+    /// its own process enumeration) are collapsed.
+    pub fn windows(&self) -> Result<Vec<Element>> {
+        Self::windows_with(Arc::clone(&self.provider), &self.data)
+    }
+
     fn from_data(provider: Arc<dyn Provider>, data: ElementData) -> Self {
         let name = data.name.clone().unwrap_or_default();
         let pid = data.pid;
@@ -618,6 +651,30 @@ mod tests {
         fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
             self.inner.perform_action(e, a)
         }
+        fn list_windows(&self, e: &ElementData) -> Result<Vec<ElementData>> {
+            self.inner.list_windows(e)
+        }
+        fn raise(&self, e: &ElementData) -> Result<()> {
+            self.inner.raise(e)
+        }
+        fn minimize(&self, e: &ElementData) -> Result<()> {
+            self.inner.minimize(e)
+        }
+        fn maximize(&self, e: &ElementData) -> Result<()> {
+            self.inner.maximize(e)
+        }
+        fn restore(&self, e: &ElementData) -> Result<()> {
+            self.inner.restore(e)
+        }
+        fn close(&self, e: &ElementData) -> Result<()> {
+            self.inner.close(e)
+        }
+        fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+            self.inner.move_to(e, x, y)
+        }
+        fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+            self.inner.resize_to(e, w, h)
+        }
         fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
             self.inner.subscribe(e)
         }
@@ -677,6 +734,14 @@ mod tests {
         fn focused_app(&self) -> Result<ElementData> {
             Ok(Self::window("Modal", 101, true))
         }
+        fn list_windows(&self, _e: &ElementData) -> Result<Vec<ElementData>> {
+            // Both top-level windows belong to the shared process (issue #304);
+            // `window(en)` on either app entry must yield both.
+            Ok(vec![
+                Self::window("Main", 100, false),
+                Self::window("Modal", 101, true),
+            ])
+        }
         fn get_children(&self, e: Option<&ElementData>) -> Result<Vec<ElementData>> {
             self.inner.get_children(e)
         }
@@ -730,6 +795,27 @@ mod tests {
         }
         fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
             self.inner.perform_action(e, a)
+        }
+        fn raise(&self, e: &ElementData) -> Result<()> {
+            self.inner.raise(e)
+        }
+        fn minimize(&self, e: &ElementData) -> Result<()> {
+            self.inner.minimize(e)
+        }
+        fn maximize(&self, e: &ElementData) -> Result<()> {
+            self.inner.maximize(e)
+        }
+        fn restore(&self, e: &ElementData) -> Result<()> {
+            self.inner.restore(e)
+        }
+        fn close(&self, e: &ElementData) -> Result<()> {
+            self.inner.close(e)
+        }
+        fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+            self.inner.move_to(e, x, y)
+        }
+        fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+            self.inner.resize_to(e, w, h)
         }
         fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
             self.inner.subscribe(e)
@@ -920,6 +1006,104 @@ mod tests {
     }
 
     #[test]
+    fn windows_with_lists_both_windows_of_shared_pid() {
+        // The Windows shape: an app entry IS a window, and `list_windows`
+        // returns every top-level window of the process (issue #304: main +
+        // modal). Both windows must survive the enumeration, and the
+        // per-app `windows()` convenience must agree with the explicit
+        // `windows_with` call.
+        let provider: Arc<dyn Provider> = Arc::new(MultiWindowProvider::new());
+        let app = App::by_pid_with(Arc::clone(&provider), 42, Duration::ZERO)
+            .expect("pid 42 must resolve in the multi-window fixture");
+        let windows =
+            App::windows_with(Arc::clone(&provider), &app.data).expect("windows_with must succeed");
+        let names: Vec<&str> = windows
+            .iter()
+            .map(|w| w.data().name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names, vec!["Main", "Modal"], "both windows must list");
+        let via_app = app.windows().expect("App::windows must succeed");
+        let names2: Vec<&str> = via_app
+            .iter()
+            .map(|w| w.data().name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names2, vec!["Main", "Modal"]);
+    }
+
+    #[test]
+    fn windows_on_mock_returns_main_window_child() {
+        // The macOS/Linux shape: the app element's `role=Window` children.
+        let app = mock_app();
+        let windows = app.windows().expect("windows must succeed");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].data().name.as_deref(), Some("Main Window"));
+    }
+
+    #[test]
+    fn closed_window_leaves_windows_enumeration() {
+        // Real providers drop a closed window from the tree; the mock must
+        // model that too, or a close regression would pass against the mock
+        // and fail on real platforms. A minimized window (also visible=false)
+        // must by contrast STAY listed — `closed`, not `visible`, is the
+        // removal signal.
+        let app = mock_app();
+        let windows = app.windows().expect("windows must succeed");
+        assert_eq!(
+            windows.len(),
+            1,
+            "mock app must expose exactly its main window before any mutation"
+        );
+        windows[0].minimize().expect("minimize must succeed");
+        assert_eq!(
+            app.windows().expect("windows must succeed").len(),
+            1,
+            "a minimized window is visible=false but must stay listed"
+        );
+        let windows = app.windows().expect("windows must succeed");
+        windows[0].close().expect("close must succeed");
+        assert_eq!(
+            app.windows().expect("windows must succeed").len(),
+            0,
+            "a closed window must drop out of the enumeration"
+        );
+    }
+
+    #[test]
+    fn closed_window_stale_handle_is_dead() {
+        // The `closed` flag must make a window vanish not only from
+        // `App::windows()` but from every access through a stale handle:
+        // `get_children`, `get_parent`, and `list_windows` self-inclusion all
+        // treat it as gone, exactly as real providers do after destroying the
+        // element. A mock that resolved a closed window's subtree would pass
+        // tests that fail on real platforms.
+        let app = mock_app();
+        let windows = app.windows().expect("windows must succeed");
+        let window = windows[0].clone();
+        window.close().expect("close must succeed");
+
+        assert!(
+            window
+                .children()
+                .expect("children of a closed window must resolve")
+                .is_empty(),
+            "a closed window must not resolve children through a stale handle"
+        );
+        assert!(
+            window
+                .parent()
+                .expect("parent of a closed window must resolve")
+                .is_none(),
+            "a closed window must not resolve a parent through a stale handle"
+        );
+        assert!(
+            App::windows_with(Arc::clone(app.provider()), window.data())
+                .expect("windows_with must succeed")
+                .is_empty(),
+            "a stale handle to a closed window must not be listed as live"
+        );
+    }
+
+    #[test]
     fn list_with_tags_only_the_active_window_of_a_shared_pid() {
         // Regression for issue #304: a process owning several top-level
         // windows (main window + modal dialog) must surface every window in
@@ -972,6 +1156,12 @@ mod tests {
                 // Reports pid 42 as foreground, but no enumerated entry is
                 // active.
                 Ok(MultiWindowProvider::window("Ghost", 102, false))
+            }
+            fn list_windows(&self, _e: &ElementData) -> Result<Vec<ElementData>> {
+                Ok(vec![
+                    MultiWindowProvider::window("Main", 100, false),
+                    MultiWindowProvider::window("Modal", 101, false),
+                ])
             }
             fn get_children(&self, e: Option<&ElementData>) -> Result<Vec<ElementData>> {
                 self.inner.get_children(e)
@@ -1026,6 +1216,27 @@ mod tests {
             }
             fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
                 self.inner.perform_action(e, a)
+            }
+            fn raise(&self, e: &ElementData) -> Result<()> {
+                self.inner.raise(e)
+            }
+            fn minimize(&self, e: &ElementData) -> Result<()> {
+                self.inner.minimize(e)
+            }
+            fn maximize(&self, e: &ElementData) -> Result<()> {
+                self.inner.maximize(e)
+            }
+            fn restore(&self, e: &ElementData) -> Result<()> {
+                self.inner.restore(e)
+            }
+            fn close(&self, e: &ElementData) -> Result<()> {
+                self.inner.close(e)
+            }
+            fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+                self.inner.move_to(e, x, y)
+            }
+            fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+                self.inner.resize_to(e, w, h)
             }
             fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
                 self.inner.subscribe(e)

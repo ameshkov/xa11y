@@ -3,10 +3,10 @@
 // This module is `#[doc(hidden)]` and not part of the public API.
 // It powers both `cargo install xa11y` and `pip install xa11y` via PyO3.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::*;
-
 /// CLI-level error, separating usage mistakes from operation failures so the
 /// binary can map them to distinct exit codes.
 ///
@@ -123,6 +123,7 @@ pub fn run_main(args: &[String]) -> i32 {
 pub fn run(args: &[String]) -> CliResult<()> {
     match args.first().map(|s| s.as_str()) {
         Some("apps") => cmd_apps(),
+        Some("windows") => cmd_windows(&args[1..]),
         Some("tree") => cmd_tree(&args[1..]),
         Some("find") => cmd_find(&args[1..]),
         Some("action") => cmd_action(&args[1..]),
@@ -151,10 +152,12 @@ Usage:
 
 Accessibility tree:
   xa11y apps                                List running applications
+  xa11y windows [--app NAME | --pid PID]    List top-level windows
   xa11y tree   [--app NAME | --pid PID]     Print the accessibility tree
   xa11y find   SELECTOR [--app NAME | --pid PID] [-o pretty|bounds|center]
                                             Find elements matching a selector
   xa11y action ACTION SELECTOR [--app NAME | --pid PID] [--value V]
+                                            [--at X,Y] [--size W,H]
                                             Perform an action on an element
   xa11y events [--app NAME | --pid PID]     Stream accessibility events
 
@@ -182,7 +185,9 @@ Compose a11y + input/screenshot via `find -o bounds|center`:
 Actions: press, focus, blur, toggle, expand, collapse, select, show-menu,
   scroll-into-view, increment, decrement,
   set-value (requires --value), type-text (requires --value),
-  select-text (requires --value START,END)
+  select-text (requires --value START,END),
+  minimize, maximize, restore, close, raise,
+  move-to (requires --at X,Y), resize-to (requires --size W,H)
 
 Exit codes:
   0  success
@@ -201,6 +206,7 @@ pub(crate) struct Opts {
     pub value: Option<String>,
     // Input simulation / screenshot
     pub at: Option<String>,
+    pub size: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
     pub button: Option<String>,
@@ -273,6 +279,10 @@ pub(crate) fn parse_opts(args: &[String]) -> CliResult<(Opts, Vec<String>)> {
             "--at" => {
                 i += 1;
                 opts.at = Some(flag_value(args, i, "--at")?.to_string());
+            }
+            "--size" => {
+                i += 1;
+                opts.size = Some(flag_value(args, i, "--size")?.to_string());
             }
             "--from" => {
                 i += 1;
@@ -350,6 +360,29 @@ pub(crate) fn parse_point_arg(s: &str, ctx: &str) -> CliResult<Point> {
         .parse()
         .map_err(|_| CliError::Usage(format!("invalid Y in {ctx}: {}", parts[1])))?;
     Ok(Point::new(x, y))
+}
+
+/// Parse a `W,H` size for `resize-to`. Width and height are logical units and
+/// must be positive — a 0-sized window is not a valid resize request.
+pub(crate) fn parse_size_arg(s: &str, ctx: &str) -> CliResult<(u32, u32)> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 2 {
+        return Err(CliError::Usage(format!("{ctx} must be W,H (got: {s})")));
+    }
+    let width: u32 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| CliError::Usage(format!("invalid W in {ctx}: {}", parts[0])))?;
+    let height: u32 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| CliError::Usage(format!("invalid H in {ctx}: {}", parts[1])))?;
+    if width == 0 || height == 0 {
+        return Err(CliError::Usage(format!(
+            "{ctx} must be W,H with positive values (got: {s})"
+        )));
+    }
+    Ok((width, height))
 }
 
 pub(crate) fn parse_region_arg(s: &str) -> CliResult<Rect> {
@@ -500,6 +533,18 @@ pub(crate) fn format_element_oneline(el: &ElementData) -> String {
     if el.states.active {
         states.push("active");
     }
+    // Window states render only when the platform reports them (Some). A
+    // `None` — unknown/not a window — stays silent rather than rendering a
+    // guessed `not minimized`-style label.
+    if el.states.minimized == Some(true) {
+        states.push("minimized");
+    }
+    if el.states.maximized == Some(true) {
+        states.push("maximized");
+    }
+    if el.states.fullscreen == Some(true) {
+        states.push("fullscreen");
+    }
     if el.states.focusable {
         states.push("focusable");
     }
@@ -615,6 +660,61 @@ fn cmd_apps() -> CliResult<()> {
     Ok(())
 }
 
+/// `xa11y windows` — enumerate top-level windows (winlenium's list-windows).
+///
+/// Without a filter, all windows across all applications are listed
+/// (deduplicated by element handle). With `--app NAME` / `--pid PID` only that
+/// application's windows are shown.
+fn cmd_windows(args: &[String]) -> CliResult<()> {
+    let (opts, positional) = parse_opts(args)?;
+    if let Some(arg) = positional.first() {
+        return Err(CliError::Usage(format!(
+            "usage: xa11y windows [--app NAME | --pid PID]; unexpected argument: {arg}"
+        )));
+    }
+    let apps = if opts.app.is_some() || opts.pid.is_some() {
+        vec![resolve_app(&opts)?]
+    } else {
+        App::list()?
+    };
+
+    let mut windows: Vec<Element> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    // On Windows every app entry IS a top-level window, and `App::windows()`
+    // returns the whole top-level set of the process — so one app entry per
+    // pid suffices; visiting each would duplicate every window of a
+    // multi-window process.
+    let mut seen_pids: HashSet<u32> = HashSet::new();
+    for app in &apps {
+        if app.data.role == Role::Window {
+            if let Some(pid) = app.pid {
+                if !seen_pids.insert(pid) {
+                    continue;
+                }
+            }
+        }
+        for w in app.windows()? {
+            if seen.insert(w.data().handle) {
+                windows.push(w);
+            }
+        }
+    }
+
+    if windows.is_empty() {
+        println!("No windows found.");
+        return Ok(());
+    }
+    for w in &windows {
+        println!("{}", format_element_oneline(w));
+    }
+    println!(
+        "({} window{})",
+        windows.len(),
+        if windows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
 fn cmd_tree(args: &[String]) -> CliResult<()> {
     let (opts, _pos) = parse_opts(args)?;
     let app = resolve_app(&opts)?;
@@ -722,7 +822,9 @@ fn cmd_action(args: &[String]) -> CliResult<()> {
     let (opts, positional) = parse_opts(args)?;
     if positional.len() < 2 {
         return Err(CliError::Usage(
-            "usage: xa11y action ACTION SELECTOR [--app NAME | --pid PID] [--value V]".into(),
+            "usage: xa11y action ACTION SELECTOR [--app NAME | --pid PID] [--value V] \
+             [--at X,Y] [--size W,H]"
+                .into(),
         ));
     }
     let action_name = &positional[0];
@@ -731,7 +833,13 @@ fn cmd_action(args: &[String]) -> CliResult<()> {
 
     let app = resolve_app(&opts)?;
     let locator = app.locator(selector);
-    perform_action(&locator, action_name, value.as_deref())?;
+    perform_action(
+        &locator,
+        action_name,
+        value.as_deref(),
+        opts.at.as_deref(),
+        opts.size.as_deref(),
+    )?;
     println!("ok");
     Ok(())
 }
@@ -757,28 +865,54 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "set-numeric-value",
     "type-text",
     "select-text",
+    "minimize",
+    "maximize",
+    "restore",
+    "close",
+    "raise",
+    "move-to",
+    "resize-to",
 ];
 
 /// Actions that require a `--value` (MCP: `value`) argument.
 pub(crate) const ACTIONS_REQUIRING_VALUE: &[&str] =
     &["set-value", "set-numeric-value", "type-text", "select-text"];
 
+/// Actions that require a geometry argument: `--at X,Y` (MCP: `at`) for
+/// `move-to`, `--size W,H` (MCP: `size`) for `resize-to`.
+pub(crate) const ACTIONS_REQUIRING_AT: &[&str] = &["move-to"];
+pub(crate) const ACTIONS_REQUIRING_SIZE: &[&str] = &["resize-to"];
+
 /// Dispatch a named action verb onto `locator`.
 ///
 /// Shared by `xa11y action` and the MCP `action` tool so the two cannot drift
-/// on which verbs exist or which of them need a value. Writes nothing to
-/// stdout: the MCP stdio transport allows only protocol messages there, so
-/// the "ok" line stays in the CLI half.
+/// on which verbs exist or which of them need a value/geometry argument.
+/// `at` / `size` are the raw option strings for the geometry verbs; they are
+/// parsed here, before the locator's auto-wait, so a bad `X,Y` / `W,H` cannot
+/// burn the timeout or reach the platform (parse arguments before the first
+/// OS call). Writes nothing to stdout: the MCP stdio transport allows only
+/// protocol messages there, so the "ok" line stays in the CLI half.
 pub(crate) fn perform_action(
     locator: &Locator,
     action_name: &str,
     value: Option<&str>,
+    at: Option<&str>,
+    size: Option<&str>,
 ) -> CliResult<()> {
     // Each `requires --value` arm re-checks rather than trusting a caller to
     // have consulted ACTIONS_REQUIRING_VALUE (tenet 1: the failure is
     // surfaced where it happens, not assumed away upstream).
     let need_value = |verb: &str| -> CliResult<&str> {
         value.ok_or_else(|| CliError::Usage(format!("{verb} requires a value")))
+    };
+    let need_at = |verb: &str| -> CliResult<(i32, i32)> {
+        let raw = at.ok_or_else(|| CliError::Usage(format!("{verb} requires --at X,Y")))?;
+        let pt = parse_point_arg(raw, "--at")?;
+        Ok((pt.x, pt.y))
+    };
+    let need_size = |verb: &str| -> CliResult<(u32, u32)> {
+        let raw = size.ok_or_else(|| CliError::Usage(format!("{verb} requires --size W,H")))?;
+        parse_size_arg(raw, "--size")
     };
 
     // The dispatch runs inside a closure so every arm's failure passes through
@@ -809,6 +943,19 @@ pub(crate) fn perform_action(
                 let v = need_value("select-text")?;
                 let (start, end) = parse_text_range(v)?;
                 locator.select_text(start, end)?;
+            }
+            "minimize" => locator.minimize()?,
+            "maximize" => locator.maximize()?,
+            "restore" => locator.restore()?,
+            "close" => locator.close()?,
+            "raise" => locator.raise()?,
+            "move-to" => {
+                let (x, y) = need_at("move-to")?;
+                locator.move_to(x, y)?;
+            }
+            "resize-to" => {
+                let (w, h) = need_size("resize-to")?;
+                locator.resize_to(w, h)?;
             }
             other => {
                 return Err(CliError::Usage(format!(
@@ -1196,6 +1343,20 @@ mod tests {
         let err = parse_opts(&args).expect_err("trailing --app must be a usage error");
         assert!(matches!(err, CliError::Usage(_)));
         assert!(format!("{err}").contains("--app requires a value"));
+    }
+
+    #[test]
+    fn cmd_windows_rejects_positional_arg() {
+        // `xa11y windows stray` used to silently ignore the extra argument
+        // (tenet 1); it is now a usage error.
+        let err = cmd_windows(&strs(&["stray"]))
+            .expect_err("a positional argument to `windows` must be a usage error");
+        assert!(matches!(err, CliError::Usage(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stray"),
+            "message must name the offending argument: {msg}"
+        );
     }
 
     #[test]
@@ -1608,6 +1769,14 @@ mod tests {
         // of the action enum; a verb in one list and not the other would be
         // documented and unreachable.
         for verb in ACTIONS_REQUIRING_VALUE {
+            assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
+        }
+        // The geometry-requiring verbs (move-to / resize-to) are advertised
+        // the same way.
+        for verb in ACTIONS_REQUIRING_AT {
+            assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
+        }
+        for verb in ACTIONS_REQUIRING_SIZE {
             assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
         }
     }

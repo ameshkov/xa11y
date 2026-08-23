@@ -9,7 +9,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::*;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, STATE_SYSTEM_SELECTED};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, SetForegroundWindow, STATE_SYSTEM_SELECTED,
+};
 
 use xa11y_core::{
     selector::{matches_simple, Combinator, Selector, SelectorSegment},
@@ -125,9 +127,10 @@ impl WindowsProvider {
     /// single application's subtree.
     fn find_app_by_pid(&self, pid: u32) -> Result<(IUIAutomationElement, String)> {
         let root = uia_call(|| unsafe { self.automation.GetRootElement() })?;
+        let value = pid_variant(pid)?;
         let condition = uia_call(|| unsafe {
             self.automation
-                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &VARIANT::from(pid as i32))
+                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &value)
         })?;
         let el = unsafe { root.FindFirst(TreeScope_Children, &condition) }.map_err(|_| {
             Error::Platform {
@@ -170,7 +173,29 @@ impl WindowsProvider {
 
     /// Query UIA patterns from the element once, sharing across
     /// `get_value`, `get_actions`, and `parse_states` to avoid duplicate COM calls.
-    fn query_patterns(element: &IUIAutomationElement) -> ElementPatterns {
+    ///
+    /// WindowPattern / TransformPattern exist only on top-level window
+    /// elements, and `GetCurrentPatternAs` is a live COM round-trip — not
+    /// served from the snapshot cache — so they are queried only for
+    /// window/dialog roles. Every other element previously paid two failed
+    /// provider calls per snapshot for patterns nothing consults.
+    fn query_patterns(role: Role, element: &IUIAutomationElement) -> ElementPatterns {
+        let window = if matches!(role, Role::Window | Role::Dialog) {
+            unsafe {
+                element.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId)
+            }
+            .ok()
+        } else {
+            None
+        };
+        let transform = if matches!(role, Role::Window | Role::Dialog) {
+            unsafe {
+                element.GetCurrentPatternAs::<IUIAutomationTransformPattern>(UIA_TransformPatternId)
+            }
+            .ok()
+        } else {
+            None
+        };
         ElementPatterns {
             invoke: unsafe {
                 element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
@@ -201,6 +226,8 @@ impl WindowsProvider {
                 )
             }
             .ok(),
+            window,
+            transform,
         }
     }
 
@@ -381,6 +408,19 @@ fn uia_call<T>(f: impl Fn() -> windows::core::Result<T>) -> Result<T> {
     })
 }
 
+/// Build the UIA `ProcessId` property-condition value for `pid`.
+///
+/// UIA property conditions carry an i32: a `u32` pid above 2^31 would wrap
+/// and silently match nothing (tenet 1), so fail surfaceably instead.
+fn pid_variant(pid: u32) -> Result<VARIANT> {
+    i32::try_from(pid)
+        .map(VARIANT::from)
+        .map_err(|_| Error::Platform {
+            code: -1,
+            message: format!("PID {pid} exceeds the i32 range UIA property conditions accept"),
+        })
+}
+
 /// Read a BSTR VARIANT property from the element's pre-fetched snapshot.
 fn uia_cached_bstr(element: &IUIAutomationElement, prop: UIA_PROPERTY_ID) -> Option<String> {
     unsafe { element.GetCachedPropertyValue(prop) }
@@ -473,7 +513,7 @@ fn build_snapshot_data(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
-    let patterns = WindowsProvider::query_patterns(element);
+    let patterns = WindowsProvider::query_patterns(role, element);
     let value = get_value(role, &patterns);
 
     // Try FullDescription first (AccessKit's description), then HelpText
@@ -731,6 +771,12 @@ struct ElementPatterns {
     value: Option<IUIAutomationValuePattern>,
     range_value: Option<IUIAutomationRangeValuePattern>,
     selection_item: Option<IUIAutomationSelectionItemPattern>,
+    /// WindowPattern — present only on elements backed by an HWND frame
+    /// (top-level windows, dialogs). Drives the window verbs and the
+    /// `minimized` / `maximized` / `modal` state reads.
+    window: Option<IUIAutomationWindowPattern>,
+    /// TransformPattern — present on movable/resizable windows.
+    transform: Option<IUIAutomationTransformPattern>,
 }
 
 impl Provider for WindowsProvider {
@@ -847,9 +893,10 @@ impl Provider for WindowsProvider {
     /// named or not.
     fn app_by_pid(&self, pid: u32) -> Result<ElementData> {
         let root = uia_call(|| unsafe { self.automation.GetRootElement() })?;
+        let value = pid_variant(pid)?;
         let condition = uia_call(|| unsafe {
             self.automation
-                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &VARIANT::from(pid as i32))
+                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &value)
         })?;
         // FindFirstBuildCache returns S_OK with a null element when nothing
         // matches; windows-rs surfaces that null as an `Err` carrying the
@@ -1453,6 +1500,255 @@ impl Provider for WindowsProvider {
         })
     }
 
+    // ── Window management ──────────────────────────────────────────
+    //
+    // Window verbs go through UIA's WindowPattern / TransformPattern — the
+    // canonical accessibility interfaces for window state and geometry. No
+    // input simulation is involved (tenet 2).
+
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        // All top-level windows owned by the element's process. A UIA app
+        // entry IS a top-level window, so this returns a fresh entry for the
+        // same window plus any sibling top-level windows of the pid (the
+        // modal-dialog case, issue #304).
+        let Some(pid) = element.pid else {
+            return Err(Error::Platform {
+                code: -1,
+                message: "window element has no PID; cannot enumerate its top-level windows"
+                    .to_string(),
+            });
+        };
+        let root = uia_call(|| unsafe { self.automation.GetRootElement() })?;
+        let value = pid_variant(pid)?;
+        let condition = uia_call(|| unsafe {
+            self.automation
+                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &value)
+        })?;
+        let found = uia_call(|| unsafe {
+            root.FindAllBuildCache(TreeScope_Children, &condition, &self.batch_request)
+        })?;
+        let mut results = Vec::new();
+        for i in 0..uia_len(&found) {
+            let Some(el) = uia_get(&found, i) else {
+                continue;
+            };
+            // Mirror get_children(None): re-acquire via HWND to activate
+            // AccessKit's UIA provider, then repopulate the snapshot.
+            let el = self
+                .reacquire_via_hwnd(&el)
+                .and_then(|e| self.populate_cache(&e).map_err(|_| ()))
+                .unwrap_or(el);
+            let mut data = self.build_element_data(&el, Some(pid));
+            if data.name.is_none() {
+                data.name = unsafe { el.CurrentName() }.map(|s| s.to_string()).ok();
+            }
+            results.push(data);
+        }
+        Ok(results)
+    }
+
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        // winlenium parity: if minimized, restore; then bring the HWND to the
+        // foreground; then complete with a UIA SetFocus so UIA-backed
+        // providers treat the window as focused.
+        if let Ok(pattern) =
+            unsafe { uia.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+        {
+            if unsafe { pattern.CurrentWindowVisualState() }.ok()
+                == Some(WindowVisualState_Minimized)
+            {
+                unsafe { pattern.SetWindowVisualState(WindowVisualState_Normal) }.map_err(|e| {
+                    Error::Platform {
+                        code: e.code().0 as i64,
+                        message: format!(
+                            "WindowPattern.SetWindowVisualState(Normal) while raising failed: {e}"
+                        ),
+                    }
+                })?;
+            }
+        }
+        let hwnd = unsafe { uia.CurrentNativeWindowHandle() }.map_err(|e| Error::Platform {
+            code: e.code().0 as i64,
+            message: format!("CurrentNativeWindowHandle failed while raising: {e}"),
+        })?;
+        if hwnd.0.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "window has no native handle; cannot raise".to_string(),
+            });
+        }
+        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+            // Windows restricts foreground changes (foreground lock); a
+            // denied SetForegroundWindow is a real failure, not a no-op —
+            // surface it (tenet 1).
+            return Err(Error::Platform {
+                code: -1,
+                message: "SetForegroundWindow was denied (foreground lock); the window may not \
+                          have been raised"
+                    .to_string(),
+            });
+        }
+        unsafe { uia.SetFocus() }.map_err(|e| Error::Platform {
+            code: e.code().0 as i64,
+            message: format!("SetFocus during raise failed: {e}"),
+        })?;
+        Ok(())
+    }
+
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern =
+            unsafe { uia.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+                .map_err(|_| Error::ActionNotSupported {
+                action: "minimize".to_string(),
+                role: element.role,
+            })?;
+        if unsafe { pattern.CurrentCanMinimize() }.ok() != Some(TRUE) {
+            return Err(Error::ActionNotSupported {
+                action: "minimize".to_string(),
+                role: element.role,
+            });
+        }
+        unsafe { pattern.SetWindowVisualState(WindowVisualState_Minimized) }.map_err(|e| {
+            Error::Platform {
+                code: e.code().0 as i64,
+                message: format!("WindowPattern.SetWindowVisualState(Minimized) failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern =
+            unsafe { uia.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+                .map_err(|_| Error::ActionNotSupported {
+                action: "maximize".to_string(),
+                role: element.role,
+            })?;
+        if unsafe { pattern.CurrentCanMaximize() }.ok() != Some(TRUE) {
+            return Err(Error::ActionNotSupported {
+                action: "maximize".to_string(),
+                role: element.role,
+            });
+        }
+        unsafe { pattern.SetWindowVisualState(WindowVisualState_Maximized) }.map_err(|e| {
+            Error::Platform {
+                code: e.code().0 as i64,
+                message: format!("WindowPattern.SetWindowVisualState(Maximized) failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern =
+            unsafe { uia.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+                .map_err(|_| Error::ActionNotSupported {
+                action: "restore".to_string(),
+                role: element.role,
+            })?;
+        let can_minimize = unsafe { pattern.CurrentCanMinimize() }.ok() == Some(TRUE);
+        let can_maximize = unsafe { pattern.CurrentCanMaximize() }.ok() == Some(TRUE);
+        if !can_minimize && !can_maximize {
+            return Err(Error::ActionNotSupported {
+                action: "restore".to_string(),
+                role: element.role,
+            });
+        }
+        unsafe { pattern.SetWindowVisualState(WindowVisualState_Normal) }.map_err(|e| {
+            Error::Platform {
+                code: e.code().0 as i64,
+                message: format!("WindowPattern.SetWindowVisualState(Normal) failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn close(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern =
+            unsafe { uia.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+                .map_err(|_| Error::ActionNotSupported {
+                action: "close".to_string(),
+                role: element.role,
+            })?;
+        unsafe { pattern.Close() }.map_err(|e| Error::Platform {
+            code: e.code().0 as i64,
+            message: format!("WindowPattern.Close failed: {e}"),
+        })?;
+        Ok(())
+    }
+
+    fn move_to(&self, element: &ElementData, x: i32, y: i32) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern = unsafe {
+            uia.GetCurrentPatternAs::<IUIAutomationTransformPattern>(UIA_TransformPatternId)
+        }
+        .map_err(|_| Error::ActionNotSupported {
+            action: "move_to".to_string(),
+            role: element.role,
+        })?;
+        if unsafe { pattern.CurrentCanMove() }.ok() != Some(TRUE) {
+            return Err(Error::ActionNotSupported {
+                action: "move_to".to_string(),
+                role: element.role,
+            });
+        }
+        // UIA TransformPattern works in physical pixels; the core contract is
+        // logical coordinates. Convert at the target position.
+        let scale = crate::dpi::scale_for_logical_point(x, y);
+        unsafe { pattern.Move(f64::from(x) * scale, f64::from(y) * scale) }.map_err(|e| {
+            Error::Platform {
+                code: e.code().0 as i64,
+                message: format!("TransformPattern.Move({x}, {y}) failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn resize_to(&self, element: &ElementData, width: u32, height: u32) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        let pattern = unsafe {
+            uia.GetCurrentPatternAs::<IUIAutomationTransformPattern>(UIA_TransformPatternId)
+        }
+        .map_err(|_| Error::ActionNotSupported {
+            action: "resize_to".to_string(),
+            role: element.role,
+        })?;
+        if unsafe { pattern.CurrentCanResize() }.ok() != Some(TRUE) {
+            return Err(Error::ActionNotSupported {
+                action: "resize_to".to_string(),
+                role: element.role,
+            });
+        }
+        // Logical → physical (see move_to). The scale is that of the monitor
+        // under the window's current origin when bounds are known. Snapshot
+        // bounds are absent for a minimized window (UIA reports a 0×0 rect);
+        // re-query the live rect so a mixed-DPI desktop does not fall back to
+        // the primary monitor's scale.
+        let scale = match element.bounds {
+            Some(b) => crate::dpi::scale_for_logical_point(b.x, b.y),
+            None => {
+                let rect =
+                    unsafe { uia.CurrentBoundingRectangle() }.map_err(|e| Error::Platform {
+                        code: e.code().0 as i64,
+                        message: format!("CurrentBoundingRectangle failed while resizing: {e}"),
+                    })?;
+                crate::dpi::scale_for_physical_point(rect.left, rect.top)
+            }
+        };
+        unsafe { pattern.Resize(f64::from(width) * scale, f64::from(height) * scale) }.map_err(
+            |e| Error::Platform {
+                code: e.code().0 as i64,
+                message: format!("TransformPattern.Resize({width}, {height}) failed: {e}"),
+            },
+        )?;
+        Ok(())
+    }
+
     fn set_value(&self, element: &ElementData, value: &str) -> Result<()> {
         let uia_element = self.get_cached(element.handle)?;
         if let Ok(pattern) = unsafe {
@@ -1573,6 +1869,23 @@ impl Provider for WindowsProvider {
             "increment" => self.increment(element),
             "decrement" => self.decrement(element),
             "scroll_into_view" => self.scroll_into_view(element),
+            "raise" => self.raise(element),
+            "minimize" => self.minimize(element),
+            "maximize" => self.maximize(element),
+            "restore" => self.restore(element),
+            "close" => self.close(element),
+            // Payload verbs have no arguments on the generic escape hatch;
+            // fail surfaceably with how to call them instead of guessing
+            // (tenet 1: no silent fallback).
+            "move_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"move_to\") requires coordinates; call move_to(x, y)"
+                    .to_string(),
+            }),
+            "resize_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"resize_to\") requires dimensions; call \
+                           resize_to(width, height)"
+                    .to_string(),
+            }),
             _ => Err(Error::ActionNotSupported {
                 action: action.to_string(),
                 role: element.role,
@@ -1687,6 +2000,39 @@ fn get_actions(
         actions.push("set_value".to_string());
     }
 
+    // Window verbs, from WindowPattern / TransformPattern.
+    if let Some(ref pattern) = patterns.window {
+        if !actions.iter().any(|a| a == "close") {
+            actions.push("close".to_string());
+        }
+        // Setup for minimize/maximize/restore advertisement, based on what
+        // the window can actually do (CurrentCanMinimize/CurrentCanMaximize).
+        let can_minimize = unsafe { pattern.CurrentCanMinimize() }.ok() == Some(TRUE);
+        let can_maximize = unsafe { pattern.CurrentCanMaximize() }.ok() == Some(TRUE);
+        if can_minimize {
+            actions.push("minimize".to_string());
+        }
+        if can_maximize {
+            actions.push("maximize".to_string());
+        }
+        if can_minimize || can_maximize {
+            actions.push("restore".to_string());
+        }
+    }
+    if let Some(ref pattern) = patterns.transform {
+        if unsafe { pattern.CurrentCanMove() }.ok() == Some(TRUE) {
+            actions.push("move_to".to_string());
+        }
+        if unsafe { pattern.CurrentCanResize() }.ok() == Some(TRUE) {
+            actions.push("resize_to".to_string());
+        }
+    }
+    // `raise` works on any top-level HWND window (SetForegroundWindow +
+    // UIA SetFocus), independent of the pattern set.
+    if matches!(role, Role::Window | Role::Dialog) && !actions.iter().any(|a| a == "raise") {
+        actions.push("raise".to_string());
+    }
+
     actions
 }
 
@@ -1797,13 +2143,38 @@ fn parse_states(
 
     let focusable = unsafe { element.CachedIsKeyboardFocusable() }.unwrap_or(FALSE) == TRUE;
 
+    // Window visual state (minimized / maximized) from WindowPattern. `None`
+    // means unknown: no WindowPattern (non-window element) or a state that
+    // couldn't be read. Fullscreen is not reported by UIA, so it stays
+    // `None` — never guessed `false` (tenet 1).
+    let (minimized, maximized) = match patterns.window {
+        Some(ref pattern) => match unsafe { pattern.CurrentWindowVisualState() } {
+            Ok(WindowVisualState_Minimized) => (Some(true), Some(false)),
+            Ok(WindowVisualState_Maximized) => (Some(false), Some(true)),
+            Ok(_) => (Some(false), Some(false)),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // Modal from WindowPattern.CurrentIsModal — the only authoritative UIA
+    // signal. Previously hard-coded `false`, which reported every modal
+    // dialog (e.g. a WinForms modal form) as non-modal.
+    let modal = match patterns.window {
+        Some(ref pattern) => unsafe { pattern.CurrentIsModal() }.unwrap_or(FALSE) == TRUE,
+        None => false,
+    };
+
     StateParts {
         enabled,
         visible,
         focused,
         active,
         focusable,
-        modal: false,
+        modal,
+        minimized,
+        maximized,
+        fullscreen: None,
         checked,
         selected,
         expanded,
@@ -3206,6 +3577,25 @@ mod tests {
                 "HRESULT 0x{code:08X} must not be classified as an event-subscriber failure"
             );
         }
+    }
+
+    // ── pid_variant ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pid_variant_accepts_pids_in_i32_range() {
+        for pid in [0u32, 1, 42, i32::MAX as u32] {
+            pid_variant(pid).expect("pids within i32 range must convert");
+        }
+    }
+
+    #[test]
+    fn pid_variant_rejects_pids_above_i32_range() {
+        // The smallest pid that no longer fits: 2^31. A silent wrap would
+        // make the UIA ProcessId condition match nothing (tenet 1).
+        let err = pid_variant(i32::MAX as u32 + 1)
+            .expect_err("pid above i32 range must be a surfaceable error");
+        assert!(matches!(err, Error::Platform { .. }));
+        pid_variant(u32::MAX).expect_err("u32::MAX pid must fail");
     }
 
     // ── uia_call retry behaviour (issue #257) ───────────────────────────────

@@ -29,6 +29,7 @@ pytestmark = pytest.mark.timeout(120)
 
 EXPECTED_TOOLS = [
     "apps",
+    "windows",
     "tree",
     "find",
     "action",

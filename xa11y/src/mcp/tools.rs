@@ -22,9 +22,11 @@ use serde_json::{json, Map, Value};
 use super::base64;
 use crate::cli::{
     self, parse_button, parse_held, parse_key_name, resolve_app, CliError, CliResult, Opts,
-    ACTIONS_REQUIRING_VALUE, ACTION_NAMES,
+    ACTIONS_REQUIRING_AT, ACTIONS_REQUIRING_SIZE, ACTIONS_REQUIRING_VALUE, ACTION_NAMES,
 };
-use crate::{App, AppExt, ClickOptions, ClickTarget, DragOptions, Element, Rect, ScrollDelta};
+use crate::{
+    App, AppExt, ClickOptions, ClickTarget, DragOptions, Element, Rect, Role, ScrollDelta,
+};
 
 /// Depth used by `tree` when the caller does not ask for one.
 const TREE_DEFAULT_MAX_DEPTH: usize = 12;
@@ -154,7 +156,10 @@ match in document order, 1-based, and is the only pseudo-class — `:checked`, \
 ordinary attributes: `checked` takes `\"on\"` / `\"off\"` / `\"mixed\"`, and \
 `\"true\"` / `\"false\"` work for `enabled`, `visible`, `focused`, \
 `focusable`, `selected`, `editable`, `expanded`, `required`, `busy`, \
-`modal` and `active`.";
+`modal`, `active`, and the window states `minimized`, `maximized`, and \
+`fullscreen`. A window state that the platform cannot report reads as absent \
+(no attribute) rather than `\"false\"`, so match `minimized=\"true\"` if you \
+need to be sure the state is known.";
 
 /// What one tool call produced.
 #[derive(Debug)]
@@ -234,6 +239,7 @@ pub(crate) struct Xa11yTools;
 /// Every tool name, in list order.
 const TOOL_NAMES: &[&str] = &[
     "apps",
+    "windows",
     "tree",
     "find",
     "action",
@@ -261,6 +267,7 @@ impl ToolHost for Xa11yTools {
     fn call(&self, name: &str, args: &Value) -> CliResult<ToolOutput> {
         match name {
             "apps" => tool_apps(),
+            "windows" => tool_windows(args),
             "tree" => tool_tree(args),
             "find" => tool_find(args),
             "action" => tool_action(args),
@@ -341,6 +348,35 @@ fn tool_definition(name: &str) -> Value {
              the `app` or `pid` the other tools need.",
             json!({ "type": "object", "additionalProperties": false }),
         ),
+        "windows" => {
+            let mut props = app_target_properties();
+            props.insert(
+                "limit".into(),
+                FIND_LIMIT.property(format!(
+                    "Maximum windows to return. Default {FIND_DEFAULT_LIMIT}."
+                )),
+            );
+            tool(
+                "windows",
+                "List top-level windows",
+                "List the top-level windows of one application (give `app` or \
+                 `pid`) or of every running application when neither is given. \
+                 Each window reports its `name`, `bounds`, `states` (including \
+                 `minimized` / `maximized` when the platform can report them) \
+                 and the actions it advertises — the same shape `find` returns \
+                 for elements. Results are capped at the `limit`, and \
+                 `truncated` in the result says whether anything was dropped. \
+                 If one application cannot be enumerated, it is skipped and \
+                 reported in `errors` (with `count` covering only the windows \
+                 that made it), rather than failing the whole listing. \
+                 Windows whose state is unknown to the platform simply omit \
+                 those states rather than reporting a guessed value.\n\n\
+                 The verbs `action` accepts (a window selector) cover this \
+                 surface: `raise`, `minimize`, `maximize`, `restore`, `close`, \
+                 `move-to` (with `at`) and `resize-to` (with `size`).",
+                object_schema(props, &[]),
+            )
+        }
         "tree" => {
             let mut props = app_target_properties();
             props.insert(
@@ -408,8 +444,13 @@ fn tool_definition(name: &str) -> Value {
                     "type": "string",
                     "enum": ACTION_NAMES,
                     "description": format!(
-                        "Accessibility action to perform. These require `value`: {}.",
-                        ACTIONS_REQUIRING_VALUE.join(", ")
+                        "Accessibility action to perform. These require `value`: {}. \
+                         `{at_verb}` requires `at` (X,Y) and `{size_verb}` requires \
+                         `size` (W,H): the platform needs coordinates and cannot be \
+                         told a feature off the action name alone.",
+                        ACTIONS_REQUIRING_VALUE.join(", "),
+                        at_verb = ACTIONS_REQUIRING_AT[0],
+                        size_verb = ACTIONS_REQUIRING_SIZE[0],
                     ),
                 }),
             );
@@ -424,7 +465,7 @@ fn tool_definition(name: &str) -> Value {
                          than acted on. Narrow it with an attribute filter or pick \
                          one with `:nth(n)`. Examples: `button[name=\"Save As\"]`, \
                          `text_field[name=\"Search\"]`, `check_box[checked=\"off\"]`, \
-                         `radio_button:nth(2)`.\n\n{SELECTOR_SYNTAX}"
+                         `radio_button:nth(2)`, `window[name=\"Settings\"]`.\n\n{SELECTOR_SYNTAX}"
                     ),
                 }),
             );
@@ -436,6 +477,22 @@ fn tool_definition(name: &str) -> Value {
                                     and `type-text`, a number for `set-numeric-value` (e.g. \
                                     \"88\", within the element's `min_value`..`max_value`), or \
                                     `START,END` character offsets for `select-text`.",
+                }),
+            );
+            props.insert(
+                "at".into(),
+                json!({
+                    "type": "string",
+                    "description": "`X,Y` screen coordinates (logical points) for `move-to`. \
+                                    Required for `move-to`; ignored otherwise.",
+                }),
+            );
+            props.insert(
+                "size".into(),
+                json!({
+                    "type": "string",
+                    "description": "`W,H` logical dimensions for `resize-to`, both positive. \
+                                    Required for `resize-to`; ignored otherwise.",
                 }),
             );
             tool(
@@ -928,6 +985,8 @@ fn tool_action(args: &Value) -> CliResult<ToolOutput> {
     let action = req_str(args, "action")?;
     let selector = req_str(args, "selector")?;
     let value = opt_str(args, "value")?;
+    let at = opt_str(args, "at")?;
+    let size = opt_str(args, "size")?;
     let app = target_app(args)?;
 
     let locator = app.locator(selector);
@@ -944,7 +1003,7 @@ fn tool_action(args: &Value) -> CliResult<ToolOutput> {
         return Err(ambiguous(selector, &matches));
     }
 
-    cli::perform_action(&locator, action, value)?;
+    cli::perform_action(&locator, action, value, at, size)?;
 
     // `ok` reports that the platform accepted the call. Whether the
     // application did anything with it is only knowable by re-reading, which
@@ -954,6 +1013,67 @@ fn tool_action(args: &Value) -> CliResult<ToolOutput> {
         "action": action,
         "selector": selector,
         "application": app.name,
+    })))
+}
+
+/// `windows` tool — enumerate top-level windows (winlenium's list-windows).
+///
+/// Without `app`/`pid` this lists the windows of every running application;
+/// with either it lists those of that one application. Bounded by `limit`
+/// with an explicit `truncated` flag: a silently shortened result reads as a
+/// complete one, which is worse than no result.
+fn tool_windows(args: &Value) -> CliResult<ToolOutput> {
+    let limit = opt_usize(args, "limit", FIND_DEFAULT_LIMIT, FIND_LIMIT)?;
+    let apps = if args.get("app").is_some() || args.get("pid").is_some() {
+        vec![target_app(args)?]
+    } else {
+        App::list()?
+    };
+
+    let mut windows: Vec<Element> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // On Windows every app entry IS a top-level window and `App::windows()`
+    // returns the whole top-level set of the process, so one app entry per
+    // pid suffices — visiting each would duplicate every window.
+    let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for app in &apps {
+        if app.data.role == Role::Window {
+            if let Some(pid) = app.pid {
+                if !seen_pids.insert(pid) {
+                    continue;
+                }
+            }
+        }
+        // A transient failure in one app (dying process, flaky bridge) must
+        // not abort a listing that already holds healthy windows: skip it,
+        // keep the successful windows, and surface the failure in `errors`
+        // so the partial result is honest, not silently shortened.
+        match app.windows() {
+            Ok(ws) => {
+                for w in ws {
+                    if seen.insert(w.data().handle) {
+                        windows.push(w);
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e}", app.name)),
+        }
+    }
+
+    let total = windows.len();
+    let listed: Vec<Value> = windows
+        .iter()
+        .take(limit)
+        .map(|w| element_data_json(w))
+        .collect();
+
+    Ok(ToolOutput::json(json!({
+        "count": total,
+        "returned": listed.len(),
+        "truncated": total > listed.len(),
+        "windows": listed,
+        "errors": errors,
     })))
 }
 
@@ -1267,6 +1387,17 @@ fn states_json(states: &crate::StateSet) -> Value {
     }
     if let Some(expanded) = states.expanded {
         out.insert("expanded".into(), json!(expanded));
+    }
+    // Window states are Option<bool>: `None` means "the platform cannot
+    // report this" — send only what is known, never a guessed false.
+    for (key, value) in [
+        ("minimized", states.minimized),
+        ("maximized", states.maximized),
+        ("fullscreen", states.fullscreen),
+    ] {
+        if let Some(v) = value {
+            out.insert(key.into(), json!(v));
+        }
     }
     Value::Object(out)
 }

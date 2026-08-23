@@ -240,6 +240,15 @@ export declare class App {
   locator(selector: string): Locator;
   /** Get direct children (typically windows) of this application. */
   children(): Promise<Element[]>;
+  /**
+   * List the top-level windows of this application.
+   *
+   * Each call queries the provider — results are not cached. On Linux and
+   * macOS these are the app's `window` children; on Windows, where each
+   * application entry is itself a top-level window, this returns every
+   * top-level window of the process (main window plus modal dialogs).
+   */
+  windows(): Promise<Element[]>;
 
   /**
    * Get an `Element` handle for the application root.

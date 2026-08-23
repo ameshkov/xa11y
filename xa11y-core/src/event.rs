@@ -130,6 +130,12 @@ pub enum StateFlag {
     Modal,
     Required,
     Busy,
+    /// The window was minimized (iconified).
+    Minimized,
+    /// The window was maximized.
+    Maximized,
+    /// The window entered fullscreen.
+    Fullscreen,
 }
 
 reader_writer_pair! {

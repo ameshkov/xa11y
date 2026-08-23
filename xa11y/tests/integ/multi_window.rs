@@ -37,33 +37,50 @@ mod tests {
     /// The top-level windows belonging to the test-app process, as
     /// `(name, active)` pairs.
     ///
-    /// On Windows each top-level window is its own `App::list()` entry (the
-    /// dialog is a sibling of the main window, not a descendant), so we
-    /// enumerate by pid. Elsewhere the windows are descendants of the app
-    /// root, so a `window` locator finds them.
+    /// `App::windows()` is the cross-platform enumeration: on macOS/Linux it
+    /// returns the app's `role=Window` children, and on Windows — where every
+    /// `App::list()` entry IS a top-level window — it returns the process's
+    /// whole top-level set. When `pid` is given only that process is
+    /// enumerated; otherwise the app owning the main window is inferred.
     fn app_windows(pid: Option<u32>) -> Result<Vec<(String, bool)>> {
-        #[cfg(target_os = "windows")]
-        {
-            Ok(App::list()?
-                .into_iter()
-                .filter(|a| a.pid == pid)
-                .map(|a| {
-                    let el = a.as_element();
-                    (a.name.clone(), el.states.active)
-                })
-                .collect())
+        let apps = App::list()?;
+        let pid = match pid {
+            Some(pid) => Some(pid),
+            None => apps
+                .iter()
+                .find(|a| TEST_APP_NAMES.contains(&a.name.as_str()))
+                .and_then(|a| a.pid),
+        };
+        // Failed inference must not silently fall back to enumerating every
+        // app on the system: the test's own app is identifiable by
+        // construction, and window counts from unrelated processes would
+        // make every assertion here meaningless.
+        let Some(pid) = pid else {
+            return Err(Error::selector_not_matched("xa11y test app"));
+        };
+        let mut out: Vec<(String, bool)> = Vec::new();
+        // On Windows every `App::list()` entry IS a top-level window, so a
+        // process with several windows yields several entries for one pid and
+        // `App::windows()` re-enumerates the process's whole window set from
+        // each of them (its handles are fresh per call). Enumerate once per
+        // pid instead of once per entry: the same window then appears exactly
+        // once, without collapsing by name — which would silently drop a
+        // second DISTINCT window that happens to share a title.
+        let mut seen_pids = std::collections::HashSet::new();
+        for app in &apps {
+            if app.pid != Some(pid) {
+                continue;
+            }
+            // Enumerate each matching process's windows once. The guard above
+            // guarantees `app.pid == Some(pid)`, so the pid is deduplicable.
+            if !seen_pids.insert(pid) {
+                continue;
+            }
+            for w in app.windows()? {
+                out.push((w.name.clone().unwrap_or_default(), w.states.active));
+            }
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = pid;
-            let app = current_app()?;
-            Ok(app
-                .locator("window")
-                .elements()?
-                .into_iter()
-                .map(|w| (w.name.clone().unwrap_or_default(), w.states.active))
-                .collect())
-        }
+        Ok(out)
     }
 
     /// Poll `f` until it yields `Some`, or panic after `timeout`. The standard

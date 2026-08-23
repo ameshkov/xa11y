@@ -865,7 +865,10 @@ impl LinuxProvider {
     fn parse_states_with_bits(&self, aref: &AccessibleRef, role: Role) -> (StateSet, u64) {
         let bits = self.state_bits(aref);
 
-        // AT-SPI2 state bit positions (AtspiStateType enum values)
+        // AT-SPI2 state bit positions: each is `1 << ordinal` of the
+        // `AtspiStateType` enum in at-spi2-core's `atspi/atspi-constants.h`
+        // (ICONIFIED=15, MODAL=16, SELECTED=23, VISIBLE=30, ...). Kept in
+        // sync with `states_from_bits` in events.rs.
         const ACTIVE: u64 = 1 << 1;
         const BUSY: u64 = 1 << 3;
         const CHECKED: u64 = 1 << 4;
@@ -875,6 +878,7 @@ impl LinuxProvider {
         const EXPANDED: u64 = 1 << 10;
         const FOCUSABLE: u64 = 1 << 11;
         const FOCUSED: u64 = 1 << 12;
+        const ICONIFIED: u64 = 1 << 15;
         const MODAL: u64 = 1 << 16;
         const SELECTED: u64 = 1 << 23;
         const SENSITIVE: u64 = 1 << 24;
@@ -920,6 +924,17 @@ impl LinuxProvider {
             modal: (bits & MODAL) != 0,
             required: (bits & REQUIRED) != 0,
             busy: (bits & BUSY) != 0,
+            // `ICONIFIED` is AT-SPI's minimized state, reported on window
+            // frames. Maximized/fullscreen are not reported by AT-SPI at all
+            // (no state bit), so they stay `None` — unknown, not guessed
+            // `false` (tenet 1).
+            minimized: if matches!(role, Role::Window | Role::Dialog) {
+                Some((bits & ICONIFIED) != 0)
+            } else {
+                None
+            },
+            maximized: None,
+            fullscreen: None,
         }
         .into();
         (states, bits)
@@ -1885,6 +1900,93 @@ impl Provider for LinuxProvider {
         Ok(())
     }
 
+    // ── Window management ──────────────────────────────────────────
+    //
+    // AT-SPI exposes exactly one of these verbs: `raise` (Component.GrabFocus
+    // on the frame — same path as `focus`). There is no AT-SPI API to alter
+    // window state or geometry (no minimize/maximize/close/move/resize), and
+    // implementing them via input simulation would violate tenet 2, so those
+    // fail surfaceably as `Unsupported` at the call site.
+
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        // Windows of the process owning `element`: the element's
+        // `role=Window` / `role=Dialog` children (the AT-SPI shape), plus
+        // `element` itself when it is window-like (the shape a consumer that
+        // received a window element passes in).
+        let mut out: Vec<ElementData> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        if matches!(element.role, Role::Window | Role::Dialog) && seen.insert(element.handle) {
+            out.push(element.clone());
+        }
+        for child in self.get_children(Some(element))? {
+            if matches!(child.role, Role::Window | Role::Dialog) && seen.insert(child.handle) {
+                out.push(child);
+            }
+        }
+        Ok(out)
+    }
+
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        // The AT-SPI implementation of "raise this window" is the same
+        // Component.GrabFocus path `focus` uses: the frame that receives
+        // focus becomes the active window. No separate raise API exists.
+        self.focus(element)
+    }
+
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "minimize on {}: AT-SPI has no API to alter window state",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "maximize on {}: AT-SPI has no API to alter window state",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "restore on {}: AT-SPI has no API to alter window state",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
+    fn close(&self, element: &ElementData) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "close on {}: AT-SPI has no API to close a window",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
+    fn move_to(&self, element: &ElementData, _x: i32, _y: i32) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "move_to on {}: AT-SPI has no API to move a window",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
+    fn resize_to(&self, element: &ElementData, _w: u32, _h: u32) -> Result<()> {
+        Err(Error::Unsupported {
+            feature: format!(
+                "resize_to on {}: AT-SPI has no API to resize a window",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
     fn set_value(&self, element: &ElementData, value: &str) -> Result<()> {
         let target = self.get_cached(element.handle)?;
         let proxy = self
@@ -1991,6 +2093,23 @@ impl Provider for LinuxProvider {
             "increment" => self.increment(element),
             "decrement" => self.decrement(element),
             "scroll_into_view" => self.scroll_into_view(element),
+            "raise" => self.raise(element),
+            "minimize" => self.minimize(element),
+            "maximize" => self.maximize(element),
+            "restore" => self.restore(element),
+            "close" => self.close(element),
+            // Payload verbs have no arguments on the generic escape hatch;
+            // fail surfaceably with how to call them instead of guessing
+            // (tenet 1: no silent fallback).
+            "move_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"move_to\") requires coordinates; call move_to(x, y)"
+                    .to_string(),
+            }),
+            "resize_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"resize_to\") requires dimensions; call \
+                           resize_to(width, height)"
+                    .to_string(),
+            }),
             _ => Err(Error::ActionNotSupported {
                 action: action.to_string(),
                 role: element.role,

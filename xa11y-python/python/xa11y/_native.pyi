@@ -305,6 +305,14 @@ class App:
         """Subscribe to accessibility events from this application."""
     def children(self) -> list[Element]:
         """Get direct children (typically windows) of this application."""
+    def windows(self) -> list[Element]:
+        """List the top-level windows of this application.
+
+        Each call queries the provider — results are not cached. On Linux and
+        macOS these are the app's ``window`` children; on Windows, where each
+        application entry is itself a top-level window, this returns every
+        top-level window of the process (main window plus modal dialogs).
+        """
     def as_element(self) -> Element:
         """Get an :class:`Element` handle for the application root.
 
@@ -410,6 +418,19 @@ class Element:
     def required(self) -> bool: ...
     @property
     def busy(self) -> bool: ...
+    @property
+    def minimized(self) -> bool | None:
+        """Whether the window is minimized.
+
+        ``None`` means unknown (the element is not a window, or the platform
+        cannot report the state). Never a guessed ``False``.
+        """
+    @property
+    def maximized(self) -> bool | None:
+        """Whether the window is maximized. ``None`` = unknown / not a window."""
+    @property
+    def fullscreen(self) -> bool | None:
+        """Whether the window is fullscreen. ``None`` = unknown / not a window."""
     def children(self) -> list[Element]:
         """Get direct children (lazy — each call queries the provider)."""
     def parent(self) -> Element | None:
@@ -470,6 +491,28 @@ class Element:
         """Select the text range from ``start`` to ``end`` (0-based offsets)."""
     def perform_action(self, action: str) -> None:
         """Perform an action by ``snake_case`` name."""
+    def raise_(self) -> None:
+        """Raise this window to the foreground.
+
+        Named with a trailing underscore because ``raise`` is a Python
+        keyword. The platform action recorded is still ``"raise"``.
+        """
+    def minimize(self) -> None:
+        """Minimize this window."""
+    def maximize(self) -> None:
+        """Maximize this window."""
+    def restore(self) -> None:
+        """Restore this window to its normal state (from minimized/maximized)."""
+    def close(self) -> None:
+        """Close this window."""
+    def move_to(self, x: int, y: int) -> None:
+        """Move this window to the given logical screen coordinates (top-left origin)."""
+    def resize_to(self, width: int, height: int) -> None:
+        """Resize this window to the given logical width and height.
+
+        Raises ``InvalidActionDataError`` if either dimension is 0.
+        ``OverflowError`` if either is negative or exceeds ``u32``.
+        """
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
 
@@ -555,6 +598,29 @@ class Locator:
         """Select a text range within the matched element (0-based offsets)."""
     def perform_action(self, action: str) -> None:
         """Perform an action by snake_case name."""
+    def raise_(self) -> None:
+        """Raise the matched window to the foreground.
+
+        Named with a trailing underscore because ``raise`` is a Python
+        keyword. The platform action recorded is still ``"raise"``.
+        """
+    def minimize(self) -> None:
+        """Minimize the matched window."""
+    def maximize(self) -> None:
+        """Maximize the matched window."""
+    def restore(self) -> None:
+        """Restore the matched window to its normal state."""
+    def close(self) -> None:
+        """Close the matched window."""
+    def move_to(self, x: int, y: int) -> None:
+        """Move the matched window to the given logical screen coordinates (top-left origin)."""
+    def resize_to(self, width: int, height: int) -> None:
+        """Resize the matched window to the given logical dimensions.
+
+        Raises ``InvalidActionDataError`` if either dimension is 0, before
+        any auto-wait polling begins. ``OverflowError`` if either is negative
+        or exceeds ``u32``.
+        """
     def wait_visible(self, timeout: float | None = None) -> Element:
         """Wait until the element is visible, polling the provider.
 

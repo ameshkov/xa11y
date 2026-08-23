@@ -114,6 +114,8 @@ extern "C" {
     fn safe_cf_run_loop_run();
     fn safe_cf_run_loop_stop(run_loop: CFTypeRef);
     fn safe_ax_value_create_cf_range(location: isize, length: isize) -> CFTypeRef;
+    fn safe_ax_value_create_cg_point(x: f64, y: f64) -> CFTypeRef;
+    fn safe_ax_value_create_cg_size(width: f64, height: f64) -> CFTypeRef;
 
     // CoreFoundation helpers - all calls from ax.rs go through these.
     fn safe_cf_retain(cf: CFTypeRef) -> CFTypeRef;
@@ -401,6 +403,50 @@ fn ax_parent(element: AXUIElementRef) -> Option<AXElement> {
     Some(AXElement::from_owned(value as AXUIElementRef))
 }
 
+/// Top-level windows of the application (`AXWindows` attribute), in window
+/// order. Layout mirrors [`ax_children`]: the attribute value is owned and
+/// released here, and each element is retained via `from_borrowed`.
+fn ax_windows(element: AXUIElementRef) -> Vec<AXElement> {
+    let value = match ax_attr(element, "AXWindows") {
+        Some(v) => v,
+        None => return vec![],
+    };
+    unsafe {
+        if safe_cf_get_type_id(value) != safe_cf_array_get_type_id() {
+            safe_cf_release(value);
+            return vec![];
+        }
+        let count = safe_cf_array_get_count(value);
+        let mut windows = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let w = safe_cf_array_get_value(value, i);
+            if !w.is_null() {
+                windows.push(AXElement::from_borrowed(w));
+            }
+        }
+        safe_cf_release(value);
+        windows
+    }
+}
+
+/// Is the raw attribute present on the element (any type, including an
+/// `AXUIElement` value like `AXCloseButton`)? A present attribute is the
+/// advertisement signal for `close` — the actual press is dispatched by the
+/// caller.
+fn ax_has_attr(element: AXUIElementRef, attribute: &str) -> bool {
+    match ax_attr(element, attribute) {
+        // `AXUIElementCopyAttributeValue` follows the Create Rule: the value
+        // is +1 retained and owned by us, so release it before returning. The
+        // previous `ax_attr(...).is_some()` dropped the raw CFTypeRef without
+        // releasing, leaking one object per advertisement.
+        Some(value) => {
+            unsafe { safe_cf_release(value) };
+            true
+        }
+        None => false,
+    }
+}
+
 /// Roles whose selection state may live on the container rather than on the
 /// element itself. Kept narrow so the container probe never fires for
 /// elements that simply have no selection concept.
@@ -578,7 +624,10 @@ mod attr_idx {
     pub const POSITION: usize = 12;
     pub const SIZE: usize = 13;
     pub const IDENTIFIER: usize = 14;
-    pub const COUNT: usize = 15;
+    pub const MINIMIZED: usize = 15;
+    pub const ZOOMED: usize = 16;
+    pub const FULLSCREEN: usize = 17;
+    pub const COUNT: usize = 18;
 }
 
 /// Raw values returned by a single batch AX fetch. Values are borrowed
@@ -611,6 +660,9 @@ impl BatchAttrs {
             CFString::new("AXPosition"),
             CFString::new("AXSize"),
             CFString::new("AXIdentifier"),
+            CFString::new("AXMinimized"),
+            CFString::new("AXZoomed"),
+            CFString::new("AXFullScreen"),
         ];
         let ptrs: Vec<CFTypeRef> = attr_names
             .iter()
@@ -799,6 +851,12 @@ struct ResolvedAttrs {
     hidden: Option<bool>,
     expanded: Option<bool>,
     modal: Option<bool>,
+    /// Window minimized state (`AXMinimized`); `None` on non-window elements.
+    minimized: Option<bool>,
+    /// Window maximized / zoomed state (`AXZoomed`); `None` on non-window elements.
+    zoomed: Option<bool>,
+    /// Window fullscreen state (`AXFullScreen`); `None` on non-window elements.
+    fullscreen: Option<bool>,
     position: Option<(f64, f64)>,
     size: Option<(f64, f64)>,
     identifier: Option<String>,
@@ -838,6 +896,9 @@ impl ResolvedAttrs {
             hidden: batch.boolean(attr_idx::HIDDEN),
             expanded: batch.boolean(attr_idx::EXPANDED),
             modal: batch.boolean(attr_idx::MODAL),
+            minimized: batch.boolean(attr_idx::MINIMIZED),
+            zoomed: batch.boolean(attr_idx::ZOOMED),
+            fullscreen: batch.boolean(attr_idx::FULLSCREEN),
             position: batch.position(),
             size: batch.size(),
             identifier: batch.string(attr_idx::IDENTIFIER),
@@ -862,6 +923,9 @@ impl ResolvedAttrs {
             hidden: ax_bool(element, "AXHidden"),
             expanded: ax_bool(element, "AXExpanded"),
             modal: ax_bool(element, "AXModal"),
+            minimized: ax_bool(element, "AXMinimized"),
+            zoomed: ax_bool(element, "AXZoomed"),
+            fullscreen: ax_bool(element, "AXFullScreen"),
             position: ax_position(element),
             size: ax_size(element),
             identifier: ax_string(element, "AXIdentifier"),
@@ -1095,6 +1159,7 @@ fn ax_action_to_name(ax_name: &str) -> Option<&'static str> {
         "AXShowMenu" => Some("show_menu"),
         "AXIncrement" => Some("increment"),
         "AXDecrement" => Some("decrement"),
+        "AXRaise" => Some("raise"),
         _ => None,
     }
 }
@@ -1619,6 +1684,21 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             active,
             focusable,
             modal: attrs.modal.unwrap_or(false),
+            minimized: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.minimized
+            } else {
+                None
+            },
+            maximized: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.zoomed
+            } else {
+                None
+            },
+            fullscreen: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.fullscreen
+            } else {
+                None
+            },
             checked,
             // `AXSelected` is the per-element attribute, but bridges like
             // Qt's implement selection only container-side
@@ -1691,6 +1771,53 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             && !actions.contains(&toggle_str)
         {
             actions.push(toggle_str);
+        }
+
+        // Window verbs: `raise` is advertised from the native action list
+        // (AXRaise is a real AX action for windows); the attribute-backed
+        // verbs are advertised from settability, the same way `expand` /
+        // `collapse` decide theirs. A failed settability probe degrades to
+        // "not advertised" — the action list is advisory, and the verb
+        // still returns a real error when invoked on an element that
+        // doesn't support it.
+        if matches!(role, Role::Window | Role::Dialog) {
+            let settable = |attr: &str| is_attr_settable(element, attr).unwrap_or(false);
+            let push = |actions: &mut Vec<String>, name: &str| {
+                let n = name.to_string();
+                if !actions.contains(&n) {
+                    actions.push(n);
+                }
+            };
+            if ax_actions.iter().any(|a| a == "AXRaise") {
+                push(&mut actions, "raise");
+            }
+            // Probe Minimized/Zoomed once each — every probe is an
+            // AXIsAttributeSettable FFI round-trip, and the same two results
+            // feed both the verb advertisement and the `restore` condition
+            // below.
+            let minimized_settable = settable("AXMinimized");
+            let zoomed_settable = settable("AXZoomed");
+            if minimized_settable {
+                push(&mut actions, "minimize");
+            }
+            if zoomed_settable {
+                push(&mut actions, "maximize");
+            }
+            if minimized_settable || zoomed_settable {
+                push(&mut actions, "restore");
+            }
+            // `close` is advertised when the window exposes a close button
+            // (AXCloseButton attribute) — pressing it is the canonical AX
+            // close path.
+            if ax_has_attr(element, "AXCloseButton") {
+                push(&mut actions, "close");
+            }
+            if settable("AXPosition") {
+                push(&mut actions, "move_to");
+            }
+            if settable("AXSize") {
+                push(&mut actions, "resize_to");
+            }
         }
 
         let numeric_value = match role {
@@ -2326,6 +2453,185 @@ impl Provider for MacOSProvider {
         Ok(())
     }
 
+    // ── Window management ──────────────────────────────────────────
+
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        // Windows of the process owning `element`. On macOS the app element
+        // is the discovery root: `AXWindows` lists its top-level windows
+        // (window order); each is cached so the returned ElementData is
+        // navigable by a later get_children. On a window element itself (the
+        // shape a window-owning consumer passes) the window is its own list.
+        let ax = self.get_cached(element.handle)?;
+        if element.role == Role::Application {
+            let windows = ax_windows(ax.as_ptr());
+            Ok(windows
+                .into_iter()
+                .map(|w| self.build_element_data(&w, element.pid))
+                .collect())
+        } else if matches!(element.role, Role::Window | Role::Dialog) {
+            Ok(vec![element.clone()])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        perform_ax_action(ax.as_ptr(), "AXRaise", "raise", element.role)
+    }
+
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // See expand(): unsettable AXMinimized sets would silently no-op in
+        // every bridge — surface unsupported as ActionNotSupported instead.
+        if !is_attr_settable(ax.as_ptr(), "AXMinimized")? {
+            return Err(Error::ActionNotSupported {
+                action: "minimize".to_string(),
+                role: element.role,
+            });
+        }
+        set_bool_attr(ax.as_ptr(), "AXMinimized", true, "minimize", element.role)
+    }
+
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // AXZoomed is macOS's "maximized" (zoom) state.
+        if !is_attr_settable(ax.as_ptr(), "AXZoomed")? {
+            return Err(Error::ActionNotSupported {
+                action: "maximize".to_string(),
+                role: element.role,
+            });
+        }
+        set_bool_attr(ax.as_ptr(), "AXZoomed", true, "maximize", element.role)
+    }
+
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // Restore clears both the minimized and the zoomed flag. A window
+        // supports restore if either of them is settable; each clear is
+        // attempted only when settable (a missing attribute would no-op).
+        let min_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
+        let zoom_settable = is_attr_settable(ax.as_ptr(), "AXZoomed")?;
+        if !min_settable && !zoom_settable {
+            return Err(Error::ActionNotSupported {
+                action: "restore".to_string(),
+                role: element.role,
+            });
+        }
+        if min_settable {
+            set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
+        }
+        if zoom_settable {
+            set_bool_attr(ax.as_ptr(), "AXZoomed", false, "restore", element.role)?;
+        }
+        Ok(())
+    }
+
+    fn close(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        let el_ptr = ax.as_ptr();
+        // The canonical AX close path is pressing the close button: prefer
+        // the direct AXCloseButton attribute, then the child scan (both are
+        // the same button; the attribute is one IPC call and the scan is the
+        // fallback for bridges that only expose it as a child with the
+        // AXCloseButton subrole).
+        // The value must be an AXUIElement before it is cast and handed to
+        // AXPress. `AXUIElementCopyAttributeValue` can return `kCFNull` (or
+        // another non-element!) for a window with no close button instead of
+        // an error, and casting that to `AXUIElementRef` is undefined
+        // behavior. Comparing type ids against the element's own (also an
+        // AXUIElement) is the same guard `ax_string`/`ax_bool` apply, and
+        // needs no new safe wrapper.
+        let close_btn = ax_attr(el_ptr, "AXCloseButton").and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                // Both `v` and `el_ptr` carry the AXUIElement type id if `v`
+                // is really an element; anything else (kCFNull, etc.) is
+                // treated like a missing attribute.
+                let is_element =
+                    unsafe { safe_cf_get_type_id(v) == safe_cf_get_type_id(el_ptr as CFTypeRef) };
+                if is_element {
+                    Some(AXElement::from_owned(v as AXUIElementRef))
+                } else {
+                    unsafe { safe_cf_release(v) };
+                    None
+                }
+            }
+        });
+        let btn = match close_btn {
+            Some(b) => Some(b),
+            None => ax_children(el_ptr).into_iter().find(|c| {
+                ax_string(c.as_ptr(), "AXSubrole").is_some_and(|sr| sr == "AXCloseButton")
+            }),
+        };
+        let Some(btn) = btn else {
+            return Err(Error::ActionNotSupported {
+                action: "close".to_string(),
+                role: element.role,
+            });
+        };
+        perform_ax_action(btn.as_ptr(), "AXPress", "close", element.role)
+    }
+
+    fn move_to(&self, element: &ElementData, x: i32, y: i32) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        if !is_attr_settable(ax.as_ptr(), "AXPosition")? {
+            return Err(Error::ActionNotSupported {
+                action: "move_to".to_string(),
+                role: element.role,
+            });
+        }
+        let value = unsafe { safe_ax_value_create_cg_point(f64::from(x), f64::from(y)) };
+        if value.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "Failed to create CGPoint AXValue for window move".to_string(),
+            });
+        }
+        let attr = CFString::new("AXPosition");
+        let err = do_set_attribute(ax.as_ptr(), &attr, value);
+        unsafe { safe_cf_release(value) };
+        if err != AX_ERROR_SUCCESS {
+            return Err(action_error(
+                err,
+                "move_to",
+                element.role,
+                "Set AXPosition failed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resize_to(&self, element: &ElementData, width: u32, height: u32) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        if !is_attr_settable(ax.as_ptr(), "AXSize")? {
+            return Err(Error::ActionNotSupported {
+                action: "resize_to".to_string(),
+                role: element.role,
+            });
+        }
+        let value = unsafe { safe_ax_value_create_cg_size(f64::from(width), f64::from(height)) };
+        if value.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "Failed to create CGSize AXValue for window resize".to_string(),
+            });
+        }
+        let attr = CFString::new("AXSize");
+        let err = do_set_attribute(ax.as_ptr(), &attr, value);
+        unsafe { safe_cf_release(value) };
+        if err != AX_ERROR_SUCCESS {
+            return Err(action_error(
+                err,
+                "resize_to",
+                element.role,
+                "Set AXSize failed",
+            ));
+        }
+        Ok(())
+    }
+
     // ── Typed operations ────────────────────────────────────────────
 
     fn set_value(&self, element: &ElementData, value: &str) -> Result<()> {
@@ -2428,6 +2734,23 @@ impl Provider for MacOSProvider {
             "increment" => self.increment(element),
             "decrement" => self.decrement(element),
             "scroll_into_view" => self.scroll_into_view(element),
+            "raise" => self.raise(element),
+            "minimize" => self.minimize(element),
+            "maximize" => self.maximize(element),
+            "restore" => self.restore(element),
+            "close" => self.close(element),
+            // Payload verbs have no arguments on the generic escape hatch;
+            // fail surfaceably with how to call them instead of guessing
+            // (tenet 1: no silent fallback).
+            "move_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"move_to\") requires coordinates; call move_to(x, y)"
+                    .to_string(),
+            }),
+            "resize_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"resize_to\") requires dimensions; call \
+                           resize_to(width, height)"
+                    .to_string(),
+            }),
             _ => {
                 // Custom action resolution: snake_case → AXPascalCase
                 let ax = self.get_cached(element.handle)?;
@@ -2846,6 +3169,12 @@ mod tests {
     }
 
     #[test]
+    fn ax_has_attr_returns_false_for_null_element() {
+        let result = ax_has_attr(std::ptr::null(), "AXCloseButton");
+        assert!(!result);
+    }
+
+    #[test]
     fn ax_string_returns_none_for_null_element() {
         let result = ax_string(std::ptr::null(), "AXTitle");
         assert!(result.is_none());
@@ -3016,12 +3345,12 @@ mod tests {
         assert_eq!(ax_action_to_name("AXShowMenu"), Some("show_menu"));
         assert_eq!(ax_action_to_name("AXIncrement"), Some("increment"));
         assert_eq!(ax_action_to_name("AXDecrement"), Some("decrement"));
+        assert_eq!(ax_action_to_name("AXRaise"), Some("raise"));
     }
 
     #[test]
     fn ax_action_to_name_returns_none_for_unknown() {
         // Unknown AX actions get converted via ax_pascal_to_snake instead
-        assert_eq!(ax_action_to_name("AXRaise"), None);
         assert_eq!(ax_action_to_name("AXCancel"), None);
         assert_eq!(ax_action_to_name("AXCustomThing"), None);
         assert_eq!(ax_action_to_name("UnknownAction"), None);

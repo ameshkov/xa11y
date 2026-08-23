@@ -59,7 +59,8 @@ pub type ActionLogEntry = (u64, String, Option<String>);
 
 /// Mock provider backing the test tree.
 pub struct MockProvider {
-    nodes: Vec<MockNode>,
+    /// Interior-mutable so window verbs can mutate state/bounds in place.
+    nodes: Mutex<Vec<MockNode>>,
     actions: Mutex<Vec<ActionLogEntry>>,
 }
 
@@ -89,60 +90,107 @@ impl MockProvider {
     }
 }
 
+#[derive(Clone)]
 struct MockNode {
     data: ElementData,
     children: Vec<usize>,
     parent: Option<usize>,
+    /// A closed window is gone: unlike `minimized` (visible=false but still
+    /// listed), a closed window must not be enumerated by `get_children` or
+    /// `list_windows` — real providers drop it from the tree.
+    closed: bool,
 }
 
 impl Provider for MockProvider {
     fn get_children(&self, element: Option<&ElementData>) -> Result<Vec<ElementData>> {
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         match element {
             None => {
-                if self.nodes.is_empty() {
+                if nodes.is_empty() {
                     return Ok(vec![]);
                 }
-                Ok(vec![self.nodes[0].data.clone()])
+                Ok(vec![nodes[0].data.clone()])
             }
             Some(el) => {
                 let idx = el.handle as usize;
-                if idx >= self.nodes.len() {
+                // A closed element is gone (see `closed`): resolving its subtree
+                // through a stale handle would fake a live window that real
+                // providers have dropped.
+                if idx >= nodes.len() || nodes[idx].closed {
                     return Ok(vec![]);
                 }
-                Ok(self.nodes[idx]
+                Ok(nodes[idx]
                     .children
                     .iter()
-                    .map(|&i| self.nodes[i].data.clone())
+                    .filter(|&&i| !nodes[i].closed)
+                    .map(|&i| nodes[i].data.clone())
                     .collect())
             }
         }
     }
 
     fn get_parent(&self, element: &ElementData) -> Result<Option<ElementData>> {
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         let idx = element.handle as usize;
-        if idx >= self.nodes.len() {
+        // A closed element is gone: no parent either (see `closed`).
+        if idx >= nodes.len() || nodes[idx].closed {
             return Ok(None);
         }
-        Ok(self.nodes[idx].parent.map(|i| self.nodes[i].data.clone()))
+        Ok(nodes[idx].parent.map(|i| nodes[i].data.clone()))
     }
 
     fn list_apps(&self) -> Result<Vec<ElementData>> {
         // The mock tree's root is a single Application node; expose it as
         // the lone "app" so Locator's rootless path enumerates it.
-        if self.nodes.is_empty() {
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+        if nodes.is_empty() {
             return Ok(vec![]);
         }
-        Ok(vec![self.nodes[0].data.clone()])
+        Ok(vec![nodes[0].data.clone()])
     }
 
     fn focused_app(&self) -> Result<ElementData> {
         // The mock has a single application root; treat it as the foreground
         // app so `App::is_foreground` / `find(|a| a.focused())` have something
         // to resolve against in binding and core tests.
-        if self.nodes.is_empty() {
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+        if nodes.is_empty() {
             return Err(Error::selector_not_matched("focused application"));
         }
-        Ok(self.nodes[0].data.clone())
+        Ok(nodes[0].data.clone())
+    }
+
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        // Windows of the process owning `element`: the element's children
+        // with `role=Window` (the macOS/Linux shape) — plus `element` itself
+        // when it is a window (the Windows shape, where every app entry IS a
+        // top-level window). The app root in this fixture yields exactly its
+        // "Main Window" child.
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<ElementData> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let idx = element.handle as usize;
+        // Self-inclusion (the Windows shape, where an app entry IS a window)
+        // must apply the same `closed` filter as the children loop below: a
+        // stale handle to a closed window is not a live window.
+        if element.role == Role::Window
+            && idx < nodes.len()
+            && !nodes[idx].closed
+            && seen.insert(element.handle)
+        {
+            out.push(element.clone());
+        }
+        if idx < nodes.len() {
+            for &i in &nodes[idx].children {
+                if nodes[i].data.role == Role::Window
+                    && !nodes[i].closed
+                    && seen.insert(nodes[i].data.handle)
+                {
+                    out.push(nodes[i].data.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn press(&self, el: &ElementData) -> Result<()> {
@@ -193,6 +241,99 @@ impl Provider for MockProvider {
     fn perform_action(&self, el: &ElementData, action: &str) -> Result<()> {
         self.record(el, action, None)
     }
+
+    // ── Window management ──────────────────────────────────────────
+    //
+    // The mock models window state mutations in place so tests can verify
+    // minimize → state → restore round-trips without a real platform.
+
+    fn raise(&self, el: &ElementData) -> Result<()> {
+        self.record(el, "raise", None)
+    }
+
+    fn minimize(&self, el: &ElementData) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                node.data.states.minimized = Some(true);
+                node.data.states.maximized = None;
+                // Model an iconified window as off-screen. That is what makes
+                // the Locator window verbs' enabled-only gate (no `visible`)
+                // testable: a minimized window must still be actionable.
+                node.data.states.visible = false;
+            }
+        }
+        self.record(el, "minimize", None)
+    }
+
+    fn maximize(&self, el: &ElementData) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                node.data.states.maximized = Some(true);
+                node.data.states.minimized = None;
+                // A minimized window is modeled iconified (visible=false);
+                // maximizing it must bring it back on-screen, or a
+                // minimize → maximize round-trip would leave the mock
+                // reporting maximized AND invisible.
+                node.data.states.visible = true;
+            }
+        }
+        self.record(el, "maximize", None)
+    }
+
+    fn restore(&self, el: &ElementData) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                node.data.states.minimized = Some(false);
+                node.data.states.maximized = Some(false);
+                node.data.states.visible = true;
+            }
+        }
+        self.record(el, "restore", None)
+    }
+
+    fn close(&self, el: &ElementData) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                // `closed` (not `visible`) is what removes it from the tree:
+                // a minimized window is also visible=false but must stay
+                // listed. Both flags together model the real provider result.
+                node.closed = true;
+                node.data.states.visible = false;
+            }
+        }
+        self.record(el, "close", None)
+    }
+
+    fn move_to(&self, el: &ElementData, x: i32, y: i32) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                if let Some(b) = node.data.bounds.as_mut() {
+                    b.x = x;
+                    b.y = y;
+                }
+            }
+        }
+        self.record(el, "move_to", Some(format!("{x},{y}")))
+    }
+
+    fn resize_to(&self, el: &ElementData, width: u32, height: u32) -> Result<()> {
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                if let Some(b) = node.data.bounds.as_mut() {
+                    b.width = width;
+                    b.height = height;
+                }
+            }
+        }
+        self.record(el, "resize_to", Some(format!("{width}x{height}")))
+    }
+
     fn subscribe(&self, _el: &ElementData) -> Result<Subscription> {
         Err(Error::Platform {
             code: -1,
@@ -246,7 +387,15 @@ pub fn build_provider() -> Arc<MockProvider> {
                 width: 800,
                 height: 600,
             }),
-            vec![],
+            vec![
+                "raise",
+                "minimize",
+                "maximize",
+                "restore",
+                "close",
+                "move_to",
+                "resize_to",
+            ],
             // The mock models the foreground app, so its main window is the
             // active window — mirrors `focused_app` returning the app root.
             StateSet {
@@ -518,11 +667,12 @@ pub fn build_provider() -> Arc<MockProvider> {
             data,
             children: children_map[i].clone(),
             parent: parent_map[i],
+            closed: false,
         });
     }
 
     Arc::new(MockProvider {
-        nodes,
+        nodes: Mutex::new(nodes),
         actions: Mutex::new(Vec::new()),
     })
 }

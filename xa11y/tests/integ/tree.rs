@@ -172,6 +172,60 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore]
+    fn window_state_attributes_are_selectable_when_known() {
+        // The `minimized` / `maximized` / `fullscreen` attributes are usable
+        // in selectors without error, and a state the platform reports as
+        // known must be selectable by its literal value. An unknown state
+        // (None) is absent rather than guessed `false` — neither literal is
+        // required to match it.
+        let app = h::app_root();
+        let main = app
+            .windows()
+            .expect("App::windows must succeed")
+            .into_iter()
+            .find(|w| {
+                w.name
+                    .as_deref()
+                    .is_some_and(|n| n.contains("xa11y Test App"))
+            })
+            .expect("the main window must be enumerated");
+        for (state, value) in [
+            ("minimized", main.states.minimized),
+            ("maximized", main.states.maximized),
+            ("fullscreen", main.states.fullscreen),
+        ] {
+            // The selector must always resolve (no error), whatever the state.
+            for flag in ["true", "false"] {
+                let selector = format!("window[{state}=\"{flag}\"]");
+                assert!(
+                    app.locator(&selector).elements().is_ok(),
+                    "selector {selector} must resolve"
+                );
+            }
+            // A reported Some(v) must be selectable by that literal.
+            if let Some(v) = value {
+                let literal = if v { "true" } else { "false" };
+                let selector = format!("window[{state}=\"{literal}\"]");
+                let matched = app.locator(&selector).elements().unwrap();
+                assert!(
+                    matched.iter().any(|e| e
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.contains("xa11y Test App"))),
+                    "{selector} must match the window reporting {state}={literal}, \
+                     got: {}",
+                    matched
+                        .iter()
+                        .map(|e| e.name.as_deref().unwrap_or("<unnamed>"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════
     // Tree Structure — Element Discovery (14 tests)
     // ════════════════════════════════════════════════════════════════

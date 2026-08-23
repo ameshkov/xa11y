@@ -749,6 +749,65 @@ impl Locator {
             .perform_action(action)
     }
 
+    // ── Window management ─────────────────────────────────────────
+    //
+    // Window verbs wait only on `enabled`, not `visible` (we reuse
+    // [`Actionability::ENABLED`]): a minimized window is legitimately
+    // not visible, and gate the very verbs that must act on it —
+    // `minimize`, `restore`, and `raise` all need to reach an invisible
+    // window. The same argument that relaxed `scroll_into_view` (issue
+    // #350) applies here, so the gate is documented once on
+    // [`Actionability::ENABLED`].
+
+    /// Raise the matched window to the foreground.
+    pub fn raise(&self) -> Result<()> {
+        self.auto_wait("raise", Actionability::ENABLED)?.raise()
+    }
+
+    /// Minimize the matched window.
+    pub fn minimize(&self) -> Result<()> {
+        self.auto_wait("minimize", Actionability::ENABLED)?
+            .minimize()
+    }
+
+    /// Maximize the matched window.
+    pub fn maximize(&self) -> Result<()> {
+        self.auto_wait("maximize", Actionability::ENABLED)?
+            .maximize()
+    }
+
+    /// Restore the matched window to its normal state.
+    pub fn restore(&self) -> Result<()> {
+        self.auto_wait("restore", Actionability::ENABLED)?.restore()
+    }
+
+    /// Close the matched window.
+    pub fn close(&self) -> Result<()> {
+        self.auto_wait("close", Actionability::ENABLED)?.close()
+    }
+
+    /// Move the matched window to the given **logical** screen coordinates.
+    pub fn move_to(&self, x: i32, y: i32) -> Result<()> {
+        self.auto_wait("move_to", Actionability::ENABLED)?
+            .move_to(x, y)
+    }
+
+    /// Resize the matched window to the given **logical** dimensions.
+    ///
+    /// Returns [`Error::InvalidActionData`] if either dimension is 0,
+    /// before any auto-wait polling begins.
+    pub fn resize_to(&self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidActionData {
+                message: format!(
+                    "resize_to requires positive width and height, got {width}x{height}"
+                ),
+            });
+        }
+        self.auto_wait("resize_to", Actionability::ENABLED)?
+            .resize_to(width, height)
+    }
+
     // ── Wait operations ─────────────────────────────────────────────
 
     /// Wait until the element is visible, polling the provider.
@@ -1099,6 +1158,51 @@ mod tests {
         );
     }
 
+    // ── Window management gate (enabled-only) ───────────────────────
+
+    #[test]
+    fn window_verbs_act_on_minimized_invisible_window() {
+        // Window verbs use the enabled-only gate, not visible&&enabled: a
+        // minimized window is visible=false, and minimizing it is the thing
+        // `restore` must then reverse. If the gate required `visible`, this
+        // zero-timeout restore would fail with a Timeout.
+        let provider = build_provider();
+        let handle = Arc::clone(&provider);
+        let provider_dyn: Arc<dyn Provider> = provider;
+        let min = Locator::new(provider_dyn.clone(), None, "window").with_timeout(Duration::ZERO);
+        min.minimize()
+            .expect("minimize must act on the (initially visible) window");
+        // The window is now minimized (visible=false); restore still acts.
+        let restore = Locator::new(provider_dyn, None, "window").with_timeout(Duration::ZERO);
+        restore
+            .restore()
+            .expect("restore must act on a minimized window");
+        assert!(
+            handle
+                .actions()
+                .iter()
+                .any(|(_, action, _)| action == "restore"),
+            "restore must delegate to the provider"
+        );
+    }
+
+    #[test]
+    fn locator_resize_to_rejects_zero_before_auto_wait() {
+        // Locator validates payloads before entering its 5s auto-wait poll;
+        // the zero-size rejection must produce InvalidActionData immediately,
+        // not a Timeout after polling a never-matching selector.
+        let provider = build_provider();
+        let provider_dyn: Arc<dyn Provider> = provider;
+        let locator = Locator::new(provider_dyn, None, r#"window[name="never-matches"]"#);
+        let started = std::time::Instant::now();
+        let err = locator.resize_to(0, 100).unwrap_err();
+        assert!(matches!(err, Error::InvalidActionData { .. }));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "validation must short-circuit auto-wait",
+        );
+    }
+
     // ── Rootless search across apps ─────────────────────────────────
 
     #[test]
@@ -1353,6 +1457,33 @@ mod tests {
         }
         fn perform_action(&self, e: &crate::element::ElementData, action: &str) -> Result<()> {
             self.inner.perform_action(e, action)
+        }
+        fn list_windows(
+            &self,
+            e: &crate::element::ElementData,
+        ) -> Result<Vec<crate::element::ElementData>> {
+            self.inner.list_windows(e)
+        }
+        fn raise(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.raise(e)
+        }
+        fn minimize(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.minimize(e)
+        }
+        fn maximize(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.maximize(e)
+        }
+        fn restore(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.restore(e)
+        }
+        fn close(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.close(e)
+        }
+        fn move_to(&self, e: &crate::element::ElementData, x: i32, y: i32) -> Result<()> {
+            self.inner.move_to(e, x, y)
+        }
+        fn resize_to(&self, e: &crate::element::ElementData, w: u32, h: u32) -> Result<()> {
+            self.inner.resize_to(e, w, h)
         }
         fn subscribe(
             &self,

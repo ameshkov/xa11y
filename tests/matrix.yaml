@@ -186,10 +186,12 @@ features:
 # rust_core is the xa11y/tests/integ/ suite — separate from per-app compat suites.
 rust_core:
   app: accesskit
-  features: [compat, actions, events, screenshot]
+  features: [compat, actions, events, screenshot, windows]
   note: >
     Fast-path core validation. All tests are #[ignore] and run via `cargo xtask test-integ`.
     Platform-split event tests: events_linux.rs, events_macos.rs, events_windows.rs.
+    windows.rs covers window management verbs + App::windows() — the same suite runs
+    against the WinForms test app for TransformPattern coverage.
 
 # coverage[app][language] = list of features covered, or [] for none.
 coverage:

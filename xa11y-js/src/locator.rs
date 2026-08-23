@@ -298,6 +298,78 @@ impl Locator {
         ))
     }
 
+    // ── Window management ──────────────────────────────────────────────
+    //
+    // Window verbs wait only for the matched window to be `enabled`: a
+    // minimized window is legitimately not visible, and these actions are
+    // exactly what must reach it.
+
+    /// Raise the matched window to the foreground.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn raise(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(self.inner.clone(), ActionKind::Raise))
+    }
+
+    /// Minimize the matched window.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn minimize(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(
+            self.inner.clone(),
+            ActionKind::Minimize,
+        ))
+    }
+
+    /// Maximize the matched window.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn maximize(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(
+            self.inner.clone(),
+            ActionKind::Maximize,
+        ))
+    }
+
+    /// Restore the matched window to its normal state.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn restore(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(self.inner.clone(), ActionKind::Restore))
+    }
+
+    /// Close the matched window.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn close(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(self.inner.clone(), ActionKind::Close))
+    }
+
+    /// Move the matched window to the given logical screen coordinates.
+    #[napi(
+        ts_args_type = "x: number, y: number",
+        ts_return_type = "Promise<void>"
+    )]
+    pub fn move_to(&self, x: i32, y: i32) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::with_point(
+            self.inner.clone(),
+            ActionKind::MoveTo,
+            x,
+            y,
+        ))
+    }
+
+    /// Resize the matched window to the given logical dimensions. Rejects
+    /// with `InvalidActionDataError` if either dimension is 0, before any
+    /// auto-wait polling begins.
+    #[napi(
+        ts_args_type = "width: number, height: number",
+        ts_return_type = "Promise<void>"
+    )]
+    pub fn resize_to(&self, width: u32, height: u32) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::with_size(
+            self.inner.clone(),
+            ActionKind::ResizeTo,
+            width,
+            height,
+        ))
+    }
+
     // ── Waits ──────────────────────────────────────────────────────────
     //
     // Each wait polls the provider until its condition is satisfied or
@@ -532,6 +604,13 @@ pub enum ActionKind {
     TypeText,
     SelectText,
     PerformAction,
+    Raise,
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+    MoveTo,
+    ResizeTo,
 }
 
 pub struct ActionTask {
@@ -540,6 +619,8 @@ pub struct ActionTask {
     text: Option<String>,
     num: Option<f64>,
     range: Option<(u32, u32)>,
+    point: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
 }
 
 impl ActionTask {
@@ -550,6 +631,8 @@ impl ActionTask {
             text: None,
             num: None,
             range: None,
+            point: None,
+            size: None,
         }
     }
     fn with_text(inner: xa11y::Locator, kind: ActionKind, text: String) -> Self {
@@ -559,6 +642,8 @@ impl ActionTask {
             text: Some(text),
             num: None,
             range: None,
+            point: None,
+            size: None,
         }
     }
     fn with_num(inner: xa11y::Locator, kind: ActionKind, num: f64) -> Self {
@@ -568,6 +653,8 @@ impl ActionTask {
             text: None,
             num: Some(num),
             range: None,
+            point: None,
+            size: None,
         }
     }
     fn with_range(inner: xa11y::Locator, kind: ActionKind, start: u32, end: u32) -> Self {
@@ -577,6 +664,30 @@ impl ActionTask {
             text: None,
             num: None,
             range: Some((start, end)),
+            point: None,
+            size: None,
+        }
+    }
+    fn with_point(inner: xa11y::Locator, kind: ActionKind, x: i32, y: i32) -> Self {
+        Self {
+            inner,
+            kind,
+            text: None,
+            num: None,
+            range: None,
+            point: Some((x, y)),
+            size: None,
+        }
+    }
+    fn with_size(inner: xa11y::Locator, kind: ActionKind, width: u32, height: u32) -> Self {
+        Self {
+            inner,
+            kind,
+            text: None,
+            num: None,
+            range: None,
+            point: None,
+            size: Some((width, height)),
         }
     }
 }
@@ -608,6 +719,27 @@ impl Task for ActionTask {
             ActionKind::PerformAction => self
                 .inner
                 .perform_action(self.text.as_deref().unwrap_or("")),
+            ActionKind::Raise => self.inner.raise(),
+            ActionKind::Minimize => self.inner.minimize(),
+            ActionKind::Maximize => self.inner.maximize(),
+            ActionKind::Restore => self.inner.restore(),
+            ActionKind::Close => self.inner.close(),
+            ActionKind::MoveTo => {
+                // `(0, 0)` is a valid coordinate, so a missing payload must
+                // fail loudly rather than silently relocate the window
+                // (tenet 1). The public `move_to` always supplies a point;
+                // reaching here is a task-construction bug.
+                let (x, y) = self.point.ok_or_else(|| {
+                    napi::Error::from_reason("MoveTo task requires a point payload")
+                })?;
+                self.inner.move_to(x, y)
+            }
+            ActionKind::ResizeTo => {
+                let (w, h) = self.size.ok_or_else(|| {
+                    napi::Error::from_reason("ResizeTo task requires a size payload")
+                })?;
+                self.inner.resize_to(w, h)
+            }
         };
         r.map_err(map_err)
     }

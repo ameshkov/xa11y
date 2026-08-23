@@ -300,6 +300,53 @@ pub trait Provider: Send + Sync {
     /// here — providers should delegate to the corresponding method.
     fn perform_action(&self, element: &ElementData, action: &str) -> Result<()>;
 
+    // ── Window management ──────────────────────────────────────────
+
+    /// Enumerate the top-level windows of the process that owns `element`.
+    ///
+    /// `element` is typically an application element from [`list_apps`], but
+    /// its Windows shape is a top-level window (UIA exposes applications as
+    /// their top-level HWNDs) — backends must accept both and, on Windows,
+    /// return all top-level windows of that process (including `element`
+    /// itself when it is one). This is the window-discovery primitive behind
+    /// `App::windows`: it replaces the previous "children with `role=Window`"
+    /// idiom, which broke on Windows where the app entry *is* a window.
+    ///
+    /// Required: every `Provider` implements this explicitly — window
+    /// enumeration cost profiles differ by platform (AXWindows on macOS, a
+    /// UIA ProcessId query on Windows, an AT-SPI walk on Linux), and a
+    /// generic `get_children` + role filter default would silently route
+    /// Windows through the wrong discovery path.
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>>;
+
+    /// Raise / activate the window to the foreground.
+    ///
+    /// Required: every `Provider` implements this explicitly. There is no
+    /// portable default — each platform's activation mechanism is unique
+    /// (AXRaise on macOS, `SetForegroundWindow` on Windows, GrabFocus on
+    /// Linux), and a silent no-op default would hide an unimplemented
+    /// backend (tenet 1).
+    fn raise(&self, element: &ElementData) -> Result<()>;
+
+    /// Minimize the window.
+    fn minimize(&self, element: &ElementData) -> Result<()>;
+
+    /// Maximize the window.
+    fn maximize(&self, element: &ElementData) -> Result<()>;
+
+    /// Restore the window to its normal state (from minimized/maximized).
+    fn restore(&self, element: &ElementData) -> Result<()>;
+
+    /// Close the window.
+    fn close(&self, element: &ElementData) -> Result<()>;
+
+    /// Move the window to the given **logical** screen coordinates (top-left
+    /// origin, same space as [`ElementData::bounds`]).
+    fn move_to(&self, element: &ElementData, x: i32, y: i32) -> Result<()>;
+
+    /// Resize the window to the given **logical** width and height.
+    fn resize_to(&self, element: &ElementData, width: u32, height: u32) -> Result<()>;
+
     // ── Events ──────────────────────────────────────────────────────
 
     /// Subscribe to all accessibility events for an application.
@@ -410,6 +457,30 @@ impl<T: Provider + ?Sized> Provider for &T {
     }
     fn perform_action(&self, element: &ElementData, action: &str) -> Result<()> {
         (**self).perform_action(element, action)
+    }
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        (**self).list_windows(element)
+    }
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        (**self).raise(element)
+    }
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        (**self).minimize(element)
+    }
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        (**self).maximize(element)
+    }
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        (**self).restore(element)
+    }
+    fn close(&self, element: &ElementData) -> Result<()> {
+        (**self).close(element)
+    }
+    fn move_to(&self, element: &ElementData, x: i32, y: i32) -> Result<()> {
+        (**self).move_to(element, x, y)
+    }
+    fn resize_to(&self, element: &ElementData, width: u32, height: u32) -> Result<()> {
+        (**self).resize_to(element, width, height)
     }
     fn subscribe(&self, element: &ElementData) -> Result<Subscription> {
         (**self).subscribe(element)

@@ -24,6 +24,7 @@ pub mod errors;
 pub mod multi_window;
 pub mod screenshot;
 pub mod tree;
+pub mod windows;
 
 #[cfg(target_os = "macos")]
 pub mod events_macos;

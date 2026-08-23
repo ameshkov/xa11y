@@ -161,6 +161,20 @@ impl App {
         })
     }
 
+    /// List the top-level windows of this application.
+    ///
+    /// Each call queries the provider — results are not cached. On Linux and
+    /// macOS these are the app's `window` children; on Windows, where each
+    /// application entry is itself a top-level window, this returns every
+    /// top-level window of the process (main window plus modal dialogs).
+    #[napi(ts_return_type = "Promise<Element[]>")]
+    pub fn windows(&self) -> AsyncTask<AppWindowsTask> {
+        AsyncTask::new(AppWindowsTask {
+            data: self.data.clone(),
+            provider: self.provider.clone(),
+        })
+    }
+
     /// Get an `Element` handle for the application root.
     ///
     /// Useful for invoking Element-level methods (`children()`, `parent()`,
@@ -318,6 +332,29 @@ impl Task for AppChildrenTask {
     fn compute(&mut self) -> napi::Result<Self::Output> {
         self.provider
             .get_children(Some(&self.data))
+            .map_err(map_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output
+            .into_iter()
+            .map(|d| Element::new(d, self.provider.clone()))
+            .collect())
+    }
+}
+
+pub struct AppWindowsTask {
+    data: xa11y::ElementData,
+    provider: Arc<dyn xa11y::Provider>,
+}
+
+impl Task for AppWindowsTask {
+    type Output = Vec<xa11y::ElementData>;
+    type JsValue = Vec<Element>;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        xa11y::App::windows_with(self.provider.clone(), &self.data)
+            .map(|windows| windows.into_iter().map(|w| w.data().clone()).collect())
             .map_err(map_err)
     }
 

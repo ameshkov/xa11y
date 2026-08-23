@@ -470,6 +470,61 @@ impl Element {
     pub fn perform_action(&self, action: &str) -> crate::error::Result<()> {
         self.provider.perform_action(&self.data, action)
     }
+
+    // ── Window management ──────────────────────────────────────────
+    //
+    // These verbs operate on window-like elements (`Role::Window`, dialogs).
+    // Multiple windows can be managed from any window element, not just the
+    // app root. The provider methods validate first-class, and the platform
+    // semantics are:
+    // - `minimize`/`maximize`/`restore`/`close`: window state operations.
+    // - `raise`: bring the window to the foreground (activation).
+    // - `move_to`/`resize_to`: geometry operations in logical coordinates.
+
+    /// Raise this window to the foreground.
+    pub fn raise(&self) -> crate::error::Result<()> {
+        self.provider.raise(&self.data)
+    }
+
+    /// Minimize this window.
+    pub fn minimize(&self) -> crate::error::Result<()> {
+        self.provider.minimize(&self.data)
+    }
+
+    /// Maximize this window.
+    pub fn maximize(&self) -> crate::error::Result<()> {
+        self.provider.maximize(&self.data)
+    }
+
+    /// Restore this window to its normal state (from minimized/maximized).
+    pub fn restore(&self) -> crate::error::Result<()> {
+        self.provider.restore(&self.data)
+    }
+
+    /// Close this window.
+    pub fn close(&self) -> crate::error::Result<()> {
+        self.provider.close(&self.data)
+    }
+
+    /// Move this window to the given **logical** screen coordinates (top-left
+    /// origin, same space as [`ElementData::bounds`]).
+    pub fn move_to(&self, x: i32, y: i32) -> crate::error::Result<()> {
+        self.provider.move_to(&self.data, x, y)
+    }
+
+    /// Resize this window to the given **logical** width and height.
+    ///
+    /// Returns [`Error::InvalidActionData`] if either dimension is 0.
+    pub fn resize_to(&self, width: u32, height: u32) -> crate::error::Result<()> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidActionData {
+                message: format!(
+                    "resize_to requires positive width and height, got {width}x{height}"
+                ),
+            });
+        }
+        self.provider.resize_to(&self.data, width, height)
+    }
 }
 
 fn build_tree_node(
@@ -522,7 +577,11 @@ reader_writer_pair! {
     ///
     /// States that are inherently inapplicable use `Option`: `checked` is
     /// `None` for non-checkable elements, `expanded` is `None` for
-    /// non-expandable elements.
+    /// non-expandable elements. The window states (`minimized`, `maximized`,
+    /// `fullscreen`) are `Option` for a second reason: `None` also means
+    /// *unknown* — a platform that cannot read the state reports `None`
+    /// rather than a guessed `false` (Linux and Windows cannot report
+    /// maximized or fullscreen at all).
     ///
     /// `#[non_exhaustive]`: more states arrive in compatible releases and must
     /// not break readers. Providers building a complete state set use
@@ -563,6 +622,18 @@ reader_writer_pair! {
         /// (Windows).
         #[serde(default)]
         pub active: bool,
+        /// Whether the window is minimized (iconified).
+        ///
+        /// `None` = unknown or not a window. Unlike `enabled`/`visible`, the
+        /// three window states are `Option<bool>` because `None` also means
+        /// "this platform cannot report the state": Linux and Windows cannot
+        /// read maximized or fullscreen at all, so a hard-coded `false` would
+        /// be a silent guess.
+        pub minimized: Option<bool>,
+        /// Whether the window is maximized. `None` = unknown / not a window.
+        pub maximized: Option<bool>,
+        /// Whether the window is in fullscreen. `None` = unknown / not a window.
+        pub fullscreen: Option<bool>,
         /// None = not checkable
         pub checked: Option<Toggled>,
         pub selected: bool,
@@ -587,6 +658,9 @@ impl Default for StateSet {
             visible: true,
             focused: false,
             active: false,
+            minimized: None,
+            maximized: None,
+            fullscreen: None,
             checked: None,
             selected: false,
             expanded: None,
@@ -1000,6 +1074,89 @@ mod tests {
         assert_eq!(name, "raise");
     }
 
+    // ── Window management verbs ───────────────────────────────────
+
+    #[test]
+    fn window_verbs_record_correct_name() {
+        let provider = build_provider();
+        let cases = [
+            ("window", "raise" as &str),
+            ("window", "minimize"),
+            ("window", "maximize"),
+            ("window", "restore"),
+            ("window", "close"),
+        ];
+        for (selector, action) in cases {
+            provider.clear_actions();
+            let el = find_element(&provider, selector);
+            match action {
+                "raise" => el.raise().unwrap(),
+                "minimize" => el.minimize().unwrap(),
+                "maximize" => el.maximize().unwrap(),
+                "restore" => el.restore().unwrap(),
+                "close" => el.close().unwrap(),
+                _ => unreachable!(),
+            }
+            let (handle, name, data) = last_action(&provider);
+            assert_eq!(name, action, "wrong action recorded for {selector}");
+            assert_eq!(data, None, "nullary action should not carry data");
+            assert_eq!(handle, el.data.handle);
+        }
+    }
+
+    #[test]
+    fn move_to_records_coordinate_payload() {
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        el.move_to(10, 20).unwrap();
+        let (_, name, data) = last_action(&provider);
+        assert_eq!(name, "move_to");
+        assert_eq!(data.as_deref(), Some("10,20"));
+    }
+
+    #[test]
+    fn resize_to_records_size_payload() {
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        el.resize_to(640, 480).unwrap();
+        let (_, name, data) = last_action(&provider);
+        assert_eq!(name, "resize_to");
+        assert_eq!(data.as_deref(), Some("640x480"));
+    }
+
+    #[test]
+    fn resize_to_rejects_zero_dimensions() {
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        for (w, h) in [(0u32, 100u32), (100, 0), (0, 0)] {
+            assert!(matches!(
+                el.resize_to(w, h),
+                Err(Error::InvalidActionData { .. })
+            ));
+        }
+        assert!(
+            provider.actions().is_empty(),
+            "validation failures must not reach the provider"
+        );
+    }
+
+    #[test]
+    fn minimize_then_restore_roundtrip_updates_state() {
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        el.minimize().unwrap();
+        // Re-resolve: the window must now report minimized and be off-screen.
+        let after = find_element(&provider, "window");
+        assert_eq!(after.states.minimized, Some(true));
+        assert_eq!(after.states.maximized, None);
+        assert!(!after.states.visible);
+        el.restore().unwrap();
+        let restored = find_element(&provider, "window");
+        assert_eq!(restored.states.minimized, Some(false));
+        assert_eq!(restored.states.maximized, Some(false));
+        assert!(restored.states.visible);
+    }
+
     #[test]
     fn locator_actions_desugar_to_element_actions() {
         // Locator's auto-wait wraps the resolved data in an Element and calls
@@ -1032,5 +1189,36 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "validation must short-circuit auto-wait",
         );
+    }
+
+    #[test]
+    fn state_set_payload_without_window_fields_still_deserializes() {
+        // A `states` payload serialized before the window-management release
+        // has no `minimized` / `maximized` / `fullscreen` keys at all. Those
+        // are `Option<bool>`, and serde's derived `Deserialize` treats a
+        // missing `Option` field as `None` implicitly — unlike a plain field
+        // such as `active`, which is why `active` carries `#[serde(default)]`
+        // while the three window fields need nothing. This test pins that
+        // backward-compat guarantee so a payload from a previous release stays
+        // readable.
+        let json = r#"{
+            "enabled": true, "visible": true, "focused": false, "active": false,
+            "checked": null, "selected": false, "expanded": null, "editable": false,
+            "focusable": false, "modal": false, "required": false, "busy": false
+        }"#;
+        let states: StateSet = serde_json::from_str(json)
+            .expect("payloads without the window state fields must still deserialize");
+        assert_eq!(states.minimized, None);
+        assert_eq!(states.maximized, None);
+        assert_eq!(states.fullscreen, None);
+
+        // And a payload that does carry a window state round-trips untouched.
+        let mut data = ElementData::for_role(Role::Window);
+        data.states.minimized = Some(true);
+        let json = serde_json::to_string(&data.states).unwrap();
+        assert!(json.contains("\"minimized\":true"));
+        let round: StateSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.minimized, Some(true));
+        assert_eq!(round.maximized, None);
     }
 }

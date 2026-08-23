@@ -129,6 +129,42 @@ impl Provider for MockProvider {
         Ok(())
     }
 
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        Ok(self
+            .get_children(Some(element))?
+            .into_iter()
+            .filter(|c| c.role == Role::Window)
+            .collect())
+    }
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "raise".to_string()));
+        Ok(())
+    }
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "minimize".to_string()));
+        Ok(())
+    }
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "maximize".to_string()));
+        Ok(())
+    }
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "restore".to_string()));
+        Ok(())
+    }
+    fn close(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "close".to_string()));
+        Ok(())
+    }
+    fn move_to(&self, element: &ElementData, _x: i32, _y: i32) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "move_to".to_string()));
+        Ok(())
+    }
+    fn resize_to(&self, element: &ElementData, _width: u32, _height: u32) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "resize_to".to_string()));
+        Ok(())
+    }
+
     fn subscribe(&self, _element: &ElementData) -> Result<Subscription> {
         Err(Error::Platform {
             code: -1,
@@ -1077,6 +1113,35 @@ impl Provider for MultiAppMockProvider {
         Ok(())
     }
 
+    fn list_windows(&self, element: &ElementData) -> Result<Vec<ElementData>> {
+        Ok(self
+            .get_children(Some(element))?
+            .into_iter()
+            .filter(|c| c.role == Role::Window)
+            .collect())
+    }
+    fn raise(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
+    fn minimize(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
+    fn maximize(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
+    fn restore(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
+    fn close(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
+    fn move_to(&self, _: &ElementData, _: i32, _: i32) -> Result<()> {
+        Ok(())
+    }
+    fn resize_to(&self, _: &ElementData, _: u32, _: u32) -> Result<()> {
+        Ok(())
+    }
+
     fn subscribe(&self, _: &ElementData) -> Result<Subscription> {
         Err(Error::Platform {
             code: -1,
@@ -1350,6 +1415,30 @@ impl Provider for DelayedProvider {
     fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
         self.inner.perform_action(e, a)
     }
+    fn list_windows(&self, e: &ElementData) -> Result<Vec<ElementData>> {
+        self.inner.list_windows(e)
+    }
+    fn raise(&self, e: &ElementData) -> Result<()> {
+        self.inner.raise(e)
+    }
+    fn minimize(&self, e: &ElementData) -> Result<()> {
+        self.inner.minimize(e)
+    }
+    fn maximize(&self, e: &ElementData) -> Result<()> {
+        self.inner.maximize(e)
+    }
+    fn restore(&self, e: &ElementData) -> Result<()> {
+        self.inner.restore(e)
+    }
+    fn close(&self, e: &ElementData) -> Result<()> {
+        self.inner.close(e)
+    }
+    fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+        self.inner.move_to(e, x, y)
+    }
+    fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+        self.inner.resize_to(e, w, h)
+    }
     fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
         self.inner.subscribe(e)
     }
@@ -1506,6 +1595,30 @@ impl Provider for AppByPidOverrideProvider {
     fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
         self.inner.perform_action(e, a)
     }
+    fn list_windows(&self, e: &ElementData) -> Result<Vec<ElementData>> {
+        self.inner.list_windows(e)
+    }
+    fn raise(&self, e: &ElementData) -> Result<()> {
+        self.inner.raise(e)
+    }
+    fn minimize(&self, e: &ElementData) -> Result<()> {
+        self.inner.minimize(e)
+    }
+    fn maximize(&self, e: &ElementData) -> Result<()> {
+        self.inner.maximize(e)
+    }
+    fn restore(&self, e: &ElementData) -> Result<()> {
+        self.inner.restore(e)
+    }
+    fn close(&self, e: &ElementData) -> Result<()> {
+        self.inner.close(e)
+    }
+    fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+        self.inner.move_to(e, x, y)
+    }
+    fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+        self.inner.resize_to(e, w, h)
+    }
     fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
         self.inner.subscribe(e)
     }
@@ -1647,6 +1760,30 @@ impl Provider for GhostAppProvider {
     }
     fn perform_action(&self, e: &ElementData, a: &str) -> Result<()> {
         self.inner.perform_action(e, a)
+    }
+    fn list_windows(&self, e: &ElementData) -> Result<Vec<ElementData>> {
+        self.inner.list_windows(e)
+    }
+    fn raise(&self, e: &ElementData) -> Result<()> {
+        self.inner.raise(e)
+    }
+    fn minimize(&self, e: &ElementData) -> Result<()> {
+        self.inner.minimize(e)
+    }
+    fn maximize(&self, e: &ElementData) -> Result<()> {
+        self.inner.maximize(e)
+    }
+    fn restore(&self, e: &ElementData) -> Result<()> {
+        self.inner.restore(e)
+    }
+    fn close(&self, e: &ElementData) -> Result<()> {
+        self.inner.close(e)
+    }
+    fn move_to(&self, e: &ElementData, x: i32, y: i32) -> Result<()> {
+        self.inner.move_to(e, x, y)
+    }
+    fn resize_to(&self, e: &ElementData, w: u32, h: u32) -> Result<()> {
+        self.inner.resize_to(e, w, h)
     }
     fn subscribe(&self, e: &ElementData) -> Result<Subscription> {
         self.inner.subscribe(e)

@@ -659,6 +659,10 @@ fn bits_from_u32s(state_bits: &[u32]) -> u64 {
 
 fn states_from_bits(bits: u64, role: Role) -> StateSet {
     // Same bit positions as `LinuxProvider::parse_states` — kept in sync.
+    // Each constant is `1 << ordinal` of the `AtspiStateType` enum in
+    // at-spi2-core's `atspi/atspi-constants.h` (e.g. ICONIFIED=15,
+    // MODAL=16, VISIBLE=30); the state set arrives packed as one bit per
+    // state ordinal.
     const ACTIVE: u64 = 1 << 1;
     const BUSY: u64 = 1 << 3;
     const CHECKED: u64 = 1 << 4;
@@ -668,6 +672,7 @@ fn states_from_bits(bits: u64, role: Role) -> StateSet {
     const EXPANDED: u64 = 1 << 10;
     const FOCUSABLE: u64 = 1 << 11;
     const FOCUSED: u64 = 1 << 12;
+    const ICONIFIED: u64 = 1 << 15;
     const MODAL: u64 = 1 << 16;
     const SELECTED: u64 = 1 << 23;
     const SENSITIVE: u64 = 1 << 24;
@@ -713,6 +718,13 @@ fn states_from_bits(bits: u64, role: Role) -> StateSet {
         modal: (bits & MODAL) != 0,
         required: (bits & REQUIRED) != 0,
         busy: (bits & BUSY) != 0,
+        minimized: if matches!(role, Role::Window | Role::Dialog) {
+            Some((bits & ICONIFIED) != 0)
+        } else {
+            None
+        },
+        maximized: None,
+        fullscreen: None,
     }
     .into()
 }
