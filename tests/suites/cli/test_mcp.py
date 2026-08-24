@@ -271,6 +271,9 @@ def test_tools_list_is_complete_and_deterministic(mcp):
         "key",
         "type",
         "screenshot",
+        "events_start",
+        "events_poll",
+        "events_stop",
     ]
 
 
@@ -1154,3 +1157,210 @@ def test_a_missing_shell_surface_is_an_operation_failure_not_a_usage_error(entry
     result = _run(entry_point, "find", "*", "--shell", absent[0])
     assert result.returncode == 1, result.stdout
     assert absent[0] in result.stderr, result.stderr
+
+
+# ── Event subscriptions ──────────────────────────────────────────────────────
+#
+# The lifecycle is protocol, not platform: a handle is issued, resolves while
+# it is open, and stops resolving once it is closed. Those tests assert
+# strictly everywhere.
+#
+# Whether an event *arrives* is a platform question. Bridge delivery for
+# programmatic actions is unreliable on several app/platform combinations —
+# tests/suites/python/test_events.py documents which — so a bare "an event
+# shows up" assertion would flake, and an xfail around it would assert
+# nothing in either direction.
+#
+# The way out is a control. xa11y's own subscription, from this process,
+# watches the same application through the same bridge, and the test compares
+# the two: an event the library received and the MCP registry did not is a
+# defect in this layer, which is the only defect this layer can have. When the
+# bridge delivers to neither, there was nothing to carry and the test says so.
+
+TEST_APP = os.environ.get("XA11Y_TEST_APP", "tauri")
+
+# Longest the two subscribers are given to see the same action. Generous
+# because it is a failure deadline, not a wait: a delivering bridge answers in
+# well under a second.
+EVENT_DEADLINE = 15.0
+
+
+@pytest.fixture
+def subscription(mcp, app_pid):
+    """An open subscription on the test app, closed however the test ends."""
+    started = mcp.call_tool("events_start", {"pid": app_pid})["result"]
+    assert started["isError"] is False, started["content"]
+    handle = started["structuredContent"]["subscription_id"]
+    try:
+        yield handle
+    finally:
+        mcp.call_tool("events_stop", {"subscription_id": handle}, id_=98)
+
+
+def test_events_start_hands_out_a_handle_with_its_limits(mcp, app_pid):
+    """A model has to know the buffer size and the retention to poll sanely."""
+    started = mcp.call_tool("events_start", {"pid": app_pid})["result"]
+    assert started["isError"] is False, started["content"]
+    structured = started["structuredContent"]
+    assert structured["subscription_id"]
+    assert structured["pid"] == app_pid
+    assert structured["kinds"] is None, "no filter means every kind"
+    assert structured["buffer_capacity"] > 0
+    assert structured["expires_after_ms"] > 0
+    mcp.call_tool(
+        "events_stop", {"subscription_id": structured["subscription_id"]}, id_=98
+    )
+
+
+def test_an_idle_poll_is_an_empty_result_not_a_failure(mcp, subscription):
+    """An empty `events` must not read as a broken subscription."""
+    result = mcp.call_tool("events_poll", {"subscription_id": subscription})["result"]
+    assert result["isError"] is False, result["content"]
+    structured = result["structuredContent"]
+    assert structured["subscription_id"] == subscription
+    assert isinstance(structured["events"], list)
+    assert structured["dropped"] == 0
+    assert structured["live"] is True, "the application is still running"
+
+
+def test_a_blocking_poll_returns_within_its_timeout(mcp, subscription):
+    """The cap exists because the session loop handles one message at a time."""
+    start = time.monotonic()
+    result = mcp.call_tool(
+        "events_poll", {"subscription_id": subscription, "timeout_ms": 500}
+    )["result"]
+    elapsed = time.monotonic() - start
+    assert result["isError"] is False, result["content"]
+    assert elapsed < 20, f"a 500ms poll took {elapsed:.1f}s"
+
+
+def test_a_stopped_handle_reports_expiry_rather_than_a_generic_miss(mcp, app_pid):
+    """The two misses have different recoveries, so they are different kinds."""
+    started = mcp.call_tool("events_start", {"pid": app_pid})["result"]
+    handle = started["structuredContent"]["subscription_id"]
+
+    stopped = mcp.call_tool("events_stop", {"subscription_id": handle})["result"]
+    assert stopped["isError"] is False, stopped["content"]
+    assert stopped["structuredContent"]["stopped"] is True
+
+    after = mcp.call_tool("events_poll", {"subscription_id": handle})["result"]
+    assert after["isError"] is True
+    assert after["structuredContent"]["kind"] == "subscription_expired"
+    assert after["structuredContent"]["subscription_id"] == handle
+
+
+def test_a_handle_that_was_never_issued_is_a_different_kind(mcp):
+    result = mcp.call_tool("events_poll", {"subscription_id": "sub_nonexistent"})["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["kind"] == "subscription_not_found"
+    assert "live_subscriptions" in result["structuredContent"], (
+        "the open handles are what a model needs to recover"
+    )
+
+
+def test_events_are_subscribed_per_application_not_per_surface(mcp):
+    """`shell` is absent from the schema and refused with the reason."""
+    schema = None
+    for tool in mcp.request(1, "tools/list")["result"]["tools"]:
+        if tool["name"] == "events_start":
+            schema = tool["inputSchema"]
+    assert schema is not None
+    assert "shell" not in schema["properties"]
+
+    result = mcp.call_tool("events_start", {"shell": "taskbar"})["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["kind"] == "invalid_arguments"
+    assert "per application" in result["structuredContent"]["message"]
+
+
+def test_an_unknown_event_kind_is_refused_with_the_names_that_exist(mcp):
+    """Accepting it would look exactly like an application that emits nothing.
+
+    No application is named, and the answer is still about `kinds`: the
+    arguments are parsed before anything reaches the accessibility layer, so a
+    bad filter cannot leave a subscription open behind it.
+    """
+    result = mcp.call_tool(
+        "events_start", {"app": "NoSuchApplicationHere", "kinds": ["focus_change"]}
+    )["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["kind"] == "invalid_arguments"
+    assert "focus_change" in result["structuredContent"]["message"]
+    assert "focus_changed" in result["structuredContent"]["message"]
+
+
+@pytest.fixture
+def library_subscription(app):
+    """A second subscriber on the same application, from this process.
+
+    xa11y's own subscription, opened through the library rather than through
+    MCP, and living in a different process from the server's. It is the
+    control for `test_an_action_reaches_a_poll_as_a_shaped_event`.
+    """
+    with app.subscribe() as subscription:
+        yield subscription
+
+
+def test_an_action_reaches_a_poll_as_a_shaped_event(
+    mcp, app_pid, library_subscription
+):
+    """Whatever xa11y's own subscription receives, a poll has to receive too.
+
+    Start, act, poll — the order the tool descriptions tell a model to use.
+    Both subscribers are open before the action, and the assertion is
+    conditional on the control rather than on the platform: if the library
+    saw an event and the MCP registry did not, this layer dropped it.
+    """
+    started = mcp.call_tool("events_start", {"pid": app_pid})["result"]
+    assert started["isError"] is False, started["content"]
+    handle = started["structuredContent"]["subscription_id"]
+    try:
+        # `OK` is the one button every test app has, and pressing it by name
+        # is what `test_action_presses_a_button` already does on all of them.
+        acted = mcp.call_tool(
+            "action",
+            {"action": "press", "selector": 'button[name="OK"]', "pid": app_pid},
+        )["result"]
+        if acted["isError"]:
+            pytest.skip(f"the {TEST_APP} app did not accept a press on OK: {acted}")
+
+        library_events = []
+        mcp_events = []
+        deadline = time.monotonic() + EVENT_DEADLINE
+        while time.monotonic() < deadline and not (library_events and mcp_events):
+            event = library_subscription.try_recv()
+            if event is not None:
+                library_events.append(event)
+            polled = mcp.call_tool(
+                "events_poll", {"subscription_id": handle, "timeout_ms": 250}
+            )["result"]
+            assert polled["isError"] is False, polled["content"]
+            structured = polled["structuredContent"]
+            assert structured["dropped"] == 0, "a handful of events cannot overflow"
+            mcp_events.extend(structured["events"])
+
+        if not library_events:
+            pytest.skip(
+                f"the bridge delivered no event to xa11y's own subscription "
+                f"either, so there was nothing for MCP to carry ({TEST_APP} on "
+                f"{sys.platform}; tests/suites/python/test_events.py records "
+                f"which combinations deliver)"
+            )
+        assert mcp_events, (
+            f"xa11y's own subscription received {len(library_events)} event(s) "
+            f"from this action and the MCP subscription received none"
+        )
+
+        first = mcp_events[0]
+        assert first["kind"], "every event names its kind"
+        assert first["sequence"] == 0, "the first event of a subscription is 0"
+        assert isinstance(first["at_ms"], int)
+        # The originating process as the backend reported it, which is not
+        # asserted equal to `app_pid`: that is the backend's business, and a
+        # disagreement there would be a finding about the provider rather than
+        # about this layer.
+        assert isinstance(first["pid"], int), "an event names where it came from"
+        if "target" in first:
+            assert first["target"]["role"], "a target is shaped like a find match"
+    finally:
+        mcp.call_tool("events_stop", {"subscription_id": handle}, id_=98)
