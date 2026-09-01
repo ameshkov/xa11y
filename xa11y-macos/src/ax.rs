@@ -117,6 +117,8 @@ extern "C" {
     fn safe_cf_run_loop_run();
     fn safe_cf_run_loop_stop(run_loop: CFTypeRef);
     fn safe_ax_value_create_cf_range(location: isize, length: isize) -> CFTypeRef;
+    fn safe_ax_value_create_cg_point(x: f64, y: f64) -> CFTypeRef;
+    fn safe_ax_value_create_cg_size(width: f64, height: f64) -> CFTypeRef;
 
     // CoreFoundation helpers - all calls from ax.rs go through these.
     fn safe_cf_retain(cf: CFTypeRef) -> CFTypeRef;
@@ -454,6 +456,233 @@ fn probe_element_attr(element: AXUIElementRef, attribute: &str) -> ElementProbe 
     }
 }
 
+/// Outcome of reading a raw CFTypeRef-valued AX attribute, preserving the
+/// AXError code so a caller can distinguish "the element has no such
+/// attribute" from "the process did not answer".
+enum RawAttr {
+    /// The copy succeeded and returned a value, owned (+1 retained).
+    Value(CFTypeRef),
+    /// The process answered, and the attribute is absent, unsupported, NULL,
+    /// or null on success. No value is owned.
+    Absent,
+    /// The process did not answer within its messaging timeout, or the
+    /// element / process is gone. Carries the AXError code.
+    Unanswered(i32),
+}
+
+/// Read an attribute, preserving its AXError. The value is returned raw so a
+/// caller can type-check before casting — `AXUIElementCopyAttributeValue` can
+/// hand back `kCFNull` (or another non-element) with `AX_ERROR_SUCCESS`, and
+/// casting that to `AXUIElementRef` is undefined behavior (see `close`).
+fn read_raw_attr(element: AXUIElementRef, attribute: &str) -> RawAttr {
+    let attr = CFString::new(attribute);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err =
+        ffi_copy_attribute_value(element, attr.as_concrete_TypeRef() as CFTypeRef, &mut value);
+    match err {
+        AX_ERROR_SUCCESS => {
+            if value.is_null() {
+                RawAttr::Absent
+            } else {
+                RawAttr::Value(value)
+            }
+        }
+        // The process answered and said it has no such attribute / no value.
+        AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE => RawAttr::Absent,
+        // Everything else — kAXErrorCannotComplete (the code a messaging
+        // timeout surfaces as), kAXErrorInvalidUIElement, an ObjC exception
+        // caught by the wrapper — means we did not get an answer.
+        _ => RawAttr::Unanswered(err),
+    }
+}
+
+/// Top-level windows of the application (`AXWindows` attribute), in window
+/// order. Layout mirrors [`ax_children`]: the attribute value is owned and
+/// released here, and each element is retained via `from_borrowed`.
+///
+/// Deliberately does **not** go through [`ax_attr`], which collapses every
+/// `AXError` into `None`: `App::windows()` on a specific application must
+/// distinguish "this app has no windows" (`AX_ERROR_ATTRIBUTE_UNSUPPORTED` /
+/// `AX_ERROR_NO_VALUE` → `Ok(vec![])`) from "the app did not answer"
+/// (`kAXErrorCannotComplete`, a dead element, ...) — the latter is a real
+/// platform failure and propagates (tenet 1), never an empty success that
+/// reads as "no windows".
+fn ax_windows(element: AXUIElementRef) -> Result<Vec<AXElement>> {
+    let attr = CFString::new("AXWindows");
+    let mut value: CFTypeRef = std::ptr::null();
+    let err =
+        ffi_copy_attribute_value(element, attr.as_concrete_TypeRef() as CFTypeRef, &mut value);
+    match err {
+        AX_ERROR_SUCCESS => {
+            if value.is_null() {
+                return Ok(vec![]);
+            }
+            unsafe {
+                if safe_cf_get_type_id(value) != safe_cf_array_get_type_id() {
+                    safe_cf_release(value);
+                    return Err(Error::Platform {
+                        code: -1,
+                        message: "AXWindows returned a non-array value; the provider answered \
+                                  malformed, not empty"
+                            .to_string(),
+                    });
+                }
+                let count = safe_cf_array_get_count(value);
+                let mut windows = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    let w = safe_cf_array_get_value(value, i);
+                    if !w.is_null() {
+                        windows.push(AXElement::from_borrowed(w));
+                    }
+                }
+                safe_cf_release(value);
+                Ok(windows)
+            }
+        }
+        // The process answered and said it has no such attribute / no value:
+        // an application without windows, honestly reported as an empty list.
+        AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE => Ok(vec![]),
+        // Everything else — kAXErrorCannotComplete (the code a messaging
+        // timeout surfaces as), kAXErrorInvalidUIElement, an ObjC exception
+        // caught by the wrapper — means we did not get an answer.
+        code => Err(Error::Platform {
+            code: code as i64,
+            message: format!("AXUIElementCopyAttributeValue(AXWindows) failed (AXError {code})"),
+        }),
+    }
+}
+
+/// The close button of a window, or `None` when there is none.
+///
+/// The canonical AX close path is pressing the close button: prefer the
+/// direct `AXCloseButton` attribute, then the child scan (both are the same
+/// button; the attribute is one IPC call and the scan is the fallback for
+/// bridges that only expose it as a child with the `AXCloseButton` subrole).
+/// Shared by `close()` (which presses the result) and the `actions`
+/// advertisement, so the advertised surface always matches the dispatch
+/// (tenet 3): a bridge that exposes the button only as a child advertises
+/// `close` and can press it.
+///
+/// The value must be an `AXUIElement` before it is cast and handed to
+/// `AXPress`. `AXUIElementCopyAttributeValue` can return `kCFNull` (or
+/// another non-element!) for a window with no close button instead of an
+/// error, and casting that to `AXUIElementRef` is undefined behavior.
+/// Comparing type ids against the element's own (also an `AXUIElement`) is
+/// the same guard `ax_string`/`ax_bool` apply, and needs no new safe
+/// wrapper.
+///
+/// Error-preserving: only a genuinely absent attribute falls back to the
+/// child scan, and only a genuinely absent subrole means "not the close
+/// button". A dead or wedged element answers `kAXErrorCannotComplete` /
+/// `kAXErrorInvalidUIElement`, and letting that read as "no close button"
+/// hides the real failure as an `ActionNotSupported` (tenet 1) — the same
+/// distinction `probe_element_attr` / `ax_windows` make for their
+/// attributes.
+fn find_close_button(element: AXUIElementRef, role: Role) -> Result<Option<AXElement>> {
+    let raw_attr_close = match read_raw_attr(element, "AXCloseButton") {
+        RawAttr::Value(v) => {
+            // Both `v` and `element` carry the AXUIElement type id if `v`
+            // is really an element; anything else (kCFNull, etc.) is
+            // treated like a missing attribute.
+            let is_element =
+                unsafe { safe_cf_get_type_id(v) == safe_cf_get_type_id(element as CFTypeRef) };
+            if is_element {
+                Some(AXElement::from_owned(v as AXUIElementRef))
+            } else {
+                unsafe { safe_cf_release(v) };
+                None
+            }
+        }
+        RawAttr::Absent => None,
+        RawAttr::Unanswered(code) => {
+            return Err(Error::Platform {
+                code: code as i64,
+                message: format!(
+                    "AXCloseButton read failed for a {} (AXError {code}); the close button \
+                     is unknown, not absent",
+                    role
+                ),
+            });
+        }
+    };
+    match raw_attr_close {
+        Some(b) => Ok(Some(b)),
+        None => match read_raw_attr(element, "AXChildren") {
+            RawAttr::Value(v) => {
+                let found = unsafe {
+                    if safe_cf_get_type_id(v) != safe_cf_array_get_type_id() {
+                        None
+                    } else {
+                        let count = safe_cf_array_get_count(v);
+                        let mut found = None;
+                        for i in 0..count {
+                            let child = safe_cf_array_get_value(v, i);
+                            if child.is_null() {
+                                continue;
+                            }
+                            // Same structure as the AXCloseButton read
+                            // above: only a genuinely absent subrole means
+                            // "not the close button". `ax_string` would
+                            // collapse every read failure
+                            // (CannotComplete, InvalidUIElement) into
+                            // None — turning a real platform error into
+                            // "no close button" (tenet 1).
+                            let is_close_button = match read_raw_attr(child, "AXSubrole") {
+                                RawAttr::Value(subrole) => {
+                                    if safe_cf_get_type_id(subrole) == safe_cf_string_get_type_id()
+                                    {
+                                        // CFString compares to `&str`
+                                        // without an owned allocation.
+                                        CFString::wrap_under_create_rule(subrole as *const _)
+                                            == "AXCloseButton"
+                                    } else {
+                                        safe_cf_release(subrole);
+                                        false
+                                    }
+                                }
+                                RawAttr::Absent => false,
+                                RawAttr::Unanswered(code) => {
+                                    // `v` (AXChildren) is owned by this
+                                    // unsafe block; the release below is
+                                    // skipped by this early return, so
+                                    // release here or every failed
+                                    // subrole read leaks the array.
+                                    safe_cf_release(v);
+                                    return Err(Error::Platform {
+                                        code: code as i64,
+                                        message: format!(
+                                            "AXSubrole read failed while scanning for the \
+                                             close button of a {} (AXError {code}); the \
+                                             close button is unknown, not absent",
+                                            role
+                                        ),
+                                    });
+                                }
+                            };
+                            if is_close_button {
+                                found = Some(AXElement::from_borrowed(child));
+                                break;
+                            }
+                        }
+                        found
+                    }
+                };
+                unsafe { safe_cf_release(v) };
+                Ok(found)
+            }
+            RawAttr::Absent => Ok(None),
+            RawAttr::Unanswered(code) => Err(Error::Platform {
+                code: code as i64,
+                message: format!(
+                    "AXChildren read failed while scanning for the close button of a {} \
+                     (AXError {code}); the close button is unknown, not absent",
+                    role
+                ),
+            }),
+        },
+    }
+}
+
 /// Roles whose selection state may live on the container rather than on the
 /// element itself. Kept narrow so the container probe never fires for
 /// elements that simply have no selection concept.
@@ -631,7 +860,10 @@ mod attr_idx {
     pub const POSITION: usize = 12;
     pub const SIZE: usize = 13;
     pub const IDENTIFIER: usize = 14;
-    pub const COUNT: usize = 15;
+    pub const MINIMIZED: usize = 15;
+    pub const ZOOMED: usize = 16;
+    pub const FULLSCREEN: usize = 17;
+    pub const COUNT: usize = 18;
 }
 
 /// Raw values returned by a single batch AX fetch. Values are borrowed
@@ -664,6 +896,9 @@ impl BatchAttrs {
             CFString::new("AXPosition"),
             CFString::new("AXSize"),
             CFString::new("AXIdentifier"),
+            CFString::new("AXMinimized"),
+            CFString::new("AXZoomed"),
+            CFString::new("AXFullScreen"),
         ];
         let ptrs: Vec<CFTypeRef> = attr_names
             .iter()
@@ -852,6 +1087,12 @@ struct ResolvedAttrs {
     hidden: Option<bool>,
     expanded: Option<bool>,
     modal: Option<bool>,
+    /// Window minimized state (`AXMinimized`); `None` on non-window elements.
+    minimized: Option<bool>,
+    /// Window maximized / zoomed state (`AXZoomed`); `None` on non-window elements.
+    zoomed: Option<bool>,
+    /// Window fullscreen state (`AXFullScreen`); `None` on non-window elements.
+    fullscreen: Option<bool>,
     position: Option<(f64, f64)>,
     size: Option<(f64, f64)>,
     identifier: Option<String>,
@@ -891,6 +1132,9 @@ impl ResolvedAttrs {
             hidden: batch.boolean(attr_idx::HIDDEN),
             expanded: batch.boolean(attr_idx::EXPANDED),
             modal: batch.boolean(attr_idx::MODAL),
+            minimized: batch.boolean(attr_idx::MINIMIZED),
+            zoomed: batch.boolean(attr_idx::ZOOMED),
+            fullscreen: batch.boolean(attr_idx::FULLSCREEN),
             position: batch.position(),
             size: batch.size(),
             identifier: batch.string(attr_idx::IDENTIFIER),
@@ -915,6 +1159,9 @@ impl ResolvedAttrs {
             hidden: ax_bool(element, "AXHidden"),
             expanded: ax_bool(element, "AXExpanded"),
             modal: ax_bool(element, "AXModal"),
+            minimized: ax_bool(element, "AXMinimized"),
+            zoomed: ax_bool(element, "AXZoomed"),
+            fullscreen: ax_bool(element, "AXFullScreen"),
             position: ax_position(element),
             size: ax_size(element),
             identifier: ax_string(element, "AXIdentifier"),
@@ -995,13 +1242,20 @@ fn is_attr_settable(el_ptr: AXUIElementRef, attr_name: &str) -> Result<bool> {
             &mut settable,
         )
     };
-    if err != AX_ERROR_SUCCESS {
-        return Err(Error::Platform {
-            code: err as i64,
+    match err {
+        AX_ERROR_SUCCESS => Ok(settable),
+        // "Is this attribute settable?" answered as "the attribute is not
+        // supported / has no value" is a definitive `false`, not a platform
+        // failure: `restore` checks both `AXMinimized` and `AXZoomed`, and a
+        // window without a zoom button failing the whole restore on
+        // `AXZoomed`-unsupported hides that it restored fine (tenet 1 is
+        // about real failures — an explicit "not supported" is the answer).
+        AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE => Ok(false),
+        code => Err(Error::Platform {
+            code: code as i64,
             message: format!("IsAttributeSettable({attr_name}) failed"),
-        });
+        }),
     }
-    Ok(settable)
 }
 
 fn set_bool_attr(
@@ -1027,6 +1281,45 @@ fn set_bool_attr(
         ));
     }
     Ok(())
+}
+
+/// Clear a boolean attribute when it currently reads `true`.
+///
+/// The deminiaturize half of `raise` / `maximize`: `AXRaise` and (alone)
+/// `AXZoomed` do not clear `AXMinimized`, so a minimized window must have its
+/// minimized flag cleared first or the verb returns success while the window
+/// stays in the Dock. Error-preserving: only a definitive unsupported /
+/// no-value answer (`RawAttr::Absent`) means "not set"; a failed read is a
+/// platform error (tenet 1), the same distinction `restore()` makes.
+fn clear_bool_attr_if_true(
+    el_ptr: AXUIElementRef,
+    attr_name: &str,
+    action: &str,
+    role: Role,
+) -> Result<bool> {
+    let was_true = match read_raw_attr(el_ptr, attr_name) {
+        RawAttr::Value(v) => {
+            let is_boolean = unsafe { safe_cf_get_type_id(v) == safe_cf_boolean_get_type_id() };
+            let b = is_boolean && unsafe { safe_cf_boolean_get_value(v) };
+            unsafe { safe_cf_release(v) };
+            b
+        }
+        RawAttr::Absent => false,
+        RawAttr::Unanswered(code) => {
+            return Err(Error::Platform {
+                code: code as i64,
+                message: format!(
+                    "{attr_name} read failed while running {action} on a {} (AXError {code}); \
+                     the state is unknown, not false",
+                    role
+                ),
+            });
+        }
+    };
+    if was_true {
+        set_bool_attr(el_ptr, attr_name, false, action, role)?;
+    }
+    Ok(was_true)
 }
 
 // ── Role Mapping ──────────────────────────────────────────────────────────────
@@ -1148,6 +1441,7 @@ fn ax_action_to_name(ax_name: &str) -> Option<&'static str> {
         "AXShowMenu" => Some("show_menu"),
         "AXIncrement" => Some("increment"),
         "AXDecrement" => Some("decrement"),
+        "AXRaise" => Some("raise"),
         _ => None,
     }
 }
@@ -1235,8 +1529,13 @@ fn matches_ax_with_role(
         }
         // Snapshot handle is 0 — this path is only used to decide whether to
         // keep a candidate; callers re-resolve via the provider cache after
-        // the match set is assembled.
-        let data = build_snapshot_data(ax, None, 0);
+        // the match set is assembled. A snapshot that cannot be built is a
+        // candidate that does not match (the selector engines treat an
+        // unreadable node as absent, not as a hard failure).
+        let data = match build_snapshot_data(ax, None, 0) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
         return xa11y_core::selector::matches_simple(&data, simple);
     }
 
@@ -1487,7 +1786,7 @@ impl MacOSProvider {
     /// Build an ElementData from an AXElement, caching the AX handle.
     /// Tries batch fetch (1 IPC call for 15 attributes) first, falls back
     /// to individual calls if the batch API fails.
-    fn build_element_data(&self, ax: &AXElement, pid: Option<u32>) -> ElementData {
+    fn build_element_data(&self, ax: &AXElement, pid: Option<u32>) -> Result<ElementData> {
         let handle = self.cache_element(ax.clone());
         build_snapshot_data(ax.as_ptr(), pid, handle)
     }
@@ -1498,13 +1797,17 @@ impl MacOSProvider {
 /// want the snapshot to be navigable later must supply one from
 /// `MacOSProvider::cache_element`. For read-only snapshots (e.g. event
 /// targets), pass `0`.
-fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -> ElementData {
+fn build_snapshot_data(
+    element: AXUIElementRef,
+    pid: Option<u32>,
+    handle: u64,
+) -> Result<ElementData> {
     if element.is_null() {
         // A null AXUIElementRef reports nothing, but this is still a
         // production path that returns an element to consumers — so it goes
         // through ElementParts rather than `for_role`. A new property needs a
         // decision here too, even if the decision is almost always "absent".
-        return ElementParts {
+        return Ok(ElementParts {
             role: Role::Unknown,
             name: None,
             value: None,
@@ -1520,10 +1823,10 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             raw: std::collections::HashMap::new(),
             handle,
         }
-        .into();
+        .into());
     }
 
-    let body = move || -> ElementData {
+    let body = move || -> Result<ElementData> {
         let attrs = if let Some(batch) = BatchAttrs::fetch(element) {
             ResolvedAttrs::from_batch(&batch)
         } else {
@@ -1672,6 +1975,21 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             active,
             focusable,
             modal: attrs.modal.unwrap_or(false),
+            minimized: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.minimized
+            } else {
+                None
+            },
+            maximized: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.zoomed
+            } else {
+                None
+            },
+            fullscreen: if matches!(role, Role::Window | Role::Dialog) {
+                attrs.fullscreen
+            } else {
+                None
+            },
             checked,
             // `AXSelected` is the per-element attribute, but bridges like
             // Qt's implement selection only container-side
@@ -1746,6 +2064,56 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             actions.push(toggle_str);
         }
 
+        // Window verbs: `raise` is advertised from the native action list
+        // (AXRaise is a real AX action for windows); the attribute-backed
+        // verbs are advertised from settability, the same way `expand` /
+        // `collapse` decide theirs. The probes preserve their errors: a
+        // transient `CannotComplete` is a platform failure, not "the window
+        // cannot be minimized" — `is_attr_settable` already answers
+        // unsupported/no-value as `false` (the honest absence case), so a
+        // real failure propagates out of element construction instead of
+        // silently dropping the capability from `actions`.
+        if matches!(role, Role::Window | Role::Dialog) {
+            let push = |actions: &mut Vec<String>, name: &str| {
+                let n = name.to_string();
+                if !actions.contains(&n) {
+                    actions.push(n);
+                }
+            };
+            if ax_actions.iter().any(|a| a == "AXRaise") {
+                push(&mut actions, "raise");
+            }
+            // Probe Minimized/Zoomed once each — every probe is an
+            // AXIsAttributeSettable FFI round-trip, and the same two results
+            // feed both the verb advertisement and the `restore` condition
+            // below.
+            let minimized_settable = is_attr_settable(element, "AXMinimized")?;
+            let zoomed_settable = is_attr_settable(element, "AXZoomed")?;
+            if minimized_settable {
+                push(&mut actions, "minimize");
+            }
+            if zoomed_settable {
+                push(&mut actions, "maximize");
+            }
+            if minimized_settable || zoomed_settable {
+                push(&mut actions, "restore");
+            }
+            // `close` is advertised when the window exposes a close button —
+            // the direct AXCloseButton attribute *or* the AXCloseButton-subrole
+            // child scan, the exact lookup `close()` dispatches (tenet 3: the
+            // advertised surface must match the implementation, and a bridge
+            // that exposes the button only as a child must advertise it).
+            if find_close_button(element, role)?.is_some() {
+                push(&mut actions, "close");
+            }
+            if is_attr_settable(element, "AXPosition")? {
+                push(&mut actions, "move_to");
+            }
+            if is_attr_settable(element, "AXSize")? {
+                push(&mut actions, "resize_to");
+            }
+        }
+
         let numeric_value = match role {
             Role::Slider | Role::ProgressBar | Role::SpinButton | Role::ScrollBar => {
                 attrs.value_number
@@ -1777,7 +2145,7 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
         let value = xa11y_core::text::strip_bidi_opt(value);
         let description = xa11y_core::text::strip_bidi_opt(description);
 
-        ElementParts {
+        Ok(ElementParts {
             role,
             name,
             value,
@@ -1793,7 +2161,7 @@ fn build_snapshot_data(element: AXUIElementRef, pid: Option<u32>, handle: u64) -
             raw,
             handle,
         }
-        .into()
+        .into())
     };
     body()
 }
@@ -2049,7 +2417,7 @@ impl MacOSProvider {
                 // the root handed to the caller — keeps the system-wide
                 // default and walking the menus is not crippled by the scan's
                 // quarter-second budget.
-                let mut data = self.build_element_data(&menu_bar, app_pid);
+                let mut data = self.build_element_data(&menu_bar, app_pid)?;
                 // An `AXMenuBar` carries no title of its own; the surface is
                 // named for the app whose menus it holds ("Safari"), which is
                 // the CGWindowList name `focused_app` also resolves. When the
@@ -2129,7 +2497,19 @@ impl MacOSProvider {
                         // quarter-second budget. Building its `ElementData`
                         // costs one unbounded round-trip, to a process that
                         // just answered inside the bound.
-                        let mut data = self.build_element_data(&extras, Some(*pid as u32));
+                        let mut data = match self.build_element_data(&extras, Some(*pid as u32)) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                // Same policy as `Unanswered` below: one
+                                // process never fails the scan, but the error
+                                // is diagnosed rather than silent.
+                                eprintln!(
+                                    "status-item surface snapshot failed for pid {}: {e:?}",
+                                    pid
+                                );
+                                return None;
+                            }
+                        };
                         // The extras menu bar has no title; the surface is
                         // named for its owner, as `list_apps` names apps.
                         data.name = Some(app_name.clone());
@@ -2164,20 +2544,25 @@ impl MacOSProvider {
     /// before the element is handed out, because here the application element
     /// *is* the surface root: walking the Dock at a quarter-second per
     /// attribute is not what bounding the scan was for.
-    fn dock_surface(&self, apps: &[(i32, String)]) -> Option<(ShellSurfaceKind, ElementData)> {
-        let (pid, name) = apps.iter().find(|(_, name)| name.as_str() == "Dock")?;
+    fn dock_surface(
+        &self,
+        apps: &[(i32, String)],
+    ) -> Result<Option<(ShellSurfaceKind, ElementData)>> {
+        let Some((pid, name)) = apps.iter().find(|(_, name)| name.as_str() == "Dock") else {
+            return Ok(None);
+        };
         let app_element = AXElement::from_owned(unsafe { safe_ax_create_application(*pid) });
         if app_element.is_null() {
-            return None;
+            return Ok(None);
         }
         if !Self::bound_shell_probe(&app_element) {
-            return None;
+            return Ok(None);
         }
-        let mut data = self.build_element_data(&app_element, Some(*pid as u32));
+        let mut data = self.build_element_data(&app_element, Some(*pid as u32))?;
         Self::unbound_shell_probe(&app_element);
         // Same name policy as `list_apps`: the CGWindowList owner name wins.
         data.name = Some(name.clone());
-        Some((ShellSurfaceKind::Dock, data))
+        Ok(Some((ShellSurfaceKind::Dock, data)))
     }
 
     /// Finder's desktop scroll area, tagged `Desktop`: the `AXScrollArea`
@@ -2195,26 +2580,31 @@ impl MacOSProvider {
     /// contract false, and it is the one process this scan cannot route
     /// around. No release afterwards — the root handed to the caller is the
     /// scroll area, a child element that never carried the bound.
-    fn desktop_surface(&self, apps: &[(i32, String)]) -> Option<(ShellSurfaceKind, ElementData)> {
-        let (pid, _) = apps.iter().find(|(_, name)| name.as_str() == "Finder")?;
+    fn desktop_surface(
+        &self,
+        apps: &[(i32, String)],
+    ) -> Result<Option<(ShellSurfaceKind, ElementData)>> {
+        let Some((pid, _)) = apps.iter().find(|(_, name)| name.as_str() == "Finder") else {
+            return Ok(None);
+        };
         let app_element = AXElement::from_owned(unsafe { safe_ax_create_application(*pid) });
         if app_element.is_null() {
-            return None;
+            return Ok(None);
         }
         if !Self::bound_shell_probe(&app_element) {
-            return None;
+            return Ok(None);
         }
-        let desktop = ax_children(app_element.as_ptr())
-            .into_iter()
-            .find(|child| {
-                ax_string(child.as_ptr(), "AXRole").as_deref() == Some("AXScrollArea")
-                    && ax_string(child.as_ptr(), "AXDescription")
-                        .is_some_and(|d| d.eq_ignore_ascii_case("desktop"))
-            })?;
-        Some((
+        let Some(desktop) = ax_children(app_element.as_ptr()).into_iter().find(|child| {
+            ax_string(child.as_ptr(), "AXRole").as_deref() == Some("AXScrollArea")
+                && ax_string(child.as_ptr(), "AXDescription")
+                    .is_some_and(|d| d.eq_ignore_ascii_case("desktop"))
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some((
             ShellSurfaceKind::Desktop,
-            self.build_element_data(&desktop, Some(*pid as u32)),
-        ))
+            self.build_element_data(&desktop, Some(*pid as u32))?,
+        )))
     }
 }
 
@@ -2232,7 +2622,16 @@ impl Provider for MacOSProvider {
                 let role = element_data.role;
                 let name = element_data.name.as_deref();
 
-                let ax_children_list = ax_children(ax.as_ptr());
+                // An Application element's children are its top-level windows:
+                // `AXWindows` is the single canonical window-discovery source
+                // (the same answer `App::windows` now reads on every platform).
+                // Every other role keeps the raw `AXChildren` walk. The read is
+                // error-preserving on purpose — a dead app must report its
+                // failure, not an empty window list (tenet 1).
+                let ax_children_list = match role {
+                    Role::Application => ax_windows(ax.as_ptr())?,
+                    _ => ax_children(ax.as_ptr()),
+                };
 
                 // Filter first (cheap string checks), then build ElementData
                 // in parallel (each build_element_data is an IPC round-trip).
@@ -2244,7 +2643,7 @@ impl Provider for MacOSProvider {
                 let results: Vec<ElementData> = filtered
                     .par_iter()
                     .map(|child| self.build_element_data(child, element_data.pid))
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
                 Ok(results)
             }
@@ -2340,13 +2739,10 @@ impl Provider for MacOSProvider {
             let mut phase1_data: Vec<(usize, AXUIElementRef, ElementData)> = hits
                 .iter()
                 .map(|(pos, ax)| {
-                    (
-                        *pos,
-                        ax.as_ptr(),
-                        self.build_element_data(ax, root_data.pid),
-                    )
+                    let data = self.build_element_data(ax, root_data.pid)?;
+                    Ok((*pos, ax.as_ptr(), data))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             if clause.segments.len() == 1 {
                 // Per-clause `:nth` and limit handling — but we can't apply
@@ -2415,7 +2811,7 @@ impl Provider for MacOSProvider {
                     return Ok(None);
                 }
                 // Check if parent is an application — if so, still return it
-                let data = self.build_element_data(&parent_ax, element.pid);
+                let data = self.build_element_data(&parent_ax, element.pid)?;
                 Ok(Some(data))
             }
             None => Ok(None),
@@ -2468,10 +2864,10 @@ impl Provider for MacOSProvider {
             surfaces.push(menu_bar);
         }
         surfaces.extend(self.status_item_surfaces(&apps));
-        if let Some(dock) = self.dock_surface(&apps) {
+        if let Some(dock) = self.dock_surface(&apps)? {
             surfaces.push(dock);
         }
-        if let Some(desktop) = self.desktop_surface(&apps) {
+        if let Some(desktop) = self.desktop_surface(&apps)? {
             surfaces.push(desktop);
         }
         Ok(surfaces)
@@ -2490,8 +2886,24 @@ impl Provider for MacOSProvider {
             if app_element.is_null() {
                 continue;
             }
-            let mut data = self.build_element_data(&app_element, Some(*pid as u32));
+            let mut data = self.build_element_data(&app_element, Some(*pid as u32))?;
             data.name = Some(app_name.clone());
+            // A node built from `AXUIElementCreateApplication(pid)` is a
+            // process node, so its role is `Role::Application` whatever
+            // AXRole reads — with one exception: a process that answers
+            // AXRole with the `AXUnknown` placeholder (Window Server) is not
+            // an accessibility application at all. Its AXWindows read answers
+            // `kAXErrorCannotComplete` (-25204), so a synthesized
+            // Application node for it would make every unfiltered
+            // `xa11y windows` / MCP windows listing fail with a permanent,
+            // unactionable error on every macOS desktop. It is classified
+            // out of the listing — inspected, not silently skipped (tenet 1);
+            // a user who attaches to it by pid still gets the node and an
+            // honest error on windows().
+            if data.role == Role::Unknown {
+                continue;
+            }
+            data.role = Role::Application;
             results.push(data);
         }
         Ok(results)
@@ -2536,7 +2948,7 @@ impl Provider for MacOSProvider {
                 if !value.is_null() {
                     unsafe { safe_cf_release(value) };
                 }
-                let mut data = self.build_element_data(&app_element, Some(pid));
+                let mut data = self.build_element_data(&app_element, Some(pid))?;
                 // Keep `name` consistent with `list_apps()`, which overrides
                 // the AX-reported name with the CGWindowList owner name. A
                 // pre-window process has no CGWindowList entry yet; the
@@ -2547,6 +2959,12 @@ impl Provider for MacOSProvider {
                 {
                     data.name = Some(name);
                 }
+                // `list_apps` classifies non-AX-interactive processes (AXRole
+                // `AXUnknown`, e.g. Window Server) out of its listing; a
+                // direct pid attach keeps the role AXRole reported, so
+                // `windows()` on such a node fails with an honest
+                // ActionNotSupported rather than pretending the process has
+                // no windows.
                 Ok(data)
             }
             AX_ERROR_CANNOT_COMPLETE
@@ -2617,7 +3035,7 @@ impl Provider for MacOSProvider {
             None
         };
 
-        let mut data = self.build_element_data(&app_element, pid_opt);
+        let mut data = self.build_element_data(&app_element, pid_opt)?;
         if let Some(p) = pid_opt {
             if let Some((_, name)) = Self::list_gui_apps()
                 .into_iter()
@@ -2708,6 +3126,141 @@ impl Provider for MacOSProvider {
 
     fn scroll_into_view(&self, _element: &ElementData) -> Result<()> {
         // macOS has no accessibility API equivalent for scroll-into-view.
+        Ok(())
+    }
+
+    // ── Window management ──────────────────────────────────────────
+
+    fn raise(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // AXRaise does not deminiaturize, so a minimized window would answer
+        // Ok while staying in the Dock — the fidelity gap the Windows backend
+        // avoids by restoring first. Clear AXMinimized when it is true,
+        // error-preserving (see `clear_bool_attr_if_true`).
+        clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "raise", element.role)?;
+        perform_ax_action(ax.as_ptr(), "AXRaise", "raise", element.role)
+    }
+
+    fn minimize(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // See expand(): unsettable AXMinimized sets would silently no-op in
+        // every bridge — surface unsupported as ActionNotSupported instead.
+        if !is_attr_settable(ax.as_ptr(), "AXMinimized")? {
+            return Err(Error::ActionNotSupported {
+                action: "minimize".to_string(),
+                role: element.role,
+            });
+        }
+        set_bool_attr(ax.as_ptr(), "AXMinimized", true, "minimize", element.role)
+    }
+
+    fn maximize(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // AXZoomed is macOS's "maximized" (zoom) state.
+        if !is_attr_settable(ax.as_ptr(), "AXZoomed")? {
+            return Err(Error::ActionNotSupported {
+                action: "maximize".to_string(),
+                role: element.role,
+            });
+        }
+        // AXZoomed and AXMinimized are independent: setting AXZoomed on a
+        // minimized window would return success while the window stays in the
+        // Dock. The window-state contract (see the shared mock) has maximize
+        // clear `minimized` and bring the window back on-screen, so clear it
+        // first — error-preserving, the same `raise()` handling (tenet 1).
+        clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
+        set_bool_attr(ax.as_ptr(), "AXZoomed", true, "maximize", element.role)
+    }
+
+    fn restore(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        // Restore clears both the minimized and the zoomed flag. A window
+        // supports restore if either of them is settable; each clear is
+        // attempted only when settable (a missing attribute would no-op).
+        let min_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
+        let zoom_settable = is_attr_settable(ax.as_ptr(), "AXZoomed")?;
+        if !min_settable && !zoom_settable {
+            return Err(Error::ActionNotSupported {
+                action: "restore".to_string(),
+                role: element.role,
+            });
+        }
+        if min_settable {
+            set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
+        }
+        if zoom_settable {
+            set_bool_attr(ax.as_ptr(), "AXZoomed", false, "restore", element.role)?;
+        }
+        Ok(())
+    }
+
+    fn close(&self, element: &ElementData) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        let btn = find_close_button(ax.as_ptr(), element.role)?;
+        let Some(btn) = btn else {
+            return Err(Error::ActionNotSupported {
+                action: "close".to_string(),
+                role: element.role,
+            });
+        };
+        perform_ax_action(btn.as_ptr(), "AXPress", "close", element.role)
+    }
+
+    fn move_to(&self, element: &ElementData, x: i32, y: i32) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        if !is_attr_settable(ax.as_ptr(), "AXPosition")? {
+            return Err(Error::ActionNotSupported {
+                action: "move_to".to_string(),
+                role: element.role,
+            });
+        }
+        let value = unsafe { safe_ax_value_create_cg_point(f64::from(x), f64::from(y)) };
+        if value.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "Failed to create CGPoint AXValue for window move".to_string(),
+            });
+        }
+        let attr = CFString::new("AXPosition");
+        let err = do_set_attribute(ax.as_ptr(), &attr, value);
+        unsafe { safe_cf_release(value) };
+        if err != AX_ERROR_SUCCESS {
+            return Err(action_error(
+                err,
+                "move_to",
+                element.role,
+                "Set AXPosition failed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resize_to(&self, element: &ElementData, width: u32, height: u32) -> Result<()> {
+        let ax = self.get_cached(element.handle)?;
+        if !is_attr_settable(ax.as_ptr(), "AXSize")? {
+            return Err(Error::ActionNotSupported {
+                action: "resize_to".to_string(),
+                role: element.role,
+            });
+        }
+        let value = unsafe { safe_ax_value_create_cg_size(f64::from(width), f64::from(height)) };
+        if value.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "Failed to create CGSize AXValue for window resize".to_string(),
+            });
+        }
+        let attr = CFString::new("AXSize");
+        let err = do_set_attribute(ax.as_ptr(), &attr, value);
+        unsafe { safe_cf_release(value) };
+        if err != AX_ERROR_SUCCESS {
+            return Err(action_error(
+                err,
+                "resize_to",
+                element.role,
+                "Set AXSize failed",
+            ));
+        }
         Ok(())
     }
 
@@ -2813,6 +3366,23 @@ impl Provider for MacOSProvider {
             "increment" => self.increment(element),
             "decrement" => self.decrement(element),
             "scroll_into_view" => self.scroll_into_view(element),
+            "raise" => self.raise(element),
+            "minimize" => self.minimize(element),
+            "maximize" => self.maximize(element),
+            "restore" => self.restore(element),
+            "close" => self.close(element),
+            // Payload verbs have no arguments on the generic escape hatch;
+            // fail surfaceably with how to call them instead of guessing
+            // (tenet 1: no silent fallback).
+            "move_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"move_to\") requires coordinates; call move_to(x, y)"
+                    .to_string(),
+            }),
+            "resize_to" => Err(Error::InvalidActionData {
+                message: "perform_action(\"resize_to\") requires dimensions; call \
+                           resize_to(width, height)"
+                    .to_string(),
+            }),
             _ => {
                 // Custom action resolution: snake_case → AXPascalCase
                 let ax = self.get_cached(element.handle)?;
@@ -2888,11 +3458,24 @@ unsafe extern "C" fn ax_observer_callback(
     };
 
     // Build the target element snapshot using the full batch attribute reader
-    // so tests can assert on name, value, states, numeric_value, etc.
+    // so tests can assert on name, value, states, numeric_value, etc. An
+    // AX notification callback is fire-and-forget: a failed snapshot still
+    // delivers the event (the target is honestly unknown — the documented
+    // `None` case), with the error diagnosed on stderr rather than silently
+    // dropped (tenet 1).
     let target = if element.is_null() {
         None
     } else {
-        Some(build_snapshot_data(element, Some(ctx.app_pid), 0))
+        match build_snapshot_data(element, Some(ctx.app_pid), 0) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!(
+                    "AX notification target snapshot failed ({}): {e:?}",
+                    ctx.app_pid
+                );
+                None
+            }
+        }
     };
 
     // Alias for notification dispatch logic below.
@@ -2957,8 +3540,21 @@ unsafe extern "C" fn ax_observer_callback(
 
         "AXFocusedWindowChanged" => vec![EventKind::WindowActivated],
 
-        "AXWindowMiniaturized" => vec![EventKind::WindowDeactivated],
-        "AXWindowDeminiaturized" => vec![EventKind::WindowActivated],
+        // Minimize/restore are a window *state* change, not an activation
+        // change: a background window can be miniaturized and deminiaturized
+        // without ever becoming the key window, so emitting
+        // WindowDeactivated/WindowActivated here would report focus
+        // transitions that never happened. AXFocusedWindowChanged above is
+        // the only real activation signal. StateChanged{Minimized} is still
+        // what makes the public StateFlag::Minimized observable on macOS.
+        "AXWindowMiniaturized" => vec![EventKind::StateChanged {
+            flag: StateFlag::Minimized,
+            value: true,
+        }],
+        "AXWindowDeminiaturized" => vec![EventKind::StateChanged {
+            flag: StateFlag::Minimized,
+            value: false,
+        }],
 
         "AXSelectedTextChanged"
         | "AXSelectedRowsChanged"
@@ -3231,6 +3827,17 @@ mod tests {
     }
 
     #[test]
+    fn find_close_button_propagates_read_errors_for_null_element() {
+        // A null element answers with an error, not "no close button": the
+        // attribute is unknown, so the error must propagate (the close
+        // advertisement and `close()` must not silently drop the capability
+        // on a transient AX failure). A null AXUIElementRef fails the
+        // underlying call with kAXErrorInvalidUIElement.
+        let result = find_close_button(std::ptr::null(), Role::Window);
+        assert!(matches!(result, Err(Error::Platform { .. })));
+    }
+
+    #[test]
     fn ax_string_returns_none_for_null_element() {
         let result = ax_string(std::ptr::null(), "AXTitle");
         assert!(result.is_none());
@@ -3421,12 +4028,12 @@ mod tests {
         assert_eq!(ax_action_to_name("AXShowMenu"), Some("show_menu"));
         assert_eq!(ax_action_to_name("AXIncrement"), Some("increment"));
         assert_eq!(ax_action_to_name("AXDecrement"), Some("decrement"));
+        assert_eq!(ax_action_to_name("AXRaise"), Some("raise"));
     }
 
     #[test]
     fn ax_action_to_name_returns_none_for_unknown() {
         // Unknown AX actions get converted via ax_pascal_to_snake instead
-        assert_eq!(ax_action_to_name("AXRaise"), None);
         assert_eq!(ax_action_to_name("AXCancel"), None);
         assert_eq!(ax_action_to_name("AXCustomThing"), None);
         assert_eq!(ax_action_to_name("UnknownAction"), None);

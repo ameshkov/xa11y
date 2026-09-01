@@ -3,10 +3,10 @@
 // This module is `#[doc(hidden)]` and not part of the public API.
 // It powers both `cargo install xa11y` and `pip install xa11y` via PyO3.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::*;
-
 /// CLI-level error, separating usage mistakes from operation failures so the
 /// binary can map them to distinct exit codes.
 ///
@@ -202,6 +202,7 @@ pub fn run(args: &[String]) -> CliResult<()> {
     match args.first().map(|s| s.as_str()) {
         Some("apps") => cmd_apps(),
         Some("shell") => cmd_shell(&args[1..]),
+        Some("windows") => cmd_windows(&args[1..]),
         Some("tree") => cmd_tree(&args[1..]),
         Some("find") => cmd_find(&args[1..]),
         Some("action") => cmd_action(&args[1..]),
@@ -231,10 +232,12 @@ Usage:
 Accessibility tree:
   xa11y apps                                List running applications
   xa11y shell                               List OS shell surfaces: KIND PID NAME
+  xa11y windows [--app NAME | --pid PID]    List top-level windows
   xa11y tree   [TARGET]                     Print the accessibility tree
   xa11y find   SELECTOR [TARGET] [-o pretty|bounds|center]
                                             Find elements matching a selector
   xa11y action ACTION SELECTOR [TARGET] [--value V]
+                                            [--at X,Y] [--size W,H]
                                             Perform an action on an element
   xa11y events [--app NAME | --pid PID]     Stream accessibility events
 
@@ -284,7 +287,9 @@ Compose a11y + input/screenshot via `find -o bounds|center`:
 Actions: press, focus, blur, toggle, expand, collapse, select, show-menu,
   scroll-into-view, increment, decrement,
   set-value (requires --value), type-text (requires --value),
-  select-text (requires --value START,END)
+  select-text (requires --value START,END),
+  minimize, maximize, restore, close, raise,
+  move-to (requires --at X,Y), resize-to (requires --size W,H)
 
 Exit codes:
   0  success
@@ -308,6 +313,7 @@ pub(crate) struct Opts {
     pub value: Option<String>,
     // Input simulation / screenshot
     pub at: Option<String>,
+    pub size: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
     pub button: Option<String>,
@@ -390,6 +396,10 @@ pub(crate) fn parse_opts(args: &[String]) -> CliResult<(Opts, Vec<String>)> {
             "--at" => {
                 i += 1;
                 opts.at = Some(flag_value(args, i, "--at")?.to_string());
+            }
+            "--size" => {
+                i += 1;
+                opts.size = Some(flag_value(args, i, "--size")?.to_string());
             }
             "--from" => {
                 i += 1;
@@ -478,6 +488,29 @@ pub(crate) fn parse_point_arg(s: &str, ctx: &str) -> CliResult<Point> {
         .parse()
         .map_err(|_| CliError::Usage(format!("invalid Y in {ctx}: {}", parts[1])))?;
     Ok(Point::new(x, y))
+}
+
+/// Parse a `W,H` size for `resize-to`. Width and height are logical units and
+/// must be positive — a 0-sized window is not a valid resize request.
+pub(crate) fn parse_size_arg(s: &str, ctx: &str) -> CliResult<(u32, u32)> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 2 {
+        return Err(CliError::Usage(format!("{ctx} must be W,H (got: {s})")));
+    }
+    let width: u32 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| CliError::Usage(format!("invalid W in {ctx}: {}", parts[0])))?;
+    let height: u32 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| CliError::Usage(format!("invalid H in {ctx}: {}", parts[1])))?;
+    if width == 0 || height == 0 {
+        return Err(CliError::Usage(format!(
+            "{ctx} must be W,H with positive values (got: {s})"
+        )));
+    }
+    Ok((width, height))
 }
 
 pub(crate) fn parse_region_arg(s: &str) -> CliResult<Rect> {
@@ -575,6 +608,29 @@ pub(crate) fn resolve_app(opts: &Opts) -> CliResult<App> {
         Ok(App::by_name(name, std::time::Duration::ZERO)?)
     } else if let Some(pid) = opts.pid {
         Ok(App::by_pid(pid, std::time::Duration::ZERO)?)
+    } else {
+        Err(CliError::Usage("specify --app NAME or --pid PID".into()))
+    }
+}
+
+/// Resolve the application(s) a `--app` / `--pid` filter selects.
+///
+/// Both filters yield exactly one `App` entry. `--app` is a singular name
+/// lookup; `--pid` resolves the process directly via `App::by_pid` — no
+/// `App::list()` foreground query — and the entry's `windows()` stays
+/// process-complete on Linux, because `App::windows_with` merges every
+/// same-PID AT-SPI entry itself (a pid filter reaches the same window set
+/// without collecting each entry here). A pid with no entry is the
+/// not-matched error, surfaced rather than an empty listing.
+pub(crate) fn resolve_apps(opts: &Opts) -> CliResult<Vec<App>> {
+    if let Some(name) = &opts.app {
+        Ok(vec![App::by_name(name, std::time::Duration::ZERO)?])
+    } else if let Some(pid) = opts.pid {
+        // `App::list` would run an unrelated foreground query (focused_app)
+        // whose failure could reject a PID whose app and windows are
+        // otherwise accessible, and would re-run the same-pid merge once per
+        // matching entry. The direct lookup needs neither.
+        Ok(vec![App::by_pid(pid, std::time::Duration::ZERO)?])
     } else {
         Err(CliError::Usage("specify --app NAME or --pid PID".into()))
     }
@@ -866,6 +922,18 @@ pub(crate) fn format_element_oneline(el: &ElementData) -> String {
     if el.states.active {
         states.push("active");
     }
+    // Window states render only when the platform reports them (Some). A
+    // `None` — unknown/not a window — stays silent rather than rendering a
+    // guessed `not minimized`-style label.
+    if el.states.minimized == Some(true) {
+        states.push("minimized");
+    }
+    if el.states.maximized == Some(true) {
+        states.push("maximized");
+    }
+    if el.states.fullscreen == Some(true) {
+        states.push("fullscreen");
+    }
     if el.states.focusable {
         states.push("focusable");
     }
@@ -1016,6 +1084,140 @@ fn cmd_shell(args: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+/// Stable dedup key for a top-level window's [`ElementData`], collapsing the
+/// same window surfaced through several Application entries of one pid. Only
+/// Linux multi-registers a pid (the AT-SPI registry can surface one process
+/// twice); macOS dedups `App::list` by pid and Windows queries by pid, so
+/// one Application entry per pid is the contract there.
+///
+/// Prefer the cross-snapshot `stable_id` when present — Linux D-Bus object
+/// path, Windows HWND for top-level windows — because that is the only value
+/// that distinguishes a window rebuilt through two registrations, the one
+/// case the dedup exists to collapse. The AT-SPI identity is really
+/// `(bus_name, object path)`: two bus connections of one process can expose
+/// *distinct* windows under the same object path, so a Linux `stable_id` is
+/// scoped by the `bus_name` the provider records in `raw`. When no stable
+/// identity exists (macOS `AXIdentifier` is often absent on windows) key on
+/// `handle` instead: it is a fresh monotonic counter, unique per built node
+/// within one enumeration, so two distinct windows can never be merged on
+/// presentation data alone (the same title and bounds may legitimately
+/// belong to two same-process windows). An identity-less duplicate would
+/// stay duplicated, but that only happens through multi-registration, and
+/// the multi-registering platform (Linux) always carries the object path.
+/// The pid scopes the key so equal ids from different processes never
+/// collide.
+///
+/// Shared by `cmd_windows` and the MCP `windows` tool so both surfaces agree
+/// on what "the same window" means.
+pub(crate) fn window_key(data: &ElementData) -> String {
+    let identity = data
+        .stable_id
+        .clone()
+        .map(|sid| {
+            match data.raw.get("bus_name") {
+                Some(serde_json::Value::String(bus)) => format!("{bus}:{sid}"),
+                // Windows/macOS record no bus name; their stable_id is
+                // already unique (HWND, AXIdentifier).
+                _ => sid,
+            }
+        })
+        .unwrap_or_else(|| {
+            // Handle, not (name, bounds): presentation data is not identity
+            // and could merge two distinct same-process windows (macOS).
+            format!("h{}", data.handle)
+        });
+    format!("{}:{identity}", data.pid.unwrap_or(0))
+}
+
+/// `xa11y windows` — enumerate top-level windows (winlenium's list-windows).
+///
+/// Without a filter, all windows across all applications are listed. With
+/// `--app NAME` / `--pid PID` only that application's windows are shown.
+///
+/// Failure policy: one app whose `windows()` fails (a dying process, a flaky
+/// bridge) must not abort a listing that already holds healthy windows.
+/// The successful windows are printed, each failure is reported on stderr
+/// naming the app, and the command exits `1` so a script can tell a complete
+/// listing from a partial one without parsing stderr — the same honest
+/// partial result the MCP `windows` tool returns in its `errors` array
+/// (tenet 1: the failure is surfaced, never swallowed).
+fn cmd_windows(args: &[String]) -> CliResult<()> {
+    let (opts, positional) = parse_opts(args)?;
+    if let Some(arg) = positional.first() {
+        return Err(CliError::Usage(format!(
+            "usage: xa11y windows [--app NAME | --pid PID]; unexpected argument: {arg}"
+        )));
+    }
+    // `--shell` names an OS shell surface (`xa11y shell`), which this command
+    // does not enumerate. Silently ignoring the flag would list every
+    // application's windows instead of the requested surface — a filter that
+    // fell away instead of an unsupported target being refused (tenet 1).
+    if opts.shell.is_some() {
+        return Err(CliError::Usage(
+            "usage: xa11y windows [--app NAME | --pid PID]; --shell is not supported here — \
+             `xa11y shell` lists OS shell surfaces"
+                .into(),
+        ));
+    }
+    let apps = if opts.app.is_some() || opts.pid.is_some() {
+        resolve_apps(&opts)?
+    } else {
+        App::list()?
+    };
+
+    // One Application node per process on every platform (the unified
+    // contract), so listing each app's windows exactly once covers every
+    // top-level window — the old one-entry-per-window Windows shape needed
+    // per-pid dedup, which is gone with it.
+    let mut windows: Vec<Element> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for app in &apps {
+        match app.windows() {
+            Ok(ws) => windows.extend(ws),
+            Err(e) => errors.push(format!("{}: {e}", app.name)),
+        }
+    }
+
+    // One Application node per process is the contract on Windows/macOS, but
+    // Linux multi-registration can surface several entries for one pid whose
+    // windows overlap. Deduplicate by stable identity so a window is never
+    // printed twice and the count below is honest.
+    let mut seen = HashSet::new();
+    windows.retain(|w| seen.insert(window_key(w.data())));
+
+    if windows.is_empty() {
+        // With errors, "No windows found." would be a lie — windows may well
+        // exist, just not enumerable; stderr carries the real reason.
+        if errors.is_empty() {
+            println!("No windows found.");
+        }
+    } else {
+        for w in &windows {
+            println!("{}", format_element_oneline(w));
+        }
+        println!(
+            "({} window{})",
+            windows.len(),
+            if windows.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    if errors.is_empty() {
+        return Ok(());
+    }
+    for e in &errors {
+        eprintln!("error: {e}");
+    }
+    Err(CliError::Xa11y(Error::Platform {
+        code: -1,
+        message: format!(
+            "{} of {} application(s) could not be enumerated; see stderr for details",
+            errors.len(),
+            apps.len()
+        ),
+    }))
+}
+
 fn cmd_tree(args: &[String]) -> CliResult<()> {
     let (opts, _pos) = parse_opts(args)?;
     let target = resolve_target(&opts)?;
@@ -1125,7 +1327,7 @@ fn cmd_action(args: &[String]) -> CliResult<()> {
     if positional.len() < 2 {
         return Err(CliError::Usage(
             "usage: xa11y action ACTION SELECTOR [--app NAME | --pid PID | --shell KIND] \
-             [--value V]"
+             [--value V] [--at X,Y] [--size W,H]"
                 .into(),
         ));
     }
@@ -1133,9 +1335,21 @@ fn cmd_action(args: &[String]) -> CliResult<()> {
     let selector = &positional[1];
     let value = opts.value.clone();
 
+    // Parse the payload before resolving the target: a missing or malformed
+    // `--value` / `--at` / `--size` is a usage error, and it must surface
+    // even when the target itself would also be unresolvable — and must not
+    // spend an app-resolution / accessibility round-trip first (parse
+    // arguments before the first OS call).
+    let action_args = parse_action_args(
+        action_name,
+        value.as_deref(),
+        opts.at.as_deref(),
+        opts.size.as_deref(),
+    )?;
+
     let target = resolve_target(&opts)?;
     let locator = target.locator(selector);
-    perform_action(&locator, action_name, value.as_deref())?;
+    perform_action(&locator, action_name, &action_args)?;
     println!("ok");
     Ok(())
 }
@@ -1161,68 +1375,169 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "set-numeric-value",
     "type-text",
     "select-text",
+    "minimize",
+    "maximize",
+    "restore",
+    "close",
+    "raise",
+    "move-to",
+    "resize-to",
 ];
 
 /// Actions that require a `--value` (MCP: `value`) argument.
 pub(crate) const ACTIONS_REQUIRING_VALUE: &[&str] =
     &["set-value", "set-numeric-value", "type-text", "select-text"];
 
-/// Dispatch a named action verb onto `locator`.
+/// Actions that require a geometry argument: `--at X,Y` (MCP: `at`) for
+/// `move-to`, `--size W,H` (MCP: `size`) for `resize-to`.
+pub(crate) const ACTIONS_REQUIRING_AT: &[&str] = &["move-to"];
+pub(crate) const ACTIONS_REQUIRING_SIZE: &[&str] = &["resize-to"];
+
+/// Parsed action payload, built up front by [`parse_action_args`] so the
+/// callers can validate it before resolving the target.
+#[derive(Debug, Default)]
+pub(crate) struct ActionArgs {
+    /// `set-value` / `type-text`: the raw value string.
+    pub value: Option<String>,
+    /// `set-numeric-value`: the parsed number.
+    pub numeric: Option<f64>,
+    /// `select-text`: the parsed `START,END` range.
+    pub range: Option<(u32, u32)>,
+    /// `move-to`: the parsed `--at` point.
+    pub at: Option<(i32, i32)>,
+    /// `resize-to`: the parsed `--size`.
+    pub size: Option<(u32, u32)>,
+}
+
+/// Parse the action-specific payload for `action`, before the target is
+/// resolved (parse arguments before the first OS call).
 ///
-/// Shared by `xa11y action` and the MCP `action` tool so the two cannot drift
-/// on which verbs exist or which of them need a value. Writes nothing to
-/// stdout: the MCP stdio transport allows only protocol messages there, so
-/// the "ok" line stays in the CLI half.
-pub(crate) fn perform_action(
-    locator: &Locator,
-    action_name: &str,
+/// A missing or malformed `--value` / `--at` / `--size` is a usage error, and
+/// it must win over app-resolution failures rather than be masked by one:
+/// `xa11y action move-to --at 1,x --app nope` must say the `--at` is bad, not
+/// that the app was not found — and must not spend an accessibility
+/// round-trip first. Verbs without a payload ignore `value` / `at` / `size`,
+/// exactly as dispatch ignores them (a stray `--at` on `press` is still not
+/// an error).
+pub(crate) fn parse_action_args(
+    action: &str,
     value: Option<&str>,
-) -> CliResult<()> {
-    // Each `requires --value` arm re-checks rather than trusting a caller to
-    // have consulted ACTIONS_REQUIRING_VALUE (tenet 1: the failure is
-    // surfaced where it happens, not assumed away upstream).
+    at: Option<&str>,
+    size: Option<&str>,
+) -> CliResult<ActionArgs> {
     let need_value = |verb: &str| -> CliResult<&str> {
         value.ok_or_else(|| CliError::Usage(format!("{verb} requires a value")))
     };
+    let mut args = ActionArgs::default();
+    match action {
+        "set-value" | "type-text" => args.value = Some(need_value(action)?.to_string()),
+        "set-numeric-value" => {
+            // A bad number is refused here, so the auto-wait timeout is not
+            // burnt and the platform is never touched for a payload that
+            // cannot ever succeed.
+            args.numeric = Some(parse_numeric_value(need_value(action)?)?);
+        }
+        "select-text" => args.range = Some(parse_text_range(need_value(action)?)?),
+        "move-to" => {
+            let raw = at.ok_or_else(|| CliError::Usage(format!("{action} requires --at X,Y")))?;
+            let pt = parse_point_arg(raw, "--at")?;
+            args.at = Some((pt.x, pt.y));
+        }
+        "resize-to" => {
+            let raw =
+                size.ok_or_else(|| CliError::Usage(format!("{action} requires --size W,H")))?;
+            args.size = Some(parse_size_arg(raw, "--size")?);
+        }
+        _ => {}
+    }
+    Ok(args)
+}
 
+/// Dispatch a named action verb onto `locator`.
+///
+/// Shared by `xa11y action` and the MCP `action` tool so the two cannot drift
+/// on which verbs exist or which of them need a value/geometry argument.
+/// The payload is parsed by [`parse_action_args`], which the callers run
+/// *before* resolving the target, so a bad `X,Y` / `W,H` / value is refused
+/// as a usage error before any OS call — it cannot burn the auto-wait
+/// timeout, reach the platform, or be masked by an app-resolution failure
+/// (parse arguments before the first OS call). The `ok_or_else` arms below
+/// are defense in depth (tenet 1: an error is surfaced where it happens);
+/// [`parse_action_args`] guarantees the fields for the verb. Writes nothing
+/// to stdout: the MCP stdio transport allows only protocol messages there,
+/// so the "ok" line stays in the CLI half.
+pub(crate) fn perform_action(
+    locator: &Locator,
+    action_name: &str,
+    args: &ActionArgs,
+) -> CliResult<()> {
     // The dispatch runs inside a closure so every arm's failure passes through
     // `relabel_action_error` on the way out, and the verb spelling a caller is
     // told about is the one this function accepts.
-    let dispatch = || -> CliResult<()> {
-        match action_name {
-            "press" => locator.press()?,
-            "focus" => locator.focus()?,
-            "blur" => locator.blur()?,
-            "toggle" => locator.toggle()?,
-            "expand" => locator.expand()?,
-            "collapse" => locator.collapse()?,
-            "select" => locator.select()?,
-            "show-menu" => locator.show_menu()?,
-            "scroll-into-view" => locator.scroll_into_view()?,
-            "increment" => locator.increment()?,
-            "decrement" => locator.decrement()?,
-            "set-value" => locator.set_value(need_value("set-value")?)?,
-            "set-numeric-value" => {
-                // Parsed before the locator is touched, so a bad number cannot
-                // burn the auto-wait timeout or reach the platform call.
-                let v = parse_numeric_value(need_value("set-numeric-value")?)?;
-                locator.set_numeric_value(v)?;
+    let dispatch =
+        || -> CliResult<()> {
+            match action_name {
+                "press" => locator.press()?,
+                "focus" => locator.focus()?,
+                "blur" => locator.blur()?,
+                "toggle" => locator.toggle()?,
+                "expand" => locator.expand()?,
+                "collapse" => locator.collapse()?,
+                "select" => locator.select()?,
+                "show-menu" => locator.show_menu()?,
+                "scroll-into-view" => locator.scroll_into_view()?,
+                "increment" => locator.increment()?,
+                "decrement" => locator.decrement()?,
+                "set-value" => {
+                    let v = args.value.as_deref().ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires a value"))
+                    })?;
+                    locator.set_value(v)?;
+                }
+                "set-numeric-value" => {
+                    let v = args.numeric.ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires a value"))
+                    })?;
+                    locator.set_numeric_value(v)?;
+                }
+                "type-text" => {
+                    let v = args.value.as_deref().ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires a value"))
+                    })?;
+                    locator.type_text(v)?;
+                }
+                "select-text" => {
+                    let (start, end) = args.range.ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires a value"))
+                    })?;
+                    locator.select_text(start, end)?;
+                }
+                "minimize" => locator.minimize()?,
+                "maximize" => locator.maximize()?,
+                "restore" => locator.restore()?,
+                "close" => locator.close()?,
+                "raise" => locator.raise()?,
+                "move-to" => {
+                    let (x, y) = args.at.ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires --at X,Y"))
+                    })?;
+                    locator.move_to(x, y)?;
+                }
+                "resize-to" => {
+                    let (w, h) = args.size.ok_or_else(|| {
+                        CliError::Usage(format!("{action_name} requires --size W,H"))
+                    })?;
+                    locator.resize_to(w, h)?;
+                }
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown action: {other} (expected one of: {})",
+                        ACTION_NAMES.join(", ")
+                    )));
+                }
             }
-            "type-text" => locator.type_text(need_value("type-text")?)?,
-            "select-text" => {
-                let v = need_value("select-text")?;
-                let (start, end) = parse_text_range(v)?;
-                locator.select_text(start, end)?;
-            }
-            other => {
-                return Err(CliError::Usage(format!(
-                    "unknown action: {other} (expected one of: {})",
-                    ACTION_NAMES.join(", ")
-                )));
-            }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     dispatch().map_err(|e| relabel_action_error(e, action_name))
 }
@@ -1415,6 +1730,9 @@ pub(crate) fn format_state_flag(flag: StateFlag) -> &'static str {
         StateFlag::Modal => "modal",
         StateFlag::Required => "required",
         StateFlag::Busy => "busy",
+        StateFlag::Minimized => "minimized",
+        StateFlag::Maximized => "maximized",
+        StateFlag::Fullscreen => "fullscreen",
         // `StateFlag` is `#[non_exhaustive]`. Same reasoning as
         // `format_event_kind`: naming the flag vaguely beats dropping the
         // event that carries it.
@@ -1898,6 +2216,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// One mock-backed `App` (the mock's lone `Role::Application` entry),
+    /// for exercising locator dispatch against the shared provider.
+    fn mock_app(provider: &std::sync::Arc<xa11y_core::mock::MockProvider>) -> App {
+        // Coerce to the trait object explicitly: `App::list_with` takes
+        // `Arc<dyn Provider>`, and `Arc::clone` would otherwise infer its
+        // target from the parameter and reject the concrete handle.
+        let provider: std::sync::Arc<dyn xa11y_core::Provider> = provider.clone();
+        App::list_with(provider)
+            .expect("the mock must list its app")
+            .into_iter()
+            .next()
+            .expect("the mock must vend one app")
+    }
+
     // ── Argument parsing ────────────────────────────────────────────────────
 
     #[test]
@@ -1979,6 +2311,144 @@ mod tests {
         let err = parse_opts(&args).expect_err("trailing --app must be a usage error");
         assert!(matches!(err, CliError::Usage(_)));
         assert!(format!("{err}").contains("--app requires a value"));
+    }
+
+    #[test]
+    fn cmd_windows_rejects_positional_arg() {
+        // `xa11y windows stray` used to silently ignore the extra argument
+        // (tenet 1); it is now a usage error.
+        let err = cmd_windows(&strs(&["stray"]))
+            .expect_err("a positional argument to `windows` must be a usage error");
+        assert!(matches!(err, CliError::Usage(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stray"),
+            "message must name the offending argument: {msg}"
+        );
+    }
+
+    #[test]
+    fn cmd_windows_rejects_shell_flag() {
+        // `xa11y windows --shell taskbar` used to silently list every app's
+        // windows (the filter fell away); it must now be a usage error naming
+        // the unsupported flag.
+        let err = cmd_windows(&strs(&["--shell", "taskbar"]))
+            .expect_err("--shell must be rejected by `windows`");
+        assert!(matches!(err, CliError::Usage(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--shell"),
+            "message must name the offending flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn window_key_is_stable_across_rebuilt_snapshots_and_pid_scoped() {
+        // Handle is a fresh-per-snapshot counter, never an identity: the same
+        // window rebuilt (different handle, same stable_id) must key equal,
+        // so the per-pid dedup actually collapses it. The key must also be
+        // pid-scoped — equal stable_ids from different processes must not
+        // collide.
+        let mut a = ElementData::for_role(Role::Window);
+        a.pid = Some(7);
+        a.stable_id = Some("org/a11y/atspi/accessible/0/1".into());
+        let mut b = a.clone();
+        assert_eq!(window_key(&a), window_key(&b), "same identity, same key");
+
+        b.pid = Some(8);
+        assert_ne!(
+            window_key(&a),
+            window_key(&b),
+            "same stable_id under a different pid must not collide"
+        );
+
+        // Without a stable_id the per-snapshot handle is the identity:
+        // distinct windows (distinct handles) with identical name and bounds
+        // must key differently — presenting "same title, same place" as one
+        // window would silently discard one (macOS `AXIdentifier` is often
+        // absent, and two same-process windows may share both).
+        let mut c = ElementData::for_role(Role::Window);
+        c.pid = Some(7);
+        c.name = Some("xa11y Test App".into());
+        let mut d = c.clone();
+        assert_eq!(
+            window_key(&c),
+            window_key(&d),
+            "the same built node must key equal"
+        );
+        d.handle += 1;
+        assert_ne!(
+            window_key(&c),
+            window_key(&d),
+            "distinct handles must not merge on identical name+bounds"
+        );
+
+        // Linux scopes the AT-SPI object path by bus name: two connections of
+        // one process can expose distinct windows under the same `stable_id`,
+        // so the bus name must be part of the key and never merged.
+        let mut l = ElementData::for_role(Role::Window);
+        l.pid = Some(7);
+        l.stable_id = Some("org/a11y/atspi/accessible/2/3".into());
+        let mut m = l.clone();
+        m.raw
+            .insert("bus_name".into(), serde_json::Value::String(":1.42".into()));
+        assert_ne!(
+            window_key(&l),
+            window_key(&m),
+            "same path under different bus names must not merge"
+        );
+        let mut n = m.clone();
+        n.pid = Some(7);
+        assert_eq!(
+            window_key(&m),
+            window_key(&n),
+            "same bus name and path under one pid must key equal"
+        );
+    }
+
+    // ── Window management ───────────────────────────────────────────────────
+
+    #[test]
+    fn move_to_rejects_malformed_at_before_reaching_the_provider() {
+        // The geometry is parsed before the auto-waiting verb, so a bad
+        // `X,Y` cannot burn the timeout or touch the platform (tenet 4's
+        // "parse arguments before the first OS call").
+        let provider = xa11y_core::mock::build_provider();
+        let err = parse_action_args("move-to", None, Some("10,not-a-number"), None)
+            .expect_err("malformed --at must be refused");
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+        assert!(
+            provider.actions().is_empty(),
+            "no action may reach the provider: {:?}",
+            provider.actions()
+        );
+    }
+
+    #[test]
+    fn move_to_and_resize_to_dispatch_valid_geometry_to_the_window_verbs() {
+        let provider = xa11y_core::mock::build_provider();
+        let app = mock_app(&provider);
+        let locator = app.locator("window");
+        let move_args = parse_action_args("move-to", None, Some("10,20"), None)
+            .expect("a valid move-to must parse");
+        perform_action(&locator, "move-to", &move_args).expect("a valid move-to must succeed");
+        let resize_args = parse_action_args("resize-to", None, None, Some("800,600"))
+            .expect("a valid resize-to must parse");
+        perform_action(&locator, "resize-to", &resize_args)
+            .expect("a valid resize-to must succeed");
+        let actions = provider.actions();
+        assert!(
+            actions
+                .iter()
+                .any(|(_, name, data)| name == "move_to" && data.as_deref() == Some("10,20")),
+            "move-to must reach the provider with the parsed point: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|(_, name, data)| name == "resize_to" && data.as_deref() == Some("800x600")),
+            "resize-to must reach the provider with the parsed size: {actions:?}"
+        );
     }
 
     #[test]
@@ -2741,6 +3211,14 @@ mod tests {
         // of the action enum; a verb in one list and not the other would be
         // documented and unreachable.
         for verb in ACTIONS_REQUIRING_VALUE {
+            assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
+        }
+        // The geometry-requiring verbs (move-to / resize-to) are advertised
+        // the same way.
+        for verb in ACTIONS_REQUIRING_AT {
+            assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
+        }
+        for verb in ACTIONS_REQUIRING_SIZE {
             assert!(ACTION_NAMES.contains(verb), "{verb} is not an action");
         }
     }
