@@ -235,16 +235,27 @@ mod tests {
     #[test]
     #[ignore]
     fn raise_brings_window_to_foreground() {
-        // Every platform has a raise: AXRaise on macOS, SetForegroundWindow +
-        // SetFocus on Windows, Component.GrabFocus on Linux. The assertion is
-        // that the call succeeds — foreground verification is intentionally
-        // not attempted, since a headless CI session cannot reliably observe
-        // the system foreground.
+        // Every platform has a raise: activate-then-AXRaise on macOS,
+        // SetForegroundWindow + SetFocus on Windows, Component.GrabFocus on
+        // Linux. The assertion is that the call succeeds — foreground
+        // verification is intentionally not attempted on Windows/Linux, since
+        // a headless CI session cannot reliably observe the system foreground.
         let app = h::app_root();
         let win = h::one(&app, "window");
         win.raise().expect("raise must succeed");
         // And the window must still be reported active (no error, tree alive).
         h::one(&app, "window");
+
+        // macOS: AXRaise alone answers success with the app still in the
+        // background (it only re-raises within the app's own window list), so
+        // "the call succeeded" cannot distinguish a real raise from a silent
+        // success. The verb must activate the app (AXFrontmost), so the app
+        // ends up foreground; poll, since the round-trip can lag the call.
+        #[cfg(target_os = "macos")]
+        wait_until(Duration::from_secs(5), "test app to be foreground after raise", || {
+            let root = h::app_root();
+            root.is_foreground().then_some(())
+        });
     }
 
     #[test]

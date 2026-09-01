@@ -79,7 +79,7 @@ API is separate from its element-action interface:
 
 | xa11y Action | macOS | Linux (AT-SPI) | Windows (UIA) |
 | --- | --- | --- | --- |
-| `Raise` | AXRaise | Component.GrabFocus *(same path as Focus)* | restore if minimized, then SetForegroundWindow and SetFocus |
+| `Raise` | activate app *(set AXFrontmost)*, restore if minimized, then AXRaise | Component.GrabFocus *(same path as Focus)* | restore if minimized, then SetForegroundWindow and SetFocus |
 | `Minimize` | set AXMinimized=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Minimized) |
 | `Maximize` | set AXZoomed=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
 | `Restore` | clear AXMinimized / AXZoomed | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
@@ -103,6 +103,15 @@ Windows and `AXModal` on macOS.
 ### ScrollIntoView
 
 macOS has no direct equivalent, so this action is a **no-op**. On Linux it uses `Component.ScrollTo` with top-edge alignment. On Windows it uses `ScrollItemPattern.ScrollIntoView`.
+
+### Raise: AXRaise does not activate
+
+`AXRaise` on a window only re-raises the window within the window list of its
+own app, and it answers success even while the app sits in the background. A
+raise performed on a background app's window visibly does nothing. `Raise` on
+macOS activates the app first (sets `AXFrontmost` on the application element),
+then raises the window. A failure to activate is a surfaceable error, never a
+silent success.
 
 ### SetValue: text vs numeric
 

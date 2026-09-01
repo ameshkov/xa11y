@@ -1313,6 +1313,43 @@ fn set_bool_attr(
     Ok(())
 }
 
+/// Bring the process owning `element` to the foreground via the accessibility
+/// API: the application element's `AXFrontmost` attribute.
+///
+/// `AXRaise` on a window only re-raises it within the window list of its own
+/// app and answers success while the app sits in the background, so a raise
+/// on a background app's window appears to do nothing. The application
+/// element is built from the element's owning PID (`AXUIElementGetPid`), the
+/// same addressing `App::by_pid` uses, and the attribute is the one
+/// `osascript`'s "set frontmost of process" sets — activation without input
+/// simulation (tenet 2).
+fn activate_owning_app(el_ptr: AXUIElementRef, action: &str, role: Role) -> Result<()> {
+    let mut pid = 0;
+    let pid_err = unsafe { safe_ax_get_pid(el_ptr, &mut pid) };
+    if pid_err != AX_ERROR_SUCCESS {
+        return Err(Error::Platform {
+            code: pid_err as i64,
+            message: format!(
+                "AXUIElementGetPid failed (AXError {pid_err}) while running {action} on a {role}"
+            ),
+        });
+    }
+    if pid == 0 {
+        return Err(Error::Platform {
+            code: -1,
+            message: format!("AXUIElementGetPid returned pid 0 while running {action} on a {role}"),
+        });
+    }
+    let app = AXElement::from_owned(unsafe { safe_ax_create_application(pid) });
+    if app.is_null() {
+        return Err(Error::Platform {
+            code: -9999,
+            message: format!("AXUIElementCreateApplication failed while running {action}"),
+        });
+    }
+    set_bool_attr(app.as_ptr(), "AXFrontmost", true, action, role)
+}
+
 /// Clear a boolean attribute when it currently reads `true`.
 ///
 /// The deminiaturize half of `raise` / `maximize`: `AXRaise` and (alone)
@@ -3220,6 +3257,13 @@ impl Provider for MacOSProvider {
         // avoids by restoring first. Clear AXMinimized when it is true,
         // error-preserving (see `clear_bool_attr_if_true`).
         clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "raise", element.role)?;
+        // AXRaise alone only re-raises the window within its own app's window
+        // list and answers Ok while the app stays in the background, so a
+        // background app's window never appears on screen — the report that
+        // `xa11y action raise` "does nothing". Activate the app first through
+        // the accessibility API (the application element's AXFrontmost), then
+        // raise the window.
+        activate_owning_app(ax.as_ptr(), "raise", element.role)?;
         perform_ax_action(ax.as_ptr(), "AXRaise", "raise", element.role)
     }
 
