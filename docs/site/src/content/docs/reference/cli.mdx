@@ -43,6 +43,16 @@ Columns are tab-separated: process ID, then name. The foreground application
 carries a third column, the literal token `focused`. An application whose
 process ID cannot be resolved shows `-` in the first column.
 
+On macOS, when the accessibility permission is missing, the command's error is
+followed by an interactive prompt offering to open System Settings on the
+matching pane (`open` on the deep link). The pane is named for the running
+macOS version: `Privacy & Security → Accessibility` through macOS 26, and
+`Privacy & Security → Device Control and Data Access` on macOS 27 and newer,
+where the `Accessibility` entry no longer exists. The prompt only appears when
+standard input is a terminal; scripts and pipes get the error message alone.
+The same prompt follows the equivalent failure of every other command that
+reads the accessibility tree.
+
 ### `xa11y shell`
 
 List the OS shell surfaces currently present.

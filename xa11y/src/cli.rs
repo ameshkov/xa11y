@@ -188,6 +188,7 @@ pub fn run_main(args: &[String]) -> i32 {
                 CliError::Usage(_) => eprintln!("{e}"),
                 _ => eprintln!("error: {e}"),
             }
+            offer_accessibility_settings_hint(args.first().map(|s| s.as_str()).unwrap_or(""), &e);
             e.exit_code()
         }
     }
@@ -220,6 +221,83 @@ pub fn run(args: &[String]) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+// ── macOS Accessibility hint ───────────────────────────────────────────────
+
+/// After an operation fails, offer the one fix that is a hop away in the same
+/// terminal: the macOS TCC Accessibility grant. Asks only when stdin is
+/// interactive — a prompt in a pipe, CI, or a binding launcher would hang the
+/// caller, and one in `xa11y mcp` would read from the JSON-RPC wire — and
+/// only for the specific denial [`xa11y_macos::MacOSProvider::new`] raises;
+/// the Screen Recording denial and every other error keep the plain message.
+#[cfg(target_os = "macos")]
+fn offer_accessibility_settings_hint(command: &str, error: &CliError) {
+    if command == "mcp" {
+        // stdin is the protocol wire; reading from it would corrupt the
+        // session even on an interactive TTY.
+        return;
+    }
+    if !is_accessibility_permission_denied(error) {
+        return;
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        // Non-interactive (a script, CI, or a launcher that redirects stdin):
+        // the error message already names the pane; prompting would just hang.
+        return;
+    }
+    eprintln!();
+    eprintln!(
+        "Hint: grant Accessibility to the app running xa11y (the terminal it was launched from)"
+    );
+    eprintln!("{}", xa11y_macos::accessibility_grant_instructions());
+    eprintln!("then restart the app (or the terminal).");
+    eprint!("Open System Settings now? [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_ok() && parse_yes(&answer) {
+        // Best-effort: the original permission error is the failure being
+        // reported. A failed `open` — an unavailable `open` binary, or a
+        // macOS version that re-keys the deep-link scheme — must not bury it;
+        // the pane name is already on stderr above.
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn offer_accessibility_settings_hint(_command: &str, _error: &CliError) {}
+
+/// True when `error` is the macOS TCC Accessibility denial that
+/// [`xa11y_macos::MacOSProvider::new`] raises. The denial is recognized by
+/// its instruction text, compared against the same builder the provider
+/// crate uses to produce it — so a rewording in `xa11y-macos` (including the
+/// macOS 27+ pane rename) updates both sides in the same change rather than
+/// drifting.
+#[cfg(target_os = "macos")]
+fn is_accessibility_permission_denied(error: &CliError) -> bool {
+    let instructions = xa11y_macos::accessibility_grant_instructions();
+    match error {
+        CliError::Xa11y(crate::Error::PermissionDenied {
+            instructions: given,
+        }) => given == &instructions,
+        // Provider-init failures cross the provider singleton stringified:
+        // xa11y::get_provider_ref stores `format!("{e}")` and re-raises it as
+        // Platform(-1, message). The wrapped form carries the same stable text.
+        CliError::Xa11y(crate::Error::Platform { code: -1, message }) => {
+            message.contains(&instructions)
+        }
+        _ => false,
+    }
+}
+
+/// The prompt's accept words. Anything else — including an empty line, the
+/// `[y/N]` default — declines.
+#[cfg(target_os = "macos")]
+fn parse_yes(answer: &str) -> bool {
+    let answer = answer.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 fn print_usage() {
@@ -3894,5 +3972,64 @@ mod tests {
         assert_eq!(hexes[0], hexes[7], "group 8 reuses group 1's colour");
         assert_eq!(hexes[1], hexes[8]);
         assert_eq!(hexes[0], "#E69F00");
+    }
+
+    // ── macOS Accessibility settings hint ───────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_yes_accepts_only_the_yes_words() {
+        for yes in ["y", "Y", "yes", "YES", "Yes", "  y  ", "\tyes\n"] {
+            assert!(parse_yes(yes), "{yes:?} must accept");
+        }
+        for no in ["n", "no", "", " ", "maybe", "o", "yep"] {
+            assert!(!parse_yes(no), "{no:?} must decline");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_accessibility_denial_is_recognized_but_the_screen_recording_is_not() {
+        let instructions = xa11y_macos::accessibility_grant_instructions();
+
+        // The shape the CLI actually sees: provider-init failures cross the
+        // singleton as Platform(-1, "<rendered error>").
+        let wrapped = CliError::Xa11y(crate::Error::Platform {
+            code: -1,
+            message: format!("Permission denied: {instructions}"),
+        });
+        assert!(
+            is_accessibility_permission_denied(&wrapped),
+            "the wrapped singleton shape must be recognized"
+        );
+
+        // The direct variant (e.g. a future provider boundary that stops
+        // stringifying) must be recognized too.
+        let direct = CliError::Xa11y(crate::Error::PermissionDenied { instructions });
+        assert!(
+            is_accessibility_permission_denied(&direct),
+            "the direct PermissionDenied shape must be recognized"
+        );
+
+        // Screen Recording is also PermissionDenied, but names a different
+        // pane; offering the Accessibility one would be wrong.
+        let recording = CliError::Xa11y(crate::Error::PermissionDenied {
+            instructions: "Enable Screen Recording in System Settings → Privacy & Security → \
+                           Screen & System Audio Recording."
+                .to_string(),
+        });
+        assert!(
+            !is_accessibility_permission_denied(&recording),
+            "the Screen Recording denial must not open the Accessibility pane"
+        );
+
+        // An unrelated platform failure must never trigger the hint.
+        let unrelated = CliError::Xa11y(crate::Error::Platform {
+            code: -1,
+            message: "kAXErrorCannotComplete".into(),
+        });
+        assert!(!is_accessibility_permission_denied(&unrelated));
+        let usage = CliError::Usage("bad flag".into());
+        assert!(!is_accessibility_permission_denied(&usage));
     }
 }

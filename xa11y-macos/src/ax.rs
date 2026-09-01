@@ -225,6 +225,36 @@ pub mod ax_counters {
     }
 }
 
+#[cfg(test)]
+mod grant_instruction_tests {
+    use super::instructions_for_major;
+
+    #[test]
+    fn the_grant_instruction_names_the_correct_settings_entry_per_version() {
+        // macOS 27 renamed the entry under Privacy & Security: Accessibility
+        // is gone as its own entry, and the grant lives in Device Control and
+        // Data Access. The instruction a user follows must match the pane
+        // they see.
+        let old = instructions_for_major(26);
+        assert!(
+            old.contains("Privacy & Security → Accessibility"),
+            "pre-27 must name the old entry: {old}"
+        );
+
+        for new in [27u32, 28, 99] {
+            let next = instructions_for_major(new);
+            assert!(
+                next.contains("Privacy & Security → Device Control and Data Access"),
+                "macOS {new} must name the new entry: {next}"
+            );
+            assert!(
+                !next.contains("→ Accessibility"),
+                "macOS {new} must not name the removed entry: {next}"
+            );
+        }
+    }
+}
+
 // ── FFI Wrappers (instrumented in test builds) ──────────────────────────────
 
 #[inline(always)]
@@ -1624,6 +1654,60 @@ fn matches_ax_with_role(
 
 // ── MacOS Provider ────────────────────────────────────────────────────────────
 
+/// The TCC grant hint for the Accessibility permission, as carried in
+/// [`Error::PermissionDenied`].
+///
+/// The System Settings entry that holds the grant was renamed on macOS 27:
+/// `Privacy & Security → Accessibility` became `Privacy & Security →
+/// Device Control and Data Access` (the `Accessibility` entry no longer
+/// exists), so the instruction names the pane for the running macOS version.
+/// The CLI recognizes this exact denial and offers to open the matching pane —
+/// see `cli::offer_accessibility_settings_hint` — against the same builder,
+/// so the error message and the prompt can never disagree about where to
+/// click.
+pub fn accessibility_grant_instructions() -> String {
+    instructions_for_major(macos_major_version())
+}
+
+/// The instruction text for a given macOS major version. Split out so the
+/// version-dependent pane name is unit-testable without a sysctl round-trip.
+///
+/// The second-level entry under `Privacy & Security` was renamed on macOS 27:
+/// `Accessibility` as its own entry is gone, and the grant now lives in
+/// `Device Control and Data Access`.
+fn instructions_for_major(major: u32) -> String {
+    let entry = if major >= 27 {
+        "Privacy & Security → Device Control and Data Access"
+    } else {
+        "Privacy & Security → Accessibility"
+    };
+    format!("Enable Accessibility in System Settings → {entry}")
+}
+
+/// macOS major version from `kern.osproductversion`, cached after the first
+/// read. On a probe failure it reports 0, which yields the pre-27 section
+/// name: the probe is a local `sysctl` and should not fail, and a wrong
+/// section name is only a hint, but this keeps the behavior stable.
+fn macos_major_version() -> u32 {
+    static VERSION: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::process::Command::new("sysctl")
+            .args(["-n", "kern.osproductversion"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .split('.')
+                    .next()
+                    .and_then(|major| major.parse().ok())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    });
+    *VERSION
+}
+
 /// Global handle counter for mapping ElementData back to AXElements.
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -1636,9 +1720,7 @@ impl MacOSProvider {
     pub fn new() -> Result<Self> {
         if !unsafe { safe_ax_is_process_trusted() } {
             return Err(Error::PermissionDenied {
-                instructions:
-                    "Enable Accessibility in System Settings → Privacy & Security → Accessibility"
-                        .to_string(),
+                instructions: accessibility_grant_instructions(),
             });
         }
 

@@ -8,6 +8,8 @@ mod input;
 mod screenshot;
 
 #[cfg(target_os = "macos")]
+pub use ax::accessibility_grant_instructions;
+#[cfg(target_os = "macos")]
 pub use ax::MacOSProvider;
 #[cfg(target_os = "macos")]
 pub use input::MacOSInputProvider;
