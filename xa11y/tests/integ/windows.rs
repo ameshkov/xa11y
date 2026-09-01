@@ -252,10 +252,14 @@ mod tests {
         // success. The verb must activate the app (AXFrontmost), so the app
         // ends up foreground; poll, since the round-trip can lag the call.
         #[cfg(target_os = "macos")]
-        wait_until(Duration::from_secs(5), "test app to be foreground after raise", || {
-            let root = h::app_root();
-            root.is_foreground().then_some(())
-        });
+        wait_until(
+            Duration::from_secs(5),
+            "test app to be foreground after raise",
+            || {
+                let root = h::app_root();
+                root.is_foreground().then_some(())
+            },
+        );
     }
 
     #[test]
