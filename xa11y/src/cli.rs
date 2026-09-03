@@ -1168,42 +1168,41 @@ fn cmd_shell(args: &[String]) -> CliResult<()> {
 /// twice); macOS dedups `App::list` by pid and Windows queries by pid, so
 /// one Application entry per pid is the contract there.
 ///
-/// Prefer the cross-snapshot `stable_id` when present — Linux D-Bus object
-/// path, Windows HWND for top-level windows — because that is the only value
-/// that distinguishes a window rebuilt through two registrations, the one
-/// case the dedup exists to collapse. The AT-SPI identity is really
+/// Key on the per-enumeration `handle` everywhere except `bus_name`-carrying
+/// (Linux) entries. The handle is a fresh monotonic counter, unique per built
+/// node within a single listing, so it can never merge two distinct windows —
+/// which is why macOS makes an id-based key wrong: `AXIdentifier` is what
+/// `stable_id` reads there, and AppKit does not guarantee it unique per window
+/// (Terminal's windows all answer `_NS:136`). Keying two real windows with the
+/// same id to one entry silently drops one of them from `xa11y windows`.
+/// Presentation data (shared title and bounds) is likewise not identity.
+///
+/// The dedup exists only for the Linux multi-registration case, reachable
+/// purely through the `bus_name` marker the provider records in `raw`; only
+/// there is a stable_id keyed on. The AT-SPI identity is really
 /// `(bus_name, object path)`: two bus connections of one process can expose
 /// *distinct* windows under the same object path, so a Linux `stable_id` is
-/// scoped by the `bus_name` the provider records in `raw`. When no stable
-/// identity exists (macOS `AXIdentifier` is often absent on windows) key on
-/// `handle` instead: it is a fresh monotonic counter, unique per built node
-/// within one enumeration, so two distinct windows can never be merged on
-/// presentation data alone (the same title and bounds may legitimately
-/// belong to two same-process windows). An identity-less duplicate would
-/// stay duplicated, but that only happens through multi-registration, and
-/// the multi-registering platform (Linux) always carries the object path.
-/// The pid scopes the key so equal ids from different processes never
-/// collide.
+/// scoped by the `bus_name`. A `bus_name`-carrying entry without a stable_id
+/// falls back to the handle — that only happens outside multi-registration,
+/// where there is nothing to collapse. The pid scopes the key so equal ids
+/// from different processes never collide.
 ///
 /// Shared by `cmd_windows` and the MCP `windows` tool so both surfaces agree
 /// on what "the same window" means.
 pub(crate) fn window_key(data: &ElementData) -> String {
-    let identity = data
-        .stable_id
-        .clone()
-        .map(|sid| {
-            match data.raw.get("bus_name") {
-                Some(serde_json::Value::String(bus)) => format!("{bus}:{sid}"),
-                // Windows/macOS record no bus name; their stable_id is
-                // already unique (HWND, AXIdentifier).
-                _ => sid,
-            }
-        })
-        .unwrap_or_else(|| {
-            // Handle, not (name, bounds): presentation data is not identity
-            // and could merge two distinct same-process windows (macOS).
-            format!("h{}", data.handle)
-        });
+    let identity = match data.raw.get("bus_name") {
+        Some(serde_json::Value::String(bus)) => data
+            .stable_id
+            .clone()
+            .map(|sid| format!("{bus}:{sid}"))
+            // Identity-less duplicate stays duplicated, but that only happens
+            // outside multi-registration, where there is nothing to collapse.
+            .unwrap_or_else(|| format!("h{}", data.handle)),
+        // Handle, not stable_id or (name, bounds): macOS `AXIdentifier` is
+        // not unique per window, and presentation data is not identity —
+        // either could merge two distinct same-process windows.
+        _ => format!("h{}", data.handle),
+    };
     format!("{}:{identity}", data.pid.unwrap_or(0))
 }
 
@@ -2422,29 +2421,42 @@ mod tests {
 
     #[test]
     fn window_key_is_stable_across_rebuilt_snapshots_and_pid_scoped() {
-        // Handle is a fresh-per-snapshot counter, never an identity: the same
-        // window rebuilt (different handle, same stable_id) must key equal,
-        // so the per-pid dedup actually collapses it. The key must also be
-        // pid-scoped — equal stable_ids from different processes must not
-        // collide.
+        // Outside the Linux `bus_name` path the key is the per-enumeration
+        // handle, scoped by pid. The handle never merges distinct windows,
+        // even when they share a stable_id — macOS `AXIdentifier` is not
+        // unique per window, so keying two real windows that answer the same
+        // id to one entry would drop one from `xa11y windows`. The same built
+        // node (same handle) must still key equal.
         let mut a = ElementData::for_role(Role::Window);
         a.pid = Some(7);
-        a.stable_id = Some("org/a11y/atspi/accessible/0/1".into());
+        a.stable_id = Some("_NS:136".into());
         let mut b = a.clone();
-        assert_eq!(window_key(&a), window_key(&b), "same identity, same key");
+        assert_eq!(window_key(&a), window_key(&b), "same built node, same key");
 
+        // Same stable_id, same pid, different handle: two distinct windows
+        // sharing an AXIdentifier must stay distinct. Regression for the
+        // macOS case where AppKit gives every Terminal window the same id.
+        b.handle += 1;
+        assert_ne!(
+            window_key(&a),
+            window_key(&b),
+            "same stable_id + pid under distinct handles must not merge (shared AXIdentifier)"
+        );
+
+        // The key must still be pid-scoped: equal identity under different
+        // processes must not collide.
+        b.handle = a.handle;
         b.pid = Some(8);
         assert_ne!(
             window_key(&a),
             window_key(&b),
-            "same stable_id under a different pid must not collide"
+            "same identity under a different pid must not collide"
         );
 
         // Without a stable_id the per-snapshot handle is the identity:
         // distinct windows (distinct handles) with identical name and bounds
         // must key differently — presenting "same title, same place" as one
-        // window would silently discard one (macOS `AXIdentifier` is often
-        // absent, and two same-process windows may share both).
+        // window would silently discard one.
         let mut c = ElementData::for_role(Role::Window);
         c.pid = Some(7);
         c.name = Some("xa11y Test App".into());
@@ -2461,9 +2473,13 @@ mod tests {
             "distinct handles must not merge on identical name+bounds"
         );
 
-        // Linux scopes the AT-SPI object path by bus name: two connections of
-        // one process can expose distinct windows under the same `stable_id`,
-        // so the bus name must be part of the key and never merged.
+        // Linux, and only Linux, still collapses true duplicates: the AT-SPI
+        // registry surfaces one process twice and the provider records the
+        // `bus_name` marker. The identity is (bus_name, object path), so two
+        // connections of one process exposing distinct windows under the same
+        // `stable_id` must not merge, while one registration re-surfaced
+        // across queries (rebuilt node, fresh handle, same bus_name + path)
+        // must key equal.
         let mut l = ElementData::for_role(Role::Window);
         l.pid = Some(7);
         l.stable_id = Some("org/a11y/atspi/accessible/2/3".into());
@@ -2475,12 +2491,34 @@ mod tests {
             window_key(&m),
             "same path under different bus names must not merge"
         );
+        let mut rebuilt = m.clone();
+        rebuilt.handle += 100;
+        assert_eq!(
+            window_key(&m),
+            window_key(&rebuilt),
+            "same bus_name + path must key equal across rebuilt snapshots"
+        );
         let mut n = m.clone();
         n.pid = Some(7);
         assert_eq!(
             window_key(&m),
             window_key(&n),
             "same bus name and path under one pid must key equal"
+        );
+
+        // A `bus_name`-carrying entry without a stable_id falls back to the
+        // handle — that only happens outside multi-registration, where there
+        // is nothing to collapse, so distinct handles must stay distinct.
+        let mut p = ElementData::for_role(Role::Window);
+        p.pid = Some(7);
+        p.raw
+            .insert("bus_name".into(), serde_json::Value::String(":1.42".into()));
+        let mut q = p.clone();
+        q.handle += 1;
+        assert_ne!(
+            window_key(&p),
+            window_key(&q),
+            "bus_name entry without a stable_id keys on the distinct handles"
         );
     }
 

@@ -91,13 +91,16 @@ window "Settings" [enabled visible] bounds=(20,20,300,200)
 
 Without `--app` / `--pid` every running application is enumerated and all
 top-level windows are listed; with either filter only that application's
-windows are shown. Every window is listed exactly once — same-pid entries
-are deduplicated by stable identity — but on Linux AT-SPI may register
-several Application entries for one process (a main entry plus
-per-event-loop pieces), so a process's windows are process-complete rather
-than the entries themselves being one-per-process. Each line is one window
-rendered like `xa11y find` renders elements, with its `actions` including
-the window verbs below. A window state the platform cannot report
+windows are shown. Every window is listed exactly once. On macOS a single
+Application entry covers the process and each enumerated window keys
+uniquely, so a window is never dropped for sharing an identity with another
+(macOS `AXIdentifier` is not unique per window). On Linux, where AT-SPI may
+register several Application entries for one process (a main entry plus
+per-event-loop pieces), the same-pid entries are deduplicated by the
+`(bus_name, stable_id)` identity, so a process's windows are process-complete
+rather than the entries themselves being one-per-process. Each line is one
+window rendered like `xa11y find` renders elements, with its `actions`
+including the window verbs below. A window state the platform cannot report
 (`minimized`, `maximized`, `fullscreen`) is simply absent from the line
 rather than shown as a guessed `false`.
 
