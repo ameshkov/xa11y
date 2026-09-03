@@ -81,8 +81,8 @@ API is separate from its element-action interface:
 | --- | --- | --- | --- |
 | `Raise` | activate app *(set AXFrontmost)*, restore if minimized, then AXRaise | Component.GrabFocus *(same path as Focus)* | restore if minimized, then SetForegroundWindow and SetFocus |
 | `Minimize` | set AXMinimized=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Minimized) |
-| `Maximize` | set AXZoomed=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
-| `Restore` | clear AXMinimized / AXZoomed | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
+| `Maximize` | press the window's AXZoomButton | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
+| `Restore` | clear AXMinimized; clear AXFullScreen *(the zoom press's state)* | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
 | `Close` | press the AXCloseButton | *(unsupported)* | WindowPattern.Close |
 | `MoveTo` | set AXPosition | *(unsupported)* | TransformPattern.Move *(physical pixel conversion)* |
 | `ResizeTo` | set AXSize | *(unsupported)* | TransformPattern.Resize *(physical pixel conversion)* |
@@ -90,8 +90,10 @@ API is separate from its element-action interface:
 Window state reads follow the same split. `minimized`, `maximized`, and
 `fullscreen` are `Option<bool>`: `None` means *unknown*, either because the
 element is not a window or because the platform cannot report the state.
-macOS reads all three
-(`AXMinimized` / `AXZoomed` / `AXFullScreen`) on window-like elements;
+macOS reads `minimized` and `fullscreen`
+(`AXMinimized` / `AXFullScreen`) on window-like elements; there is no AX
+attribute for the zoom state, so `maximized` is always `None` on macOS.
+After a `maximize`, `fullscreen` reports the state instead.
 Windows reads `minimized` and `maximized` from
 `WindowPattern.CurrentWindowVisualState` but cannot report `fullscreen`;
 Linux reads `minimized` from the AT-SPI `ICONIFIED` bit and cannot report
@@ -112,6 +114,19 @@ raise performed on a background app's window visibly does nothing. `Raise` on
 macOS activates the app first (sets `AXFrontmost` on the application element),
 then raises the window. A failure to activate is a surfaceable error, never a
 silent success.
+
+### `Maximize`: the zoom button is the zoom surface
+
+macOS exposes the window's zoom through its **zoom button** (`AXZoomButton`,
+the documented convenience attribute that every window with a zoom button
+exposes), not through a zoom-state attribute: `Maximize` presses it, and the
+state the press leaves behind is `AXFullScreen`, which `Restore` clears.
+Windows that expose no `AXZoomButton` report `maximize` and `restore` as
+`ActionNotSupported`, never a silent no-op. `maximized` cannot be read back
+on macOS. The state is reported as `fullscreen` instead. There is no
+zoom-state AX attribute: `AXZoomed` matches the AppKit *property*
+`NSWindow.isZoomed`, is not declared in the SDK headers, and live windows
+answer `kAXErrorAttributeUnsupported` for it.
 
 ### SetValue: text vs numeric
 

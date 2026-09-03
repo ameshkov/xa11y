@@ -266,11 +266,13 @@ mod tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     fn maximize_restore_roundtrip() {
-        // macOS: AXZoomed (the "maximized"/zoom state) is settable on a
-        // resizable winit window; restore() undoes it. The read-back is
-        // polled because the bridge can round-trip asynchronously. Windows
-        // maximize is not asserted here — the winit window's TransformPattern
-        // coverage is tracked as a gap in tests/matrix.yaml.
+        // macOS: maximize presses the window's zoom button (there is no
+        // zoom-state AX attribute; see `WindowZoom` in xa11y-macos), and the
+        // state the press leaves behind is AXFullScreen. restore() undoes it.
+        // The read-back is polled because the bridge can round-trip
+        // asynchronously. Windows maximize is not asserted here — the winit
+        // window's TransformPattern coverage is tracked as a gap in
+        // tests/matrix.yaml.
         struct MaximizeGuard {
             win: Element,
         }
@@ -289,12 +291,15 @@ mod tests {
         win.maximize().expect("maximize must succeed");
         wait_until(Duration::from_secs(5), "window to report maximized", || {
             let w = h::one(&app, "window");
-            (w.states.maximized == Some(true)).then_some(())
+            // macOS reports the zoomed state as `fullscreen` (AXFullScreen).
+            (w.states.maximized == Some(true) || w.states.fullscreen == Some(true)).then_some(())
         });
         win.restore().expect("restore must succeed");
         wait_until(Duration::from_secs(5), "window to report restored", || {
             let w = h::one(&app, "window");
-            (w.states.maximized == Some(false)).then_some(())
+            let still_zoomed =
+                w.states.maximized == Some(true) || w.states.fullscreen == Some(true);
+            (!still_zoomed).then_some(())
         });
     }
 
@@ -327,7 +332,7 @@ mod tests {
             dialog.close().expect("close() must succeed on the dialog");
 
             wait_until(Duration::from_secs(5), "the dialog to disappear", || {
-                (!dialog_window().is_some()).then_some(())
+                dialog_window().is_none().then_some(())
             });
         }
     }
