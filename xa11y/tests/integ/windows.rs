@@ -266,11 +266,12 @@ mod tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     fn maximize_restore_roundtrip() {
-        // macOS: maximize presses the window's zoom button (there is no
-        // zoom-state AX attribute; see `WindowZoom` in xa11y-macos), and the
-        // state the press leaves behind is AXFullScreen. restore() undoes it.
-        // The read-back is polled because the bridge can round-trip
-        // asynchronously. Windows maximize is not asserted here — the winit
+        // macOS: maximize drives the window's native fullscreen state
+        // (AXFullScreen) — the only readable *and* writable window state —
+        // and restore clears it. There is no readable zoom state (`AXZoomed`
+        // is not an AX attribute), so the read-back is polled: the bridge
+        // round-trips asynchronously and a transition transiently reports the
+        // previous state. Windows maximize is not asserted here — the winit
         // window's TransformPattern coverage is tracked as a gap in
         // tests/matrix.yaml.
         struct MaximizeGuard {
@@ -285,22 +286,100 @@ mod tests {
             }
         }
 
+        /// The test app's real window: the one advertising the window verbs.
+        ///
+        /// A fullscreen transition transiently replaces the real window with a
+        /// shell window (empty title, `AXUnknown` subrole, no actions) that a
+        /// bare `"window"` selector matches. Selecting by the advertised
+        /// capability pins every poll and every repeated call to the window
+        /// the verbs actually act on.
+        fn main_window(app: &App) -> Option<Element> {
+            let windows = app.windows().ok()?;
+            windows
+                .into_iter()
+                .find(|w| w.actions.iter().any(|a| a == "maximize"))
+        }
+
+        /// The main window's fullscreen state, or `None` while the real
+        /// window is transiently absent mid-transition.
+        fn fullscreen(app: &App) -> Option<bool> {
+            let w = main_window(app)?;
+            // macOS reports the maximized state as `fullscreen` (AXFullScreen).
+            Some(w.states.maximized == Some(true) || w.states.fullscreen == Some(true))
+        }
+
         let app = h::app_root();
-        let win = h::one(&app, "window");
+        let win = wait_until(Duration::from_secs(5), "a maximizable window", || {
+            main_window(&app)
+        });
         let _guard = MaximizeGuard { win: win.clone() };
+
+        // maximize commits.
         win.maximize().expect("maximize must succeed");
-        wait_until(Duration::from_secs(5), "window to report maximized", || {
-            let w = h::one(&app, "window");
-            // macOS reports the zoomed state as `fullscreen` (AXFullScreen).
-            (w.states.maximized == Some(true) || w.states.fullscreen == Some(true)).then_some(())
-        });
-        win.restore().expect("restore must succeed");
+        wait_until(
+            Duration::from_secs(5),
+            "window to report fullscreen",
+            || fullscreen(&app),
+        );
+
+        // A repeated maximize must not toggle the window back out. Give the
+        // (would-be) toggle time to land before asserting the state is still
+        // fullscreen — the exit transition is what the old zoom-button press
+        // started.
+        wait_until(Duration::from_secs(5), "a maximizable window", || {
+            main_window(&app)
+        })
+        .maximize()
+        .expect("repeated maximize must succeed");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            fullscreen(&app).unwrap_or(false),
+            "a second maximize must be a no-op, but the window left fullscreen"
+        );
+
+        // restore commits, and a repeated restore must not re-enter
+        // fullscreen.
+        wait_until(Duration::from_secs(5), "a maximizable window", || {
+            main_window(&app)
+        })
+        .restore()
+        .expect("restore must succeed");
         wait_until(Duration::from_secs(5), "window to report restored", || {
-            let w = h::one(&app, "window");
-            let still_zoomed =
-                w.states.maximized == Some(true) || w.states.fullscreen == Some(true);
-            (!still_zoomed).then_some(())
+            fullscreen(&app).map(|fs| !fs)
         });
+        wait_until(Duration::from_secs(5), "a maximizable window", || {
+            main_window(&app)
+        })
+        .restore()
+        .expect("repeated restore must succeed");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !fullscreen(&app).unwrap_or(true),
+            "a second restore must be a no-op, but the window re-entered fullscreen"
+        );
+
+        // maximize -> restore -> maximize -> restore ends where every call
+        // promises; no call may toggle the state the next one sets.
+        //
+        // Each step lets the previous transition finish before the next call:
+        // driving a new fullscreen change into an animation still in flight
+        // makes the window server leave the transition shell behind as a
+        // visible extra window (the verbs still land on the right state, but
+        // the shell then breaks the shared app for the tests after this one).
+        for expected_fullscreen in [true, false, true, false] {
+            let w = wait_until(Duration::from_secs(5), "a maximizable window", || {
+                main_window(&app)
+            });
+            if expected_fullscreen {
+                w.maximize().expect("maximize must succeed");
+            } else {
+                w.restore().expect("restore must succeed");
+            }
+            wait_until(Duration::from_secs(5), "sequence step to settle", || {
+                fullscreen(&app).map(|fs| fs == expected_fullscreen)
+            });
+            std::thread::sleep(Duration::from_millis(1500));
+        }
     }
 
     #[test]

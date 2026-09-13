@@ -62,6 +62,26 @@ def _window_advertising(app: xa11y.App, verb: str) -> xa11y.Element | None:
     return None
 
 
+def _wait_for_window(app: xa11y.App, verb: str, what: str) -> xa11y.Element:
+    """The first window advertising `verb`, polling out the transition churn.
+
+    A fullscreen transition transiently removes the real window from
+    ``App.windows()`` (a shell window appears in its place), and the provider's
+    settle loop promises the *state*, not that the window is enumerable the
+    instant the verb returns. A one-shot lookup right after a verb reads that
+    absence as "the window is gone", so every repeated call waits for the real
+    window first.
+    """
+    deadline = time.monotonic() + 5.0
+    while True:
+        win = _window_advertising(app, verb)
+        if win is not None:
+            return win
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.1)
+
+
 def _wait_until(predicate, timeout: float, what: str) -> None:
     """Poll `predicate` until it returns true, or `timeout` (seconds) elapses.
 
@@ -226,8 +246,32 @@ def test_minimize_and_restore(app: xa11y.App) -> None:
         raise
 
 
+def _window_reads_maximized(app: xa11y.App) -> bool | None:
+    """Whether a maximizable window reads back as maximized/fullscreen.
+
+    The state is platform-specific: Windows reports ``maximized``, macOS
+    reports the native fullscreen state as ``fullscreen`` (its ``maximized``
+    stays ``None``). Both are polled so the assertion is portable across the
+    cells that advertise the verb.
+
+    ``None`` while no window advertising ``maximize`` is enumerable: the
+    transition transiently removes the real window, and reading that absence
+    as "restored" would let the restore wait below succeed on a window that
+    is merely mid-transition.
+    """
+    win = _window_advertising(app, "maximize")
+    if win is None:
+        return None
+    return bool(win.maximized) or bool(win.fullscreen)
+
+
 def test_maximize_and_restore(app: xa11y.App) -> None:
-    """``Element.maximize`` + ``Element.restore`` reach the platform."""
+    """``Element.maximize`` + ``Element.restore`` reach the platform.
+
+    Repeated calls must be idempotent, not toggles: the old macOS provider
+    pressed the window's zoom button, so a second ``maximize`` exited
+    fullscreen (issue #399). The state-survival assertions below guard that.
+    """
     win = _window_advertising(app, "maximize")
     if win is None:
         pytest.skip("this app's windows advertise no maximize action")
@@ -235,7 +279,37 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         pytest.skip("no window advertises both maximize and restore")
     try:
         win.maximize()
-        win.restore()
+        _wait_until(
+            lambda: _window_reads_maximized(app) is True,
+            5.0,
+            "window to report maximized",
+        )
+        # A repeated maximize must be a no-op. Re-read the window first: the
+        # platform can recreate the window object during the transition.
+        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current.maximize()
+        time.sleep(2.0)
+        _wait_until(
+            lambda: _window_reads_maximized(app) is True,
+            5.0,
+            "the window to remain maximized after a second maximize",
+        )
+        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current.restore()
+        _wait_until(
+            lambda: _window_reads_maximized(app) is False,
+            5.0,
+            "window to report restored",
+        )
+        # A repeated restore must not re-enter the maximized state.
+        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current.restore()
+        time.sleep(2.0)
+        _wait_until(
+            lambda: _window_reads_maximized(app) is False,
+            5.0,
+            "the window to remain restored after a second restore",
+        )
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
         # not be left maximized for the suites after this one.

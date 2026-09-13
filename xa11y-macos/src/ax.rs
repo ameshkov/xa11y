@@ -638,6 +638,23 @@ fn ax_windows(element: AXUIElementRef) -> Result<Vec<AXElement>> {
     }
 }
 
+/// Whether a per-element snapshot failure means the AX element is gone.
+///
+/// `kAXErrorInvalidUIElement` is how macOS reports an AX object that has been
+/// invalidated — a window closed, or one recreated during a fullscreen
+/// transition. Callers that *enumerate* a live surface drop such an element:
+/// it is not part of the surface any more, and dropping it is what keeps a
+/// listing or a selector walk from failing wholesale on churn. Every other
+/// AXError stays a real platform failure and propagates (tenet 1); only this
+/// exact code is the "no longer exists" answer. The menu-bar listing makes
+/// the same distinction for its probe (see `ShellSurfaceKind::MenuBar`).
+fn is_gone_ax_element(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Platform { code, .. } if *code == AX_ERROR_INVALID_UI_ELEMENT as i64
+    )
+}
+
 /// The close button of a window, or `None` when there is none.
 ///
 /// The canonical AX close path is pressing the close button: prefer the
@@ -762,138 +779,6 @@ fn find_close_button(element: AXUIElementRef, role: Role) -> Result<Option<AXEle
                 message: format!(
                     "AXChildren read failed while scanning for the close button of a {} \
                      (AXError {code}); the close button is unknown, not absent",
-                    role
-                ),
-            }),
-        },
-    }
-}
-
-/// How a window's maximize/restore verbs are exposed on this macOS.
-///
-/// There is no accessibility attribute for the zoom **state**: the zoom
-/// surface is the window's zoom button (`AXZoomButton`, the documented
-/// convenience attribute, "required for all window elements that have a zoom
-/// button"). The `AXZoomed` string is not that attribute — it matches the
-/// AppKit *property* `NSWindow.isZoomed`, is not declared in the SDK headers,
-/// and live windows answer `kAXErrorAttributeUnsupported` for it. The only
-/// state a zoom press leaves behind is `AXFullScreen` (pressing the button on
-/// TextEdit, Chrome, and Firefox sets `AXFullScreen=true` and ends the frame
-/// at the display's bounds), so `restore` clears that.
-enum WindowZoom {
-    /// The window exposes a zoom button. maximize presses it — the original
-    /// platform action, not a substitute (tenet 3).
-    ZoomButton(AXElement),
-    /// The window has no zoom button. The verbs are `ActionNotSupported`,
-    /// never faked (tenet 2).
-    None,
-}
-
-/// Resolve a window's maximize/restore capability, error-preserving: only a
-/// genuinely absent zoom button reads as "no zoom"; a dead or wedged element
-/// propagates (tenet 1).
-fn window_zoom(element: AXUIElementRef, role: Role) -> Result<WindowZoom> {
-    Ok(match find_zoom_button(element, role)? {
-        Some(btn) => WindowZoom::ZoomButton(btn),
-        None => WindowZoom::None,
-    })
-}
-
-/// Resolve a window's zoom button: the `AXZoomButton` convenience attribute,
-/// with a child scan by `AXZoomButton` subrole as the fallback for bridges
-/// that expose the button only as a child — the same two lookup paths as
-/// [`find_close_button`], and the same error discipline: only a genuinely
-/// absent attribute/subrole means "no zoom button"; a dead or wedged element
-/// propagates (tenet 1).
-fn find_zoom_button(element: AXUIElementRef, role: Role) -> Result<Option<AXElement>> {
-    let raw_attr_zoom = match read_raw_attr(element, "AXZoomButton") {
-        RawAttr::Value(v) => {
-            // Same guard as `find_close_button`: only a real AXUIElement
-            // value (same type id as the window itself) is a button; anything
-            // else — kCFNull, a malformed answer — is treated as absent.
-            let is_element =
-                unsafe { safe_cf_get_type_id(v) == safe_cf_get_type_id(element as CFTypeRef) };
-            if is_element {
-                Some(AXElement::from_owned(v as AXUIElementRef))
-            } else {
-                unsafe { safe_cf_release(v) };
-                None
-            }
-        }
-        RawAttr::Absent => None,
-        RawAttr::Unanswered(code) => {
-            return Err(Error::Platform {
-                code: code as i64,
-                message: format!(
-                    "AXZoomButton read failed for a {} (AXError {code}); the zoom button \
-                     is unknown, not absent",
-                    role
-                ),
-            });
-        }
-    };
-    match raw_attr_zoom {
-        Some(b) => Ok(Some(b)),
-        None => match read_raw_attr(element, "AXChildren") {
-            RawAttr::Value(v) => {
-                let found = unsafe {
-                    if safe_cf_get_type_id(v) != safe_cf_array_get_type_id() {
-                        None
-                    } else {
-                        let count = safe_cf_array_get_count(v);
-                        let mut found = None;
-                        for i in 0..count {
-                            let child = safe_cf_array_get_value(v, i);
-                            if child.is_null() {
-                                continue;
-                            }
-                            let is_zoom_button = match read_raw_attr(child, "AXSubrole") {
-                                RawAttr::Value(subrole) => {
-                                    if safe_cf_get_type_id(subrole) == safe_cf_string_get_type_id()
-                                    {
-                                        CFString::wrap_under_create_rule(subrole as *const _)
-                                            == "AXZoomButton"
-                                    } else {
-                                        safe_cf_release(subrole);
-                                        false
-                                    }
-                                }
-                                RawAttr::Absent => false,
-                                RawAttr::Unanswered(code) => {
-                                    // `v` (AXChildren) is owned by this
-                                    // unsafe block; the release below is
-                                    // skipped by this early return, so
-                                    // release here or every failed
-                                    // subrole read leaks the array.
-                                    safe_cf_release(v);
-                                    return Err(Error::Platform {
-                                        code: code as i64,
-                                        message: format!(
-                                            "AXSubrole read failed while scanning for the \
-                                             zoom button of a {} (AXError {code}); the zoom \
-                                             button is unknown, not absent",
-                                            role
-                                        ),
-                                    });
-                                }
-                            };
-                            if is_zoom_button {
-                                found = Some(AXElement::from_borrowed(child));
-                                break;
-                            }
-                        }
-                        found
-                    }
-                };
-                unsafe { safe_cf_release(v) };
-                Ok(found)
-            }
-            RawAttr::Absent => Ok(None),
-            RawAttr::Unanswered(code) => Err(Error::Platform {
-                code: code as i64,
-                message: format!(
-                    "AXChildren read failed while scanning for the zoom button of a {} \
-                     (AXError {code}); the zoom button is unknown, not absent",
                     role
                 ),
             }),
@@ -1544,7 +1429,7 @@ fn activate_owning_app(el_ptr: AXUIElementRef, action: &str, role: Role) -> Resu
 /// Clear a boolean attribute when it currently reads `true`.
 ///
 /// The deminiaturize half of `activate` / `maximize`: neither `AXRaise` nor
-/// pressing the zoom button clears `AXMinimized`, so a minimized window must
+/// setting `AXFullScreen` clears `AXMinimized`, so a minimized window must
 /// have its minimized flag cleared first or the verb returns success while
 /// the window stays in the Dock. Error-preserving: only a definitive
 /// unsupported / no-value answer (`RawAttr::Absent`) means "not set"; a
@@ -1581,25 +1466,32 @@ fn clear_bool_attr_if_true(
     Ok(was_true)
 }
 
-/// How long `maximize` / `restore` wait for the zoom/fullscreen transition —
-/// the zoom-button press (or the `AXFullScreen` clear) starts — before giving
-/// up, and the read cadence / consecutive-confirm count during the wait.
+/// How long `maximize` / `restore` wait for the fullscreen transition to
+/// commit, the poll cadence during the wait, and the number of consecutive
+/// identical samples that count as committed.
 ///
-/// The press is asynchronous, and on macOS 26 a WebKit-backed window
-/// *recreates* its window object during the transition (the title empties and
-/// comes back, a transient shell window appears and disappears, `AXWindows`
-/// momentarily returns nothing). Immediately after the press the window is
-/// already at the display's bounds while `AXFullScreen` still reads the
-/// *previous* state, and a window still inside the transition answers
-/// `kAXErrorIllegalArgument` (-25200) to an `AXSize` set. `restore`'s
-/// clear-if-true read during that stale window no-ops, so `restore` returns
-/// success with the window still zoomed and the next `resize_to` fails — the
-/// observed macOS-26 failure. These bounds cover the observed ~2s transition
-/// (including the transient shell window) while keeping a wedged window from
-/// hanging the verb for long.
-const WINDOW_ZOOM_SETTLE_BUDGET: Duration = Duration::from_secs(5);
-const WINDOW_ZOOM_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
-const WINDOW_ZOOM_SETTLE_SAMPLES: usize = 3;
+/// Native fullscreen (`AXFullScreen`) is the only macOS window state with a
+/// readable *and* writable attribute; the green button's `AXPress` and
+/// `AXZoomWindow` action are toggles whose state cannot be read back. The
+/// transition is asynchronous and hostile to observation on macOS 26:
+///
+/// * A window *entering* fullscreen transiently reports
+///   `AXFullScreen=false` (with `AXIsAttributeSettable` also false) while the
+///   transition runs, so a bare `false` read is not evidence of a restored
+///   window.
+/// * A set issued while a transition is in flight is discarded, not queued: a
+///   `true` set followed 10 ms later by a `false` set leaves the window
+///   fullscreen, and waiting alone never recovers it. Re-issuing the set once
+///   the transition commits does.
+/// * The window object can be recreated mid-transition (transient `AXUnknown`
+///   windows appear and disappear from `AXWindows`), so the settle check is
+///   application-level and compares the whole window set.
+///
+/// The budget covers the observed ~0.5s AppKit transition plus retries while
+/// keeping a wedged window from hanging the verb for long.
+const WINDOW_FULLSCREEN_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+const WINDOW_FULLSCREEN_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+const WINDOW_FULLSCREEN_SETTLE_SAMPLES: usize = 3;
 
 /// Read a boolean AX attribute with the tenet-1 distinction: a failed read is
 /// an error (the state is unknown, not false), an absent / unsupported
@@ -1661,10 +1553,15 @@ fn read_size_attr(el_ptr: AXUIElementRef, action: &str, role: Role) -> Result<Op
 
 /// The window data one settle sample is built from.
 #[derive(Clone, PartialEq, Debug)]
-struct WindowZoomSample {
+struct WindowFullscreenSample {
     size: (f64, f64),
     fullscreen: bool,
     main: bool,
+    /// `IsAttributeSettable(AXFullScreen)`. Reads `false` while an entry
+    /// transition is running, which is what tells that transient `false`
+    /// apart from a genuinely restored window (see
+    /// [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+    settable: bool,
 }
 
 /// Snapshot the app's windows once, for one settle sample.
@@ -1676,11 +1573,11 @@ struct WindowZoomSample {
 /// tenet-1 error). Absent `AXFullScreen` reads as `false` (a window without a
 /// fullscreen surface is by definition not fullscreen); an absent `AXSize` /
 /// `AXMain` makes the sample unreadable.
-fn app_window_zoom_snapshot(
+fn app_window_fullscreen_snapshot(
     app: AXUIElementRef,
     action: &str,
     role: Role,
-) -> Result<Option<Vec<WindowZoomSample>>> {
+) -> Result<Option<Vec<WindowFullscreenSample>>> {
     // A transient `kAXErrorCannotComplete` from the app mid-transition is part
     // of the churn the caller wants to wait out, not a verdict: an unreadable
     // sample resets the settle streak and the deadline error governs.
@@ -1705,10 +1602,18 @@ fn app_window_zoom_snapshot(
             Ok(v) => v.unwrap_or_default(),
             Err(_) => return Ok(None),
         };
-        samples.push(WindowZoomSample {
+        // An unreadable settability probe is churn too: a recreated window
+        // transiently refuses the attribute (see
+        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+        let settable = match is_attr_settable(window.as_ptr(), "AXFullScreen") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        samples.push(WindowFullscreenSample {
             size,
             fullscreen,
             main,
+            settable,
         });
     }
     // Round the sizes so a half-point wobble during a resize does not count as
@@ -1720,80 +1625,144 @@ fn app_window_zoom_snapshot(
     Ok(Some(samples))
 }
 
-/// Wait for the zoom/fullscreen transition to commit or clear.
+/// A one-line description of a window set for the timeout [`Diagnosis`].
+fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: bool) -> String {
+    let fullscreen = samples.iter().filter(|w| w.fullscreen).count();
+    let settable = samples.iter().filter(|w| w.settable).count();
+    format!(
+        "{} window(s): {fullscreen} report AXFullScreen=true, {settable} report it settable; \
+         waiting for the window to {}",
+        samples.len(),
+        if want {
+            "enter fullscreen"
+        } else {
+            "leave fullscreen"
+        },
+    )
+}
+
+/// Wait for the fullscreen transition to commit or clear, re-issuing the
+/// absolute set while the promise is unmet.
 ///
-/// `require` is the state the verb promises: `true` after `maximize`'s press
-/// (the zoomed state committed), `false` after `restore`'s `AXFullScreen`
-/// clear (the window actually un-zoomed). The wait succeeds once the app's
-/// window set is stable for [`WINDOW_ZOOM_SETTLE_SAMPLES`] consecutive
-/// samples and satisfies the promise. The wait is application-level, not
-/// element-level, on purpose: the transition *recreates* the window object
-/// (see [`WINDOW_ZOOM_SETTLE_BUDGET`]), so a cached element handle keeps
+/// `want` is the state the verb promises: `true` after `maximize`, `false`
+/// after `restore`. The wait succeeds once the desired state holds for
+/// [`WINDOW_FULLSCREEN_SETTLE_SAMPLES`] consecutive identical samples of the
+/// app's whole window set. The wait is application-level, not element-level,
+/// on purpose: the transition can recreate the window object (see
+/// [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]), so a cached element handle keeps
 /// reading stale state while the app itself has already settled.
 ///
-/// Timeout semantics differ per promise (tenet 1: no silent fallback, but no
-/// false failure either):
-/// - `require=true`: for the whole budget no window ever reported
-///   `AXFullScreen=true`. That is the documented "app's zoom has no
-///   `AXFullScreen` readout" case — the press was still the platform's own
-///   action, so `maximize` reports it as performed rather than failing on an
-///   unobservable state.
-/// - `require=false`: `restore` promised a restored window; returning success
-///   while the window is still zoomed would hide a broken restore and make
-///   the next `AXSize` set fail elsewhere, so budget expiry is a platform
-///   error.
-fn wait_window_zoom_settled(
+/// A set that lands while the previous transition is still running is
+/// discarded by AppKit rather than queued, so every iteration that has not
+/// committed re-issues `AXFullScreen = want`. Absolute sets make that safe:
+/// setting `true` on a fullscreen window is a no-op (verified on AppKit,
+/// WebKit and Chromium windows).
+///
+/// For `want=false` a `false` read alone is not the promise: while an *entry*
+/// transition is running the attribute transiently reads `false` and is not
+/// settable, and committing on that read would report a successful restore on
+/// a window that ends up fullscreen. The target element must both read
+/// `AXFullScreen=false` and answer `IsAttributeSettable=true` — the state a
+/// genuinely restored window is in.
+///
+/// Element-level failures during the wait (a recreated window object answers
+/// `kAXErrorInvalidUIElement`) do not end it: the retry is attempted again on
+/// the next tick, and an unmet promise fails at the deadline with a
+/// [`Diagnosis`] naming what was last observed (tenet 6).
+fn settle_window_fullscreen(
     el_ptr: AXUIElementRef,
-    require: bool,
+    want: bool,
     action: &str,
     role: Role,
 ) -> Result<()> {
     let app = owning_app_element(el_ptr, action, role)?;
-    let deadline = Instant::now() + WINDOW_ZOOM_SETTLE_BUDGET;
-    let mut previous: Option<Vec<WindowZoomSample>> = None;
+    let deadline = Instant::now() + WINDOW_FULLSCREEN_SETTLE_BUDGET;
+    let mut previous: Option<Vec<WindowFullscreenSample>> = None;
     let mut streak = 0usize;
+    let mut last_observed;
     loop {
-        match app_window_zoom_snapshot(app.as_ptr(), action, role)? {
+        let mut reached = false;
+        match app_window_fullscreen_snapshot(app.as_ptr(), action, role)? {
             Some(set) => {
-                let reached = if require {
-                    set.iter().any(|w| w.fullscreen)
+                let any_fullscreen = set.iter().any(|w| w.fullscreen);
+                if want {
+                    // The *target* window must be the one fullscreen — an app
+                    // can have several windows, and another window's state is
+                    // not this verb's promise. A read error is the window
+                    // object being recreated mid-transition; the app-level
+                    // snapshot is then the only readable evidence.
+                    reached = match read_fullscreen_state(el_ptr, action, role) {
+                        Ok(Some(true)) => true,
+                        Err(_) => any_fullscreen,
+                        _ => false,
+                    };
+                    last_observed = describe_window_fullscreen_sample(&set, want);
+                } else if any_fullscreen {
+                    last_observed = describe_window_fullscreen_sample(&set, want);
                 } else {
-                    !set.iter().any(|w| w.fullscreen)
-                };
-                let stable = previous.as_deref() == Some(set.as_slice());
-                if reached && stable {
-                    streak += 1;
-                    if streak >= WINDOW_ZOOM_SETTLE_SAMPLES {
-                        return Ok(());
+                    match (
+                        read_fullscreen_state(el_ptr, action, role),
+                        is_attr_settable(el_ptr, "AXFullScreen"),
+                    ) {
+                        (Ok(Some(false)), Ok(true)) => {
+                            reached = true;
+                            last_observed = describe_window_fullscreen_sample(&set, want);
+                        }
+                        (Ok(state), Ok(settable)) => {
+                            last_observed = format!(
+                                "no window reports fullscreen, but the target element reads \
+                                 AXFullScreen={state:?} (settable={settable})"
+                            );
+                        }
+                        (Err(err), _) | (_, Err(err)) => {
+                            last_observed = format!(
+                                "no window reports fullscreen, but the target element could \
+                                 not be read: {err}"
+                            );
+                        }
                     }
+                }
+                if reached && previous.as_deref() == Some(set.as_slice()) {
+                    streak += 1;
                 } else {
                     streak = 0;
                 }
                 previous = Some(set);
             }
-            // An unreadable window is the transition churn, not a settled
-            // state; note it so a *stable* all-false set after it can never
-            // be mistaken for persistence.
+            // An unreadable window is transition churn, not a settled state;
+            // note it so a *stable* set after it can never be mistaken for
+            // persistence.
             None => {
                 streak = 0;
                 previous = None;
+                last_observed =
+                    "the app did not answer a readable sample of its windows".to_string();
+            }
+        }
+        if streak >= WINDOW_FULLSCREEN_SETTLE_SAMPLES {
+            return Ok(());
+        }
+        if !reached {
+            // Record the failure instead of aborting: a set that fails while
+            // the window object is mid-recreation is expected, and the
+            // deadline below is the terminal site that reports it (tenet 6).
+            if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
+                last_observed = format!("{last_observed}; the retry set failed: {err}");
             }
         }
         if Instant::now() >= deadline {
-            if require {
-                return Ok(());
-            }
-            return Err(Error::Platform {
-                code: -9998,
-                message: format!(
-                    "restore did not settle within {:.0}s on a {role}: the window set never \
-                     reported a stable non-fullscreen state after the clear, so the window is \
-                     still zoomed",
-                    WINDOW_ZOOM_SETTLE_BUDGET.as_secs(),
-                ),
-            });
+            let condition = if want {
+                "window enters fullscreen (AXFullScreen=true)"
+            } else {
+                "window leaves fullscreen (AXFullScreen=false)"
+            };
+            return Err(Error::timeout(WINDOW_FULLSCREEN_SETTLE_BUDGET).diagnose(
+                xa11y_core::Diagnosis::new()
+                    .condition(condition)
+                    .last_observed(last_observed),
+            ));
         }
-        std::thread::sleep(WINDOW_ZOOM_SETTLE_INTERVAL);
+        std::thread::sleep(WINDOW_FULLSCREEN_SETTLE_INTERVAL);
     }
 }
 
@@ -2531,8 +2500,11 @@ fn build_snapshot_data(
             } else {
                 None
             },
-            // No AX attribute reports the zoom state (see `WindowZoom`): the
-            // zoomed state surfaces as `fullscreen` (from AXFullScreen).
+            // Native fullscreen is the only window state macOS reports (see
+            // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]): there is no readable
+            // "zoomed" attribute (`AXZoomed` is not in the SDK headers and
+            // live windows answer unsupported for it), so `maximized` stays
+            // `None` and the state surfaces as `fullscreen` (AXFullScreen).
             maximized: None,
             fullscreen: if matches!(role, Role::Window | Role::Dialog) {
                 attrs.fullscreen
@@ -2634,21 +2606,24 @@ fn build_snapshot_data(
             }
             // Probe the window-state capabilities once each — every probe is
             // an AX FFI round-trip, and the same results feed both the verb
-            // advertisement and the verb implementations below. Zoom is
-            // button-based (there is no zoom-state attribute; see
-            // `WindowZoom`), and the zoom press's only observable state is
-            // `AXFullScreen`, so restore is additionally available when
-            // `AXFullScreen` can be cleared.
+            // advertisement and the verb implementations below. `maximize` is
+            // the native fullscreen state: the only readable *and* writable
+            // window state, and what the green button does on a
+            // fullscreen-capable window. It is deliberately not advertised
+            // from the presence of a zoom button — the button's `AXPress` /
+            // `AXZoomWindow` actions are toggles with no readable state, and
+            // on a window that cannot fullscreen (System Settings, for
+            // example) the button only classic-zooms, which is not what
+            // `maximize` promises (tenet 3).
             let minimized_settable = is_attr_settable(element, "AXMinimized")?;
-            let zoom = window_zoom(element, role)?;
-            let fullscreen_restorable = is_attr_settable(element, "AXFullScreen")?;
+            let fullscreen_settable = is_attr_settable(element, "AXFullScreen")?;
             if minimized_settable {
                 push(&mut actions, "minimize");
             }
-            if !matches!(zoom, WindowZoom::None) {
+            if fullscreen_settable {
                 push(&mut actions, "maximize");
             }
-            if minimized_settable || !matches!(zoom, WindowZoom::None) || fullscreen_restorable {
+            if minimized_settable || fullscreen_settable {
                 push(&mut actions, "restore");
             }
             // `close` is advertised when the window exposes a close button —
@@ -3281,10 +3256,23 @@ impl Provider for MacOSProvider {
                     .filter(|child| !Self::should_filter_child(role, name, child))
                     .collect();
 
-                let results: Vec<ElementData> = filtered
+                // A child that vanished between the children read and its
+                // snapshot (macOS invalidates a window's AX object during
+                // fullscreen transitions and on close) is no longer part of
+                // this parent's live surface, so it is dropped; every other
+                // failure propagates (tenet 1).
+                let built: Vec<Result<ElementData>> = filtered
                     .par_iter()
                     .map(|child| self.build_element_data(child, element_data.pid))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect();
+                let mut results = Vec::with_capacity(built.len());
+                for data in built {
+                    match data {
+                        Ok(data) => results.push(data),
+                        Err(err) if is_gone_ax_element(&err) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
 
                 Ok(results)
             }
@@ -3376,14 +3364,20 @@ impl Provider for MacOSProvider {
             let clause = &group.clauses[clause_idx];
             let first = &clause.segments[0].simple;
 
-            // Build ElementData for this clause's phase-1 hits.
-            let mut phase1_data: Vec<(usize, AXUIElementRef, ElementData)> = hits
-                .iter()
-                .map(|(pos, ax)| {
-                    let data = self.build_element_data(ax, root_data.pid)?;
-                    Ok((*pos, ax.as_ptr(), data))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            // Build ElementData for this clause's phase-1 hits. A hit that
+            // died between the AX walk and its snapshot is dropped — it is
+            // not a match any more, and a bare miss is exactly the retry
+            // signal auto-wait polls on (`is_gone_ax_element`); every other
+            // failure propagates (tenet 1).
+            let mut phase1_data: Vec<(usize, AXUIElementRef, ElementData)> =
+                Vec::with_capacity(hits.len());
+            for (pos, ax) in &hits {
+                match self.build_element_data(ax, root_data.pid) {
+                    Ok(data) => phase1_data.push((*pos, ax.as_ptr(), data)),
+                    Err(err) if is_gone_ax_element(&err) => {}
+                    Err(err) => return Err(err),
+                }
+            }
 
             if clause.segments.len() == 1 {
                 // Per-clause `:nth` and limit handling — but we can't apply
@@ -3808,73 +3802,67 @@ impl Provider for MacOSProvider {
 
     fn maximize(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
-        // Resolve the capability before touching the window: an unsupported
-        // `maximize` must not deminiaturize and then report failure — no
-        // partial state change on an action that is going to be refused.
-        let zoom = window_zoom(ax.as_ptr(), element.role)?;
-        // AXMinimized and the zoom button are independent: zooming a minimized
-        // window would return success while the window stays in the Dock. The
-        // window-state contract (see the shared mock) has maximize clear
-        // `minimized` and bring the window back on-screen, so clear it first —
-        // error-preserving, the same `activate()` handling (tenet 1).
-        match zoom {
-            WindowZoom::None => Err(Error::ActionNotSupported {
+        // Native fullscreen is the only macOS window state with a readable
+        // *and* writable attribute; the green button's `AXPress` /
+        // `AXZoomWindow` are toggles with no readable state (see
+        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). An already-fullscreen window
+        // satisfies the verb whatever the settability probe answers: while
+        // the entry transition runs the attribute transiently reads `false`
+        // *and* not settable, which is exactly when a repeated maximize
+        // arrives (the probe answered `ActionNotSupported` for a window the
+        // settle then found fullscreen). Only a window that is not fullscreen
+        // and cannot be set fullscreen is unsupported — resolve that before
+        // clearing `AXMinimized`, so a refused verb makes no partial change
+        // (tenet 1). The settle loop still confirms the state, so a maximize
+        // racing an exit cannot no-op on a stale `true` read.
+        let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
+        if fullscreen != Some(true) && !is_attr_settable(ax.as_ptr(), "AXFullScreen")? {
+            return Err(Error::ActionNotSupported {
                 action: "maximize".to_string(),
                 role: element.role,
-            }),
-            WindowZoom::ZoomButton(btn) => {
-                clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
-                // Pressing the window's zoom button is the platform's own
-                // maximization action, not a substitute (tenet 3) — the zoom
-                // state has no AX attribute (see `WindowZoom`), so the button
-                // is the surface. The state it sets is `AXFullScreen`, which
-                // `restore()` reads back.
-                perform_ax_action(btn.as_ptr(), "AXPress", "maximize", element.role)?;
-                // The press is asynchronous: returning while the window is
-                // mid-transition makes an immediate `restore()` read the stale
-                // (previous) `AXFullScreen`, skip its clear, and report
-                // success on a window that is still zoomed — which is how the
-                // next resize answered kAXErrorIllegalArgument (-25200).
-                // Wait for the zoomed state to commit.
-                wait_window_zoom_settled(ax.as_ptr(), true, "maximize", element.role)
-            }
+            });
         }
+        // AXMinimized and fullscreen are independent states: setting
+        // fullscreen on a minimized window returns success while the window
+        // stays in the Dock. The window-state contract (see the shared mock)
+        // has maximize clear `minimized` and bring the window back on-screen,
+        // so clear it first — error-preserving, the same `activate()`
+        // handling (tenet 1).
+        clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
+        // Set the absolute state, never a toggle: setting `true` on an
+        // already-fullscreen window is a no-op, and skipping the set on a
+        // `true` read would let a maximize that races an exit transition
+        // return success on a window that ends up restored. The settle loop
+        // issues the set and re-issues it until the state commits.
+        settle_window_fullscreen(ax.as_ptr(), true, "maximize", element.role)
     }
 
     fn restore(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
-        // Restore clears the minimized state and the zoomed state. A window
-        // supports restore if either state is reachable: `AXMinimized`
-        // settable, a zoom button, or a settable `AXFullScreen` — the state
-        // the zoom button's press leaves behind. Each clear is attempted only
+        // Restore clears the minimized state and the fullscreen state. A
+        // window supports restore if either state is reachable: `AXMinimized`
+        // settable or `AXFullScreen` settable. Each clear is attempted only
         // when applicable (a missing attribute would no-op).
-        let min_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
-        let zoom = window_zoom(ax.as_ptr(), element.role)?;
+        let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
         let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        if !min_settable && matches!(zoom, WindowZoom::None) && !fullscreen_settable {
+        if !minimized_settable && !fullscreen_settable {
             return Err(Error::ActionNotSupported {
                 action: "restore".to_string(),
                 role: element.role,
             });
         }
-        if min_settable {
+        if minimized_settable {
             set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
         }
-        // The zoomed state has no AX attribute (see `WindowZoom`); the only
-        // observable leftover of the zoom button's press is AXFullScreen, and
-        // restore leaves it. Misreading that as a no-op because the read
-        // "safely" returned false would be a silent failure (tenet 1), so the
-        // clear is error-preserving. Never press the zoom button here:
-        // pressing toggles, so a window that is not zoomed would be zoomed by
-        // its own restore. `AXFullScreen` is what a non-zoomed window reports
-        // (false or absent), so a definitive read decides.
+        // Never press the green button here: the press toggles, so a window
+        // that is not fullscreen would be *entered* fullscreen by its own
+        // restore. `AXFullScreen=false` is the absolute state and is safe to
+        // set when the window is already restored; the settle loop confirms
+        // the read and re-issues the clear while an entry transition
+        // transiently reports `false` (see
+        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
         if fullscreen_settable {
-            clear_bool_attr_if_true(ax.as_ptr(), "AXFullScreen", "restore", element.role)?;
-            // Clearing starts an asynchronous exit transition; wait until the
-            // window actually reports un-zoomed, or fail (tenet 1) rather than
-            // return success on a window that is still zoomed — which is what
-            // used to leave the next AXSize set answering -25200.
-            wait_window_zoom_settled(ax.as_ptr(), false, "restore", element.role)?;
+            settle_window_fullscreen(ax.as_ptr(), false, "restore", element.role)?;
         }
         Ok(())
     }
@@ -4523,22 +4511,33 @@ mod tests {
     }
 
     #[test]
-    fn find_zoom_button_propagates_read_errors_for_null_element() {
-        // Same discipline as the close button: a null element answers with an
-        // error, so `maximize` advertisement and `maximize()` must not read
-        // "no zoom button" from a wedged element.
-        let result = find_zoom_button(std::ptr::null(), Role::Window);
+    fn settle_window_fullscreen_propagates_unreadable_element() {
+        // A null element cannot resolve its owning application, so the settle
+        // must not report a committed state: the verb's promise is
+        // unverifiable, and a silent success would be exactly the bug
+        // maximize/restore idempotency is about (tenet 1).
+        let result = settle_window_fullscreen(std::ptr::null(), true, "maximize", Role::Window);
         assert!(matches!(result, Err(Error::Platform { .. })));
     }
 
     #[test]
-    fn window_zoom_propagates_read_errors_for_null_element() {
-        // `window_zoom`'s first probe (`AXIsAttributeSettable`) on a null
-        // element errors rather than answering false: the capability must be
-        // unknown, not "no maximize" — otherwise a transient failure would
-        // silently drop the verb from `actions`.
-        let result = window_zoom(std::ptr::null(), Role::Window);
-        assert!(matches!(result, Err(Error::Platform { .. })));
+    fn is_gone_ax_element_matches_only_invalid_ui_element() {
+        let platform = |code: i32| Error::Platform {
+            code: code as i64,
+            message: String::new(),
+        };
+        // The one code that means "this AX object no longer exists": the
+        // enumerating callers drop the element instead of failing the whole
+        // listing/search.
+        assert!(is_gone_ax_element(&platform(AX_ERROR_INVALID_UI_ELEMENT)));
+        // A messaging timeout / wedged app is a real failure and must keep
+        // propagating — dropping it would silently truncate a live listing.
+        assert!(!is_gone_ax_element(&platform(AX_ERROR_CANNOT_COMPLETE)));
+        assert!(!is_gone_ax_element(&platform(AX_ERROR_ACTION_UNSUPPORTED)));
+        // Non-platform errors are never "element gone".
+        assert!(!is_gone_ax_element(&Error::ElementStale {
+            selector: "handle:1".to_string(),
+        }));
     }
 
     #[test]

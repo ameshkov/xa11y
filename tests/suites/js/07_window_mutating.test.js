@@ -38,6 +38,21 @@ async function windowAdvertising(app, verb) {
   return windows.find((w) => w.actions.includes(verb)) || null;
 }
 
+async function waitForWindow(app, verb, what) {
+  // A fullscreen transition transiently removes the real window from
+  // app.windows() (a shell window appears in its place), and the provider's
+  // settle loop promises the *state*, not that the window is enumerable the
+  // instant the verb returns. A one-shot lookup right after a verb reads that
+  // absence as "the window is gone", so every repeated call waits for it.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const win = await windowAdvertising(app, verb);
+    if (win) return win;
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for ${what}`);
+}
+
 async function waitUntil(predicate, timeoutMs, what) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -149,6 +164,20 @@ test('a window that advertises minimize is minimized and restored', async () => 
   }
 });
 
+async function windowReadsMaximized(app) {
+  // The state is platform-specific: Windows reports `maximized`, macOS
+  // reports the native fullscreen state as `fullscreen` (its `maximized`
+  // stays null). Both are checked so the assertion is portable.
+  //
+  // null while no window advertising `maximize` is enumerable: the
+  // transition transiently removes the real window, and reading that absence
+  // as "restored" would let the restore wait below succeed on a window that
+  // is merely mid-transition.
+  const win = await windowAdvertising(app, 'maximize');
+  if (!win) return null;
+  return Boolean(win.maximized) || Boolean(win.fullscreen);
+}
+
 test('a window that advertises maximize is maximized and restored', async () => {
   const app = await getApp();
   const win = await windowAdvertising(app, 'maximize');
@@ -157,7 +186,38 @@ test('a window that advertises maximize is maximized and restored', async () => 
   }
   try {
     await win.maximize();
-    await win.restore();
+    await waitUntil(
+      async () => (await windowReadsMaximized(app)) === true,
+      5000,
+      'window to report maximized'
+    );
+    // Repeated calls must be idempotent, not toggles: the old macOS provider
+    // pressed the window's zoom button, so a second maximize exited
+    // fullscreen (issue #399). Re-read the window first: the platform can
+    // recreate the window object during the transition.
+    let current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    await current.maximize();
+    await sleep(2000);
+    await waitUntil(
+      async () => (await windowReadsMaximized(app)) === true,
+      5000,
+      'the window to remain maximized after a second maximize'
+    );
+    current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    await current.restore();
+    await waitUntil(
+      async () => (await windowReadsMaximized(app)) === false,
+      5000,
+      'window to report restored'
+    );
+    current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    await current.restore();
+    await sleep(2000);
+    await waitUntil(
+      async () => (await windowReadsMaximized(app)) === false,
+      5000,
+      'the window to remain restored after a second restore'
+    );
   } catch (err) {
     try {
       const current = await windowAdvertising(app, 'maximize');
