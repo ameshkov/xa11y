@@ -658,6 +658,40 @@ fn is_gone_ax_element(err: &Error) -> bool {
     )
 }
 
+/// Recover the gone-element error from a failed [`BatchAttrs::fetch`].
+///
+/// The batch fetch collapses every failure to `None`, and
+/// [`ResolvedAttrs::from_individual`] then answers "absent" for every
+/// attribute — a dead element would be built as a role-less ghost instead of
+/// carrying the error the enumerating callers drop on ([`is_gone_ax_element`]).
+/// Probe `AXRole` (one failure-path round-trip) to recover the code:
+/// `kAXErrorInvalidUIElement` is the one answer that means "this object no
+/// longer exists", and a window invalidated mid-fullscreen-transition is
+/// exactly the churn the callers filter. Every other failure keeps the
+/// individual fallback — the batch call is an optimisation, not a
+/// requirement, and only this exact code is the "no longer exists" answer.
+fn batch_failure_is_gone(element: AXUIElementRef) -> Result<()> {
+    classify_batch_failure(read_raw_attr(element, "AXRole"))
+}
+
+/// The classification behind [`batch_failure_is_gone`], split out so the
+/// error mapping is unit-testable without a live AX element.
+fn classify_batch_failure(probe: RawAttr) -> Result<()> {
+    match probe {
+        RawAttr::Value(v) => {
+            unsafe { safe_cf_release(v) };
+            Ok(())
+        }
+        RawAttr::Unanswered(code) if code == AX_ERROR_INVALID_UI_ELEMENT => Err(Error::Platform {
+            code: code as i64,
+            message: "batch attribute fetch failed: the element was invalidated".to_string(),
+        }),
+        // The process answered (the element is alive) or failed for another
+        // reason; the individual fallback still has a chance to build it.
+        RawAttr::Absent | RawAttr::Unanswered(_) => Ok(()),
+    }
+}
+
 /// The close button of a window, or `None` when there is none.
 ///
 /// The canonical AX close path is pressing the close button: prefer the
@@ -1481,9 +1515,11 @@ fn clear_bool_attr_if_true(
 /// hostile to observation on macOS 26:
 ///
 /// * A window *entering* fullscreen transiently reports
-///   `AXFullScreen=false` (with `AXIsAttributeSettable` also false) while the
-///   transition runs, so a bare `false` read is not evidence of a restored
-///   window.
+///   `AXFullScreen=false` while the transition runs, so a bare `false` read
+///   is not evidence of a restored window. On the AppKit windows measured on
+///   macOS 26.4, `IsAttributeSettable(AXFullScreen)` stayed `true` through
+///   every entry/exit sample — the transient withdraws the *value*, not the
+///   capability.
 /// * A set issued while a transition is in flight is discarded, not queued: a
 ///   `true` set followed 10 ms later by a `false` set leaves the window
 ///   fullscreen, and waiting alone never recovers it. Re-issuing the set once
@@ -1531,6 +1567,35 @@ fn read_bool_attr(
 /// surface (unsupported), `Err` when the read fails.
 fn read_fullscreen_state(el_ptr: AXUIElementRef, action: &str, role: Role) -> Result<Option<bool>> {
     read_bool_attr(el_ptr, "AXFullScreen", action, role)
+}
+
+/// Whether `maximize` can act on a window: its native fullscreen state is
+/// already committed, or the `AXFullScreen` attribute is writable. Shared by
+/// the verb implementation and the `actions` advertisement, so a window that
+/// would honor the call never disappears from `actions` (tenet 3).
+///
+/// `fullscreen_settable` must be `false` when the caller did not run the
+/// probe (the implementation skips it when the state is already committed).
+fn maximize_supported(fullscreen: Option<bool>, fullscreen_settable: bool) -> bool {
+    fullscreen == Some(true) || fullscreen_settable
+}
+
+/// Whether `restore` can act on a window: clearing either state is reachable,
+/// or the fullscreen state is already committed (a fullscreen window whose
+/// probe answers `false` is still the state `maximize` accepts, and restore
+/// must be able to leave it). A minimized state whose attribute is not
+/// writable is refused before any mutation, so it does not count as
+/// reachable. Shared by the verb implementation and the `actions`
+/// advertisement, so an advertised `restore` always matches the dispatch
+/// (tenet 3).
+fn restore_supported(
+    minimized: Option<bool>,
+    fullscreen: Option<bool>,
+    minimized_settable: bool,
+    fullscreen_settable: bool,
+) -> bool {
+    (minimized_settable || fullscreen_settable || fullscreen == Some(true))
+        && !(minimized == Some(true) && !minimized_settable)
 }
 
 /// Read the window's `AXSize` as `(width, height)`; the same error
@@ -2458,6 +2523,11 @@ fn build_snapshot_data(
         let attrs = if let Some(batch) = BatchAttrs::fetch(element) {
             ResolvedAttrs::from_batch(&batch)
         } else {
+            // A batch failure is usually benign (fall back to individual
+            // reads), except when it is the invalidated-handle churn: that
+            // error must reach the enumerating callers instead of being
+            // flattened into a role-less ghost (tenet 1).
+            batch_failure_is_gone(element)?;
             ResolvedAttrs::from_individual(element)
         };
 
@@ -2713,13 +2783,19 @@ fn build_snapshot_data(
                 push(&mut actions, "activate");
             }
             // Probe the window-state capabilities once each — every probe is
-            // an AX FFI round-trip, and the same results feed both the verb
-            // advertisement and the verb implementations below. `maximize` is
-            // the native fullscreen state, which is readable *and* writable,
-            // and what the green button does on a fullscreen-capable window.
-            // It is deliberately not advertised from the presence of a zoom
-            // button — the button's `AXPress` / `AXZoomWindow` actions are
-            // toggles with no readable state, and
+            // an AX FFI round-trip — and advertise each verb from the exact
+            // predicate its implementation accepts, so a caller that
+            // re-enumerates after a transition never loses a verb the window
+            // would still honor (tenet 3). The state reads come from this
+            // snapshot's batch fetch (`attrs`), the same values surfaced as
+            // `states.minimized` / `states.fullscreen`, so the advertised
+            // surface and the reported state agree by construction.
+            //
+            // `maximize` is the native fullscreen state, which is readable
+            // *and* writable, and what the green button does on a
+            // fullscreen-capable window. It is deliberately not advertised
+            // from the presence of a zoom button — the button's `AXPress` /
+            // `AXZoomWindow` actions are toggles with no readable state, and
             // on a window that cannot fullscreen (System Settings, for
             // example) the button only classic-zooms, which is not what
             // `maximize` promises (tenet 3).
@@ -2728,10 +2804,24 @@ fn build_snapshot_data(
             if minimized_settable {
                 push(&mut actions, "minimize");
             }
-            if fullscreen_settable {
+            // An already-committed fullscreen window satisfies `maximize`
+            // whatever the settability probe answers (see `maximize()`), so
+            // the current state is part of the shared predicate: a repeated
+            // `maximize` on a window that dropped out of the settable set
+            // must stay advertised.
+            if maximize_supported(attrs.fullscreen, fullscreen_settable) {
                 push(&mut actions, "maximize");
             }
-            if minimized_settable || fullscreen_settable {
+            // `restore()` accepts a window when either state is reachable OR
+            // it already reads fullscreen, except for a minimized state whose
+            // attribute is not settable — that combination is refused before
+            // any mutation, so it must not be advertised.
+            if restore_supported(
+                attrs.minimized,
+                attrs.fullscreen,
+                minimized_settable,
+                fullscreen_settable,
+            ) {
                 push(&mut actions, "restore");
             }
             // `close` is advertised when the window exposes a close button —
@@ -3649,7 +3739,15 @@ impl Provider for MacOSProvider {
             if app_element.is_null() {
                 continue;
             }
-            let mut data = self.build_element_data(&app_element, Some(*pid as u32))?;
+            let mut data = match self.build_element_data(&app_element, Some(*pid as u32)) {
+                Ok(d) => d,
+                // The process disappeared between the CGWindowList scan and
+                // the snapshot: it is not part of the live listing any more
+                // (the same classification the `Role::Unknown` filter below
+                // applies), not a failure of the listing.
+                Err(err) if is_gone_ax_element(&err) => continue,
+                Err(err) => return Err(err),
+            };
             data.name = Some(app_name.clone());
             // A node built from `AXUIElementCreateApplication(pid)` is a
             // process node, so its role is `Role::Application` whatever
@@ -3711,7 +3809,24 @@ impl Provider for MacOSProvider {
                 if !value.is_null() {
                     unsafe { safe_cf_release(value) };
                 }
-                let mut data = self.build_element_data(&app_element, Some(pid))?;
+                let mut data = match self.build_element_data(&app_element, Some(pid)) {
+                    Ok(d) => d,
+                    // The process exited between the attach probe above and
+                    // the snapshot: the same "not reachable (yet)" reading
+                    // the probe maps to `SelectorNotMatched`, so the core's
+                    // poll loop keeps retrying until its deadline.
+                    Err(err) if is_gone_ax_element(&err) => {
+                        let diagnosis = xa11y_core::Diagnosis::new().last_observed(
+                            "the application was invalidated between the AX attach probe and \
+                             its snapshot",
+                        );
+                        return Err(
+                            Error::selector_not_matched(format!("application[pid={pid}]"))
+                                .diagnose(diagnosis),
+                        );
+                    }
+                    Err(err) => return Err(err),
+                };
                 // Keep `name` consistent with `list_apps()`, which overrides
                 // the AX-reported name with the CGWindowList owner name. A
                 // pre-window process has no CGWindowList entry yet; the
@@ -3937,7 +4052,12 @@ impl Provider for MacOSProvider {
         // (tenet 1). The settle loop still confirms the state, so a maximize
         // racing an exit cannot no-op on a stale `true` read.
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
-        if fullscreen != Some(true) && !is_attr_settable(ax.as_ptr(), "AXFullScreen")? {
+        // The shared predicate keeps this acceptance rule and the `actions`
+        // advertisement in lockstep; a committed fullscreen window passes
+        // without paying for the settability probe.
+        let fullscreen_settable =
+            fullscreen != Some(true) && is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
+        if !maximize_supported(fullscreen, fullscreen_settable) {
             return Err(Error::ActionNotSupported {
                 action: "maximize".to_string(),
                 role: element.role,
@@ -3979,13 +4099,16 @@ impl Provider for MacOSProvider {
         // never happened. Refuse before any partial clear (tenet 1). The
         // fullscreen state needs no such guard — its settle loop reads the
         // state back and fails on a no-op instead of returning early.
-        if minimized == Some(true) && !minimized_settable {
-            return Err(Error::ActionNotSupported {
-                action: "restore".to_string(),
-                role: element.role,
-            });
-        }
-        if !minimized_settable && !fullscreen_settable && fullscreen != Some(true) {
+        //
+        // `restore_supported` is the same predicate the `actions`
+        // advertisement uses, so an advertised `restore` cannot deterministically
+        // reject here (tenet 3).
+        if !restore_supported(
+            minimized,
+            fullscreen,
+            minimized_settable,
+            fullscreen_settable,
+        ) {
             return Err(Error::ActionNotSupported {
                 action: "restore".to_string(),
                 role: element.role,
@@ -4708,6 +4831,55 @@ mod tests {
         assert!(!is_gone_ax_element(&Error::ElementStale {
             selector: "handle:1".to_string(),
         }));
+    }
+
+    #[test]
+    fn batch_failure_classification_propagates_only_invalid_ui_element() {
+        // The batch read fails for an AXUIElement invalidated mid-transition;
+        // the role probe then answers kAXErrorInvalidUIElement, and the
+        // snapshot path must carry that error so the enumerating callers drop
+        // the element instead of falling through to a role-less ghost.
+        let gone = classify_batch_failure(RawAttr::Unanswered(AX_ERROR_INVALID_UI_ELEMENT));
+        assert!(
+            matches!(gone, Err(ref err) if is_gone_ax_element(err)),
+            "{gone:?}"
+        );
+        // Every other read failure keeps the individual fallback — the batch
+        // call is an optimisation, not a requirement.
+        assert!(classify_batch_failure(RawAttr::Unanswered(AX_ERROR_CANNOT_COMPLETE)).is_ok());
+        assert!(classify_batch_failure(RawAttr::Unanswered(AX_ERROR_ACTION_UNSUPPORTED)).is_ok());
+        assert!(classify_batch_failure(RawAttr::Absent).is_ok());
+    }
+
+    #[test]
+    fn window_verb_predicates_cover_the_advertised_combinations() {
+        // `maximize`: a committed fullscreen window is accepted whatever the
+        // settability probe answers — the repeated-maximize case the
+        // advertisement must not drop.
+        assert!(maximize_supported(Some(true), false));
+        assert!(maximize_supported(Some(true), true));
+        assert!(maximize_supported(Some(false), true));
+        assert!(maximize_supported(None, true));
+        // Not fullscreen and not writable: `ActionNotSupported`, never
+        // advertised.
+        assert!(!maximize_supported(Some(false), false));
+        assert!(!maximize_supported(None, false));
+
+        // `restore`: either state is reachable, or fullscreen is already
+        // committed.
+        assert!(restore_supported(Some(false), Some(true), false, false));
+        assert!(restore_supported(Some(false), Some(false), true, false));
+        assert!(restore_supported(Some(false), Some(false), false, true));
+        assert!(restore_supported(None, None, false, true));
+        assert!(restore_supported(Some(true), Some(false), true, false));
+        // The one refusal — a minimized state whose attribute is not
+        // settable — must never be advertised: `restore` returns
+        // `ActionNotSupported` before mutating anything.
+        assert!(!restore_supported(Some(true), Some(false), false, true));
+        assert!(!restore_supported(Some(true), Some(true), false, false));
+        assert!(!restore_supported(Some(true), Some(true), false, true));
+        // Neither state reachable, nothing committed.
+        assert!(!restore_supported(Some(false), Some(false), false, false));
     }
 
     #[test]

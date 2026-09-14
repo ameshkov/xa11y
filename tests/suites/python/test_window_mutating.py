@@ -314,6 +314,23 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             5.0,
             "the window to remain restored after a second restore",
         )
+        # maximize -> restore -> maximize -> restore ends where every call
+        # promises; no call may toggle the state the next one sets. Each step
+        # lets the previous transition finish before the next call, because
+        # driving a new fullscreen change into an animation still in flight
+        # makes the window server leave the transition shell behind.
+        for expected in (True, False, True, False):
+            current = _wait_for_window(app, "maximize", "a maximizable window")
+            if expected:
+                current.maximize()
+            else:
+                current.restore()
+            _wait_until(
+                lambda bound=expected: _window_reads_maximized(app) is bound,
+                5.0,
+                f"the window to read maximized={expected} during the alternating sequence",
+            )
+            time.sleep(1.5)
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
         # not be left maximized for the suites after this one. ``_wait_for_window``,

@@ -220,6 +220,25 @@ test('a window that advertises maximize is maximized and restored', async () => 
       5000,
       'the window to remain restored after a second restore'
     );
+    // maximize -> restore -> maximize -> restore ends where every call
+    // promises; no call may toggle the state the next one sets. Each step
+    // lets the previous transition finish before the next call, because
+    // driving a new fullscreen change into an animation still in flight
+    // makes the window server leave the transition shell behind.
+    for (const expected of [true, false, true, false]) {
+      current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      if (expected) {
+        await current.maximize();
+      } else {
+        await current.restore();
+      }
+      await waitUntil(
+        async () => (await windowReadsMaximized(app)) === expected,
+        5000,
+        `the window to read maximized=${expected} during the alternating sequence`
+      );
+      await sleep(1500);
+    }
   } catch (err) {
     try {
       // waitForWindow, not a one-shot lookup: the transition can have the
