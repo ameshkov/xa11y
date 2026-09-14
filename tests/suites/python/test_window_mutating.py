@@ -316,11 +316,13 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         )
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
-        # not be left maximized for the suites after this one.
+        # not be left maximized for the suites after this one. ``_wait_for_window``,
+        # not a one-shot lookup: the transition can have the real window out
+        # of ``App.windows()``, and a ``None`` here would leave the shared app
+        # fullscreen for the suites after this one.
         try:
-            current = _window_advertising(app, "maximize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
+            current = _wait_for_window(app, "maximize", "a maximizable window")
+            current.restore()
         except Exception:  # best-effort cleanup; the original error wins
             pass
         raise
@@ -715,10 +717,12 @@ def test_locator_maximize_and_restore(app: xa11y.App) -> None:
         locator.maximize()
         locator.restore()
     except Exception:
+        # Same failure-preserving cleanup as the element path: a one-shot
+        # lookup can miss the window while the transition has it out of
+        # ``App.windows()``, leaving the shared app fullscreen.
         try:
-            current = _window_advertising(app, "maximize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
+            current = _wait_for_window(app, "maximize", "a maximizable window")
+            current.restore()
         except Exception:  # best-effort cleanup; the original error wins
             pass
         raise

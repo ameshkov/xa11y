@@ -3965,26 +3965,33 @@ impl Provider for MacOSProvider {
         // reads true, or its attribute is settable. Settability alone is not
         // the state: a fullscreen window can read `AXFullScreen=true` while
         // its probe answers false (the same read `maximize` accepts above),
-        // and an app-minimized window can read `AXMinimized=true` while its
-        // probe answers false. Skipping such a state because its probe is
-        // false would report a successful restore on a window that never
-        // moved. A failed probe propagates as a platform error rather than
-        // being read as unsupported (tenet 1).
+        // and skipping it because the probe is false would report a
+        // successful restore on a window that never moved. A failed probe
+        // propagates as a platform error rather than being read as
+        // unsupported (tenet 1).
         let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "restore", element.role)?;
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "restore", element.role)?;
         let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
         let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        if !minimized_settable
-            && !fullscreen_settable
-            && minimized != Some(true)
-            && fullscreen != Some(true)
-        {
+        // A minimized state whose attribute is not settable cannot be
+        // cleared: AppKit accepts an unsupported AX set silently (see
+        // `is_attr_settable`), so attempting it would report a restore that
+        // never happened. Refuse before any partial clear (tenet 1). The
+        // fullscreen state needs no such guard — its settle loop reads the
+        // state back and fails on a no-op instead of returning early.
+        if minimized == Some(true) && !minimized_settable {
             return Err(Error::ActionNotSupported {
                 action: "restore".to_string(),
                 role: element.role,
             });
         }
-        if minimized_settable || minimized == Some(true) {
+        if !minimized_settable && !fullscreen_settable && fullscreen != Some(true) {
+            return Err(Error::ActionNotSupported {
+                action: "restore".to_string(),
+                role: element.role,
+            });
+        }
+        if minimized_settable {
             set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
         }
         // Never press the green button here: the press toggles, so a window

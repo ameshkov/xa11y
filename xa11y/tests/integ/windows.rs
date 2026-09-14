@@ -338,10 +338,16 @@ mod tests {
 
         // maximize commits.
         win.maximize().expect("maximize must succeed");
+        // `wait_until` returns on any `Some`, so filter for the promised
+        // state: a bare `fullscreen(&app)` would also accept `Some(false)`.
         wait_until(
             Duration::from_secs(5),
             "window to report fullscreen",
-            || fullscreen(&app),
+            || {
+                fullscreen(&app)
+                    .filter(|fullscreen| *fullscreen)
+                    .map(|_| ())
+            },
         );
 
         // A repeated maximize must not toggle the window back out. Give the
@@ -367,7 +373,9 @@ mod tests {
         .restore()
         .expect("restore must succeed");
         wait_until(Duration::from_secs(5), "window to report restored", || {
-            fullscreen(&app).map(|fs| !fs)
+            fullscreen(&app)
+                .filter(|fullscreen| !*fullscreen)
+                .map(|_| ())
         });
         wait_until(Duration::from_secs(5), "a maximizable window", || {
             main_window(&app)
@@ -398,7 +406,9 @@ mod tests {
                 w.restore().expect("restore must succeed");
             }
             wait_until(Duration::from_secs(5), "sequence step to settle", || {
-                fullscreen(&app).map(|fs| fs == expected_fullscreen)
+                fullscreen(&app)
+                    .filter(|fullscreen| *fullscreen == expected_fullscreen)
+                    .map(|_| ())
             });
             std::thread::sleep(Duration::from_millis(1500));
         }

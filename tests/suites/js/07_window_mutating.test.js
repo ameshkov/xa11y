@@ -222,10 +222,11 @@ test('a window that advertises maximize is maximized and restored', async () => 
     );
   } catch (err) {
     try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
+      // waitForWindow, not a one-shot lookup: the transition can have the
+      // real window out of app.windows(), and a null here would leave the
+      // shared app fullscreen for the suites after this one.
+      const current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      await current.restore();
     } catch (_cleanup) {
       // best-effort cleanup; the original error wins
     }
@@ -331,10 +332,11 @@ test('Locator maximize()/restore() dispatch through the async binding', async ()
     await locator.restore();
   } catch (err) {
     try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
+      // Same failure-preserving cleanup as the element path: a one-shot
+      // lookup can miss the window while the transition has it out of
+      // app.windows(), leaving the shared app fullscreen.
+      const current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      await current.restore();
     } catch (_cleanup) {
       // best-effort cleanup; the original error wins
     }
