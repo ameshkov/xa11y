@@ -1798,20 +1798,39 @@ fn settle_window_fullscreen(
                                      AXFullScreen={state:?} (settable={settable})"
                                 );
                             }
-                            // As above: an invalidated handle is the churn
-                            // this wait tolerates; a real read failure is
-                            // propagated instead of retried into a timeout.
-                            (Err(err), _) | (_, Err(err)) if is_gone_ax_element(&err) => {
+                            // A real failure from *either* probe propagates,
+                            // even when the other probe reported the
+                            // invalidated-handle churn: pairing the results in
+                            // one or-pattern binds only the first error and
+                            // could swallow the second as churn.
+                            (Err(churn), Err(real))
+                                if is_gone_ax_element(&churn) && !is_gone_ax_element(&real) =>
+                            {
+                                return Err(real);
+                            }
+                            (Err(real), _) if !is_gone_ax_element(&real) => return Err(real),
+                            (_, Err(real)) if !is_gone_ax_element(&real) => return Err(real),
+                            // What remains is the invalidated-handle churn on
+                            // at least one probe: retry, recording it for the
+                            // timeout diagnosis.
+                            (Err(err), _) | (_, Err(err)) => {
                                 last_observed = format!(
                                     "the target window is not enumerable and could not be \
                                      read: {err}"
                                 );
                             }
-                            (Err(err), _) | (_, Err(err)) => return Err(err),
                         },
                     }
                 }
-                if reached && previous.as_deref() == Some(set.as_slice()) {
+                // The consecutive-sample promise is the *target's* own
+                // sample. A cached-handle read keeps the loop polling while
+                // the target is missing from `AXWindows`, but a missing target
+                // must not advance the streak by itself: the set that remains
+                // is the transition's shell window(s), identical across
+                // samples, so a stale cached `true` could satisfy the promise
+                // in ~150ms without the recreated window ever reporting the
+                // state.
+                if reached && target.is_some() && previous.as_deref() == Some(set.as_slice()) {
                     streak += 1;
                 } else {
                     streak = 0;
@@ -3942,21 +3961,30 @@ impl Provider for MacOSProvider {
     fn restore(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
         // Restore clears the minimized state and the fullscreen state. A
-        // window supports restore if either state is reachable: `AXMinimized`
-        // settable or `AXFullScreen` settable. Each clear is attempted only
-        // when applicable (a missing attribute would no-op). These are
-        // capability probes, not state reads: only an explicit `false` from
-        // both refuses the verb, and a failed probe propagates as a platform
-        // error rather than being read as unsupported (tenet 1).
+        // window supports restore if either state is reachable: the state
+        // reads true, or its attribute is settable. Settability alone is not
+        // the state: a fullscreen window can read `AXFullScreen=true` while
+        // its probe answers false (the same read `maximize` accepts above),
+        // and an app-minimized window can read `AXMinimized=true` while its
+        // probe answers false. Skipping such a state because its probe is
+        // false would report a successful restore on a window that never
+        // moved. A failed probe propagates as a platform error rather than
+        // being read as unsupported (tenet 1).
+        let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "restore", element.role)?;
+        let fullscreen = read_fullscreen_state(ax.as_ptr(), "restore", element.role)?;
         let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
         let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        if !minimized_settable && !fullscreen_settable {
+        if !minimized_settable
+            && !fullscreen_settable
+            && minimized != Some(true)
+            && fullscreen != Some(true)
+        {
             return Err(Error::ActionNotSupported {
                 action: "restore".to_string(),
                 role: element.role,
             });
         }
-        if minimized_settable {
+        if minimized_settable || minimized == Some(true) {
             set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
         }
         // Never press the green button here: the press toggles, so a window
@@ -3966,7 +3994,7 @@ impl Provider for MacOSProvider {
         // the read and re-issues the clear while an entry transition
         // transiently reports `false` (see
         // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
-        if fullscreen_settable {
+        if fullscreen_settable || fullscreen == Some(true) {
             settle_window_fullscreen(ax.as_ptr(), false, "restore", element.role)?;
         }
         Ok(())
