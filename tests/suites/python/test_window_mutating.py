@@ -254,15 +254,19 @@ def _window_reads_maximized(app: xa11y.App) -> bool | None:
     stays ``None``). Both are polled so the assertion is portable across the
     cells that advertise the verb.
 
-    ``None`` while no window advertising ``maximize`` is enumerable: the
-    transition transiently removes the real window, and reading that absence
-    as "restored" would let the restore wait below succeed on a window that
-    is merely mid-transition.
+    ``None`` while the state is unknown: no window advertising ``maximize``
+    is enumerable (the transition transiently removes the real window), or
+    neither getter answered. ``bool(None)`` would read that as "restored" and
+    let the state waits below pass without observing anything.
     """
     win = _window_advertising(app, "maximize")
     if win is None:
         return None
-    return bool(win.maximized) or bool(win.fullscreen)
+    if win.maximized is True or win.fullscreen is True:
+        return True
+    if win.maximized is False or win.fullscreen is False:
+        return False
+    return None
 
 
 def test_maximize_and_restore(app: xa11y.App) -> None:

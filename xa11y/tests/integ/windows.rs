@@ -293,19 +293,41 @@ mod tests {
         /// bare `"window"` selector matches. Selecting by the advertised
         /// capability pins every poll and every repeated call to the window
         /// the verbs actually act on.
+        ///
+        /// Strict, like the other assertion lookups in this file: an
+        /// enumeration failure must surface as itself, not as the five-second
+        /// "no maximizable window" timeout (cf. [`dialog_window_result`]).
         fn main_window(app: &App) -> Option<Element> {
-            let windows = app.windows().ok()?;
-            windows
-                .into_iter()
-                .find(|w| w.actions.iter().any(|a| a == "maximize"))
+            main_window_result(app).expect("App::windows() enumeration must succeed")
         }
 
-        /// The main window's fullscreen state, or `None` while the real
-        /// window is transiently absent mid-transition.
+        /// [`main_window`] as a `Result`: `Ok(None)` means no window really
+        /// advertises the verbs; an enumeration failure is `Err` and must not
+        /// masquerade as an absent window.
+        fn main_window_result(app: &App) -> Result<Option<Element>> {
+            Ok(app
+                .windows()?
+                .into_iter()
+                .find(|w| w.actions.iter().any(|a| a == "maximize")))
+        }
+
+        /// The main window's maximized/fullscreen state, or `None` while it is
+        /// unknown (the real window is transiently absent mid-transition, or
+        /// neither getter answered).
+        ///
+        /// Unknown is not `false`: collapsing it to restored would let a
+        /// restored wait pass without observing anything. macOS reports the
+        /// state as `fullscreen` (AXFullScreen) and leaves `maximized` `None`;
+        /// Windows is the reverse.
         fn fullscreen(app: &App) -> Option<bool> {
             let w = main_window(app)?;
-            // macOS reports the maximized state as `fullscreen` (AXFullScreen).
-            Some(w.states.maximized == Some(true) || w.states.fullscreen == Some(true))
+            if w.states.maximized == Some(true) || w.states.fullscreen == Some(true) {
+                return Some(true);
+            }
+            if w.states.maximized.is_some() || w.states.fullscreen.is_some() {
+                return Some(false);
+            }
+            None
         }
 
         let app = h::app_root();

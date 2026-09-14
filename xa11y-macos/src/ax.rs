@@ -1473,10 +1473,12 @@ fn clear_bool_attr_if_true(
 /// commit, the poll cadence during the wait, and the number of consecutive
 /// identical samples that count as committed.
 ///
-/// Native fullscreen (`AXFullScreen`) is the only macOS window state with a
-/// readable *and* writable attribute; the green button's `AXPress` and
-/// `AXZoomWindow` action are toggles whose state cannot be read back. The
-/// transition is asynchronous and hostile to observation on macOS 26:
+/// Native fullscreen (`AXFullScreen`) is the state these verbs drive, and it
+/// is readable *and* writable. `AXMinimized` is equally readable and
+/// writable, but it is the minimize state; the zoom state has no attribute
+/// at all. The green button's `AXPress` and `AXZoomWindow` action are toggles
+/// whose state cannot be read back. The transition is asynchronous and
+/// hostile to observation on macOS 26:
 ///
 /// * A window *entering* fullscreen transiently reports
 ///   `AXFullScreen=false` (with `AXIsAttributeSettable` also false) while the
@@ -1738,24 +1740,31 @@ fn settle_window_fullscreen(
                             sample.fullscreen
                         }
                         None => match read_fullscreen_state(el_ptr, action, role) {
-                            Ok(Some(true)) => {
-                                last_observed = describe_window_fullscreen_sample(&set, want);
-                                true
-                            }
+                            // The cached read is part of the diagnosis: a
+                            // timeout that follows a successful cached read
+                            // must say so, not just that the target is
+                            // missing from `AXWindows`.
                             Ok(state) => {
                                 last_observed = format!(
                                     "{}; the cached target handle reads AXFullScreen={state:?}",
                                     describe_window_fullscreen_sample(&set, want)
                                 );
-                                false
+                                state == Some(true)
                             }
-                            Err(err) => {
+                            // Only an invalidated handle is churn: the target
+                            // can be absent from `AXWindows` while AppKit
+                            // recreates its object. Any other read failure is
+                            // a real platform error and must not be retried
+                            // into a generic timeout, the same rule the
+                            // snapshot above applies (tenet 1).
+                            Err(err) if is_gone_ax_element(&err) => {
                                 last_observed = format!(
                                     "{}; the cached target handle could not be read: {err}",
                                     describe_window_fullscreen_sample(&set, want)
                                 );
                                 false
                             }
+                            Err(err) => return Err(err),
                         },
                     };
                 } else {
@@ -1789,12 +1798,16 @@ fn settle_window_fullscreen(
                                      AXFullScreen={state:?} (settable={settable})"
                                 );
                             }
-                            (Err(err), _) | (_, Err(err)) => {
+                            // As above: an invalidated handle is the churn
+                            // this wait tolerates; a real read failure is
+                            // propagated instead of retried into a timeout.
+                            (Err(err), _) | (_, Err(err)) if is_gone_ax_element(&err) => {
                                 last_observed = format!(
                                     "the target window is not enumerable and could not be \
                                      read: {err}"
                                 );
                             }
+                            (Err(err), _) | (_, Err(err)) => return Err(err),
                         },
                     }
                 }
@@ -2576,11 +2589,11 @@ fn build_snapshot_data(
             } else {
                 None
             },
-            // Native fullscreen is the only window state macOS reports (see
-            // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]): there is no readable
-            // "zoomed" attribute (`AXZoomed` is not in the SDK headers and
-            // live windows answer unsupported for it), so `maximized` stays
-            // `None` and the state surfaces as `fullscreen` (AXFullScreen).
+            // Native fullscreen is the state behind `maximize`, and macOS has
+            // no readable "zoomed" attribute (`AXZoomed` is not in the SDK
+            // headers and live windows answer unsupported for it), so
+            // `maximized` stays `None` and the state surfaces as `fullscreen`
+            // (AXFullScreen, see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
             maximized: None,
             fullscreen: if matches!(role, Role::Window | Role::Dialog) {
                 attrs.fullscreen
@@ -2683,11 +2696,11 @@ fn build_snapshot_data(
             // Probe the window-state capabilities once each — every probe is
             // an AX FFI round-trip, and the same results feed both the verb
             // advertisement and the verb implementations below. `maximize` is
-            // the native fullscreen state: the only readable *and* writable
-            // window state, and what the green button does on a
-            // fullscreen-capable window. It is deliberately not advertised
-            // from the presence of a zoom button — the button's `AXPress` /
-            // `AXZoomWindow` actions are toggles with no readable state, and
+            // the native fullscreen state, which is readable *and* writable,
+            // and what the green button does on a fullscreen-capable window.
+            // It is deliberately not advertised from the presence of a zoom
+            // button — the button's `AXPress` / `AXZoomWindow` actions are
+            // toggles with no readable state, and
             // on a window that cannot fullscreen (System Settings, for
             // example) the button only classic-zooms, which is not what
             // `maximize` promises (tenet 3).
@@ -3415,45 +3428,61 @@ impl Provider for MacOSProvider {
             None
         };
 
-        let phase1: Vec<(usize, AXElement)> = self.collect_matching_ax_group(
-            &root_ax,
-            root_data.role,
-            root_data.name.as_deref(),
-            &firsts,
-            0,
-            max_depth_val,
-            phase1_walk_limit,
-        );
+        // Phase 1 walks and snapshots in one pass. A hit that died between
+        // the AX walk and its snapshot is dropped — it is not a match any
+        // more, and a bare miss is exactly the retry signal auto-wait polls
+        // on (`is_gone_ax_element`); every other failure propagates
+        // (tenet 1). A bounded walk (`phase1_walk_limit`, the
+        // `first()` / `nth()` short-circuit) stops before matches past the
+        // bound, so a dropped hit can have consumed the bound before a live
+        // match was ever examined. Re-walk unbounded when that happens: a
+        // second pass has no bound left to hide a match, and a drop there is
+        // the ordinary concurrent-mutation case the retry signal covers.
+        let mut walk_limit = phase1_walk_limit;
+        let phase1_data_by_clause: Vec<Vec<(usize, AXUIElementRef, ElementData)>> = loop {
+            let phase1: Vec<(usize, AXElement)> = self.collect_matching_ax_group(
+                &root_ax,
+                root_data.role,
+                root_data.name.as_deref(),
+                &firsts,
+                0,
+                max_depth_val,
+                walk_limit,
+            );
 
-        // Bucket phase-1 hits by clause + their doc-order walk position.
-        let mut by_clause: Vec<Vec<(usize, AXElement)>> =
-            (0..group.clauses.len()).map(|_| Vec::new()).collect();
-        for (walk_pos, (clause_idx, ax)) in phase1.into_iter().enumerate() {
-            by_clause[clause_idx].push((walk_pos, ax));
-        }
+            // Bucket phase-1 hits by clause + their doc-order walk position.
+            let mut by_clause: Vec<Vec<(usize, AXElement)>> =
+                (0..group.clauses.len()).map(|_| Vec::new()).collect();
+            for (walk_pos, (clause_idx, ax)) in phase1.into_iter().enumerate() {
+                by_clause[clause_idx].push((walk_pos, ax));
+            }
+
+            let mut dropped = false;
+            let mut data_by_clause: Vec<Vec<(usize, AXUIElementRef, ElementData)>> =
+                (0..group.clauses.len()).map(|_| Vec::new()).collect();
+            for (clause_idx, hits) in by_clause.into_iter().enumerate() {
+                for (pos, ax) in &hits {
+                    match self.build_element_data(ax, root_data.pid) {
+                        Ok(data) => data_by_clause[clause_idx].push((*pos, ax.as_ptr(), data)),
+                        Err(err) if is_gone_ax_element(&err) => dropped = true,
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+
+            if !dropped || walk_limit.is_none() {
+                break data_by_clause;
+            }
+            walk_limit = None;
+        };
 
         let mut merged: Vec<(usize, AXUIElementRef, ElementData)> = Vec::new();
-        for (clause_idx, hits) in by_clause.into_iter().enumerate() {
-            if hits.is_empty() {
+        for (clause_idx, mut phase1_data) in phase1_data_by_clause.into_iter().enumerate() {
+            if phase1_data.is_empty() {
                 continue;
             }
             let clause = &group.clauses[clause_idx];
             let first = &clause.segments[0].simple;
-
-            // Build ElementData for this clause's phase-1 hits. A hit that
-            // died between the AX walk and its snapshot is dropped — it is
-            // not a match any more, and a bare miss is exactly the retry
-            // signal auto-wait polls on (`is_gone_ax_element`); every other
-            // failure propagates (tenet 1).
-            let mut phase1_data: Vec<(usize, AXUIElementRef, ElementData)> =
-                Vec::with_capacity(hits.len());
-            for (pos, ax) in &hits {
-                match self.build_element_data(ax, root_data.pid) {
-                    Ok(data) => phase1_data.push((*pos, ax.as_ptr(), data)),
-                    Err(err) if is_gone_ax_element(&err) => {}
-                    Err(err) => return Err(err),
-                }
-            }
 
             if clause.segments.len() == 1 {
                 // Per-clause `:nth` and limit handling — but we can't apply
@@ -3878,17 +3907,16 @@ impl Provider for MacOSProvider {
 
     fn maximize(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
-        // Native fullscreen is the only macOS window state with a readable
-        // *and* writable attribute; the green button's `AXPress` /
-        // `AXZoomWindow` are toggles with no readable state (see
-        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). A window that already reads
-        // `AXFullScreen=true` is committed and satisfies the verb whatever
-        // the settability probe answers; that is the state a repeated
-        // maximize lands in. Only a window that is not fullscreen and cannot
-        // be set fullscreen is unsupported — resolve that before clearing
-        // `AXMinimized`, so a refused verb makes no partial change (tenet 1).
-        // The settle loop still confirms the state, so a maximize racing an
-        // exit cannot no-op on a stale `true` read.
+        // Native fullscreen is the state `maximize` promises: readable *and*
+        // writable, unlike the green button's toggle-only `AXPress` /
+        // `AXZoomWindow` (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). A window
+        // that already reads `AXFullScreen=true` is committed and satisfies
+        // the verb whatever the settability probe answers; that is the state
+        // a repeated maximize lands in. Only a window that is not fullscreen
+        // and cannot be set fullscreen is unsupported — resolve that before
+        // clearing `AXMinimized`, so a refused verb makes no partial change
+        // (tenet 1). The settle loop still confirms the state, so a maximize
+        // racing an exit cannot no-op on a stale `true` read.
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
         if fullscreen != Some(true) && !is_attr_settable(ax.as_ptr(), "AXFullScreen")? {
             return Err(Error::ActionNotSupported {

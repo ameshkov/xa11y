@@ -118,10 +118,12 @@ surfaceable error, never a silent success.
 ### `Maximize`: native fullscreen is the state
 
 macOS exposes native fullscreen through the `AXFullScreen` attribute, the
-only window state whose value can be both read and written. `Maximize` sets
-it to `true` and `Restore` sets it to `false`. A window that cannot enter
-fullscreen (its `AXFullScreen` is not settable) reports `maximize` as
-`ActionNotSupported`, never a silent no-op.
+only window state behind `Maximize` that can be both read and written.
+`AXMinimized` is readable and writable too, but it is the state `Minimize`
+drives; `AXFullScreen` is what lets `Maximize` and `Restore` be idempotent.
+`Maximize` sets it to `true` and `Restore` sets it to `false`. A window
+that cannot enter fullscreen (its `AXFullScreen` is not settable) reports
+`maximize` as `ActionNotSupported`, never a silent no-op.
 
 The green zoom button is deliberately not used. Its `AXPress` and
 `AXZoomWindow` actions toggle the window, so a second `maximize` would exit

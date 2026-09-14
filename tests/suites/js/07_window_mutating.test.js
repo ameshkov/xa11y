@@ -169,13 +169,15 @@ async function windowReadsMaximized(app) {
   // reports the native fullscreen state as `fullscreen` (its `maximized`
   // stays null). Both are checked so the assertion is portable.
   //
-  // null while no window advertising `maximize` is enumerable: the
-  // transition transiently removes the real window, and reading that absence
-  // as "restored" would let the restore wait below succeed on a window that
-  // is merely mid-transition.
+  // null while the state is unknown: no window advertising `maximize` is
+  // enumerable (the transition transiently removes the real window), or
+  // neither getter answered. Boolean(null) would read that as "restored" and
+  // let the state waits below pass without observing anything.
   const win = await windowAdvertising(app, 'maximize');
   if (!win) return null;
-  return Boolean(win.maximized) || Boolean(win.fullscreen);
+  if (win.maximized === true || win.fullscreen === true) return true;
+  if (win.maximized === false || win.fullscreen === false) return false;
+  return null;
 }
 
 test('a window that advertises maximize is maximized and restored', async () => {
