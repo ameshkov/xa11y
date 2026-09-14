@@ -647,7 +647,10 @@ fn ax_windows(element: AXUIElementRef) -> Result<Vec<AXElement>> {
 /// listing or a selector walk from failing wholesale on churn. Every other
 /// AXError stays a real platform failure and propagates (tenet 1); only this
 /// exact code is the "no longer exists" answer. The menu-bar listing makes
-/// the same distinction for its probe (see `ShellSurfaceKind::MenuBar`).
+/// the same distinction for its probe (see `ShellSurfaceKind::MenuBar`), and
+/// the fullscreen settle snapshot applies it too — there the invalidated
+/// object means "sample again", while every other read failure is returned
+/// (see `app_window_fullscreen_snapshot`).
 fn is_gone_ax_element(err: &Error) -> bool {
     matches!(
         err,
@@ -1557,63 +1560,86 @@ struct WindowFullscreenSample {
     size: (f64, f64),
     fullscreen: bool,
     main: bool,
-    /// `IsAttributeSettable(AXFullScreen)`. Reads `false` while an entry
-    /// transition is running, which is what tells that transient `false`
-    /// apart from a genuinely restored window (see
-    /// [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+    /// `IsAttributeSettable(AXFullScreen)`. A genuine restore reads `false`
+    /// *and* settable; the bare value alone never commits, so an entry
+    /// transition that reports `false` before it commits cannot be mistaken
+    /// for a restored window (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
     settable: bool,
+    /// Whether this sample is the window the verb targets.
+    ///
+    /// The settle promise is the *target's* state: a sibling window's
+    /// fullscreen state is not evidence for this verb. Matched with
+    /// [`safe_cf_equal`], which compares the underlying accessibility object,
+    /// so the freshly enumerated window still matches the cached reference
+    /// after the transition recreates it.
+    is_target: bool,
 }
 
 /// Snapshot the app's windows once, for one settle sample.
 ///
 /// Returns `Ok(Some(..))` when every window's read succeeded, `Ok(None)` when
-/// the app did not answer or some window's attribute read failed — the
-/// transition is in flight, so the snapshot is not a reliable sample and the
-/// caller keeps waiting (the failure surfaces at the budget deadline via the
-/// tenet-1 error). Absent `AXFullScreen` reads as `false` (a window without a
-/// fullscreen surface is by definition not fullscreen); an absent `AXSize` /
-/// `AXMain` makes the sample unreadable.
+/// a window object was invalidated under us (`kAXErrorInvalidUIElement`) —
+/// the transition is in flight, so the snapshot is not a reliable sample and
+/// the caller keeps polling (the failure surfaces at the budget deadline via
+/// the tenet-1 error). Every *other* read failure propagates immediately: a
+/// wedged app or a malformed answer must not be retried into a generic
+/// timeout (tenet 1). Only the invalidated-object code is churn, the same
+/// rule the enumerating callers apply ([`is_gone_ax_element`]).
+///
+/// Absent `AXFullScreen` reads as `false` (a window without a fullscreen
+/// surface is by definition not fullscreen); an absent `AXSize` / `AXMain`
+/// makes the sample unreadable.
+///
+/// `target` is the window the verb was invoked on; the sample it matches is
+/// tagged [`WindowFullscreenSample::is_target`] so the settle check can read
+/// the *target's* state rather than an app-wide aggregate.
 fn app_window_fullscreen_snapshot(
     app: AXUIElementRef,
+    target: AXUIElementRef,
     action: &str,
     role: Role,
 ) -> Result<Option<Vec<WindowFullscreenSample>>> {
-    // A transient `kAXErrorCannotComplete` from the app mid-transition is part
-    // of the churn the caller wants to wait out, not a verdict: an unreadable
-    // sample resets the settle streak and the deadline error governs.
     let windows = match ax_windows(app) {
         Ok(w) => w,
-        Err(_) => return Ok(None),
+        Err(err) if is_gone_ax_element(&err) => return Ok(None),
+        Err(err) => return Err(err),
     };
     let mut samples = Vec::with_capacity(windows.len());
     for window in &windows {
         let fullscreen = match read_fullscreen_state(window.as_ptr(), action, role) {
             Ok(v) => v.unwrap_or(false),
-            Err(_) => return Ok(None),
+            Err(err) if is_gone_ax_element(&err) => return Ok(None),
+            Err(err) => return Err(err),
         };
         let size = match read_size_attr(window.as_ptr(), action, role) {
             Ok(v) => match v {
                 Some(s) => s,
                 None => return Ok(None),
             },
-            Err(_) => return Ok(None),
+            Err(err) if is_gone_ax_element(&err) => return Ok(None),
+            Err(err) => return Err(err),
         };
         let main = match read_bool_attr(window.as_ptr(), "AXMain", action, role) {
             Ok(v) => v.unwrap_or_default(),
-            Err(_) => return Ok(None),
+            Err(err) if is_gone_ax_element(&err) => return Ok(None),
+            Err(err) => return Err(err),
         };
-        // An unreadable settability probe is churn too: a recreated window
-        // transiently refuses the attribute (see
-        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+        // The settability probe is churn under the same rule: an object
+        // invalidated mid-transition answers `kAXErrorInvalidUIElement`, and
+        // any other error is a real failure.
         let settable = match is_attr_settable(window.as_ptr(), "AXFullScreen") {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(err) if is_gone_ax_element(&err) => return Ok(None),
+            Err(err) => return Err(err),
         };
+        let is_target = !target.is_null()
+            && unsafe { safe_cf_equal(window.as_ptr() as CFTypeRef, target as CFTypeRef) };
         samples.push(WindowFullscreenSample {
             size,
             fullscreen,
             main,
             settable,
+            is_target,
         });
     }
     // Round the sizes so a half-point wobble during a resize does not count as
@@ -1629,9 +1655,16 @@ fn app_window_fullscreen_snapshot(
 fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: bool) -> String {
     let fullscreen = samples.iter().filter(|w| w.fullscreen).count();
     let settable = samples.iter().filter(|w| w.settable).count();
+    let target = match samples.iter().find(|w| w.is_target) {
+        Some(w) => format!(
+            "the target window reports AXFullScreen={} (settable={})",
+            w.fullscreen, w.settable
+        ),
+        None => "the target window is not enumerable".to_string(),
+    };
     format!(
         "{} window(s): {fullscreen} report AXFullScreen=true, {settable} report it settable; \
-         waiting for the window to {}",
+         {target}; waiting for the window to {}",
         samples.len(),
         if want {
             "enter fullscreen"
@@ -1647,10 +1680,14 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
 /// `want` is the state the verb promises: `true` after `maximize`, `false`
 /// after `restore`. The wait succeeds once the desired state holds for
 /// [`WINDOW_FULLSCREEN_SETTLE_SAMPLES`] consecutive identical samples of the
-/// app's whole window set. The wait is application-level, not element-level,
-/// on purpose: the transition can recreate the window object (see
-/// [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]), so a cached element handle keeps
-/// reading stale state while the app itself has already settled.
+/// app's whole window set. The snapshot is application-level because the
+/// transition can recreate the window object and drop it out of `AXWindows`
+/// (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]), but the state that counts is
+/// the *target* window's own sample
+/// ([`WindowFullscreenSample::is_target`]): an app can have several windows,
+/// and a sibling's fullscreen state is not this verb's promise. While the
+/// target is missing from `AXWindows` (mid-recreation, or on another Space),
+/// its cached handle is read directly instead.
 ///
 /// A set that lands while the previous transition is still running is
 /// discarded by AppKit rather than queued, so every iteration that has not
@@ -1658,12 +1695,11 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
 /// setting `true` on a fullscreen window is a no-op (verified on AppKit,
 /// WebKit and Chromium windows).
 ///
-/// For `want=false` a `false` read alone is not the promise: while an *entry*
-/// transition is running the attribute transiently reads `false` and is not
-/// settable, and committing on that read would report a successful restore on
-/// a window that ends up fullscreen. The target element must both read
-/// `AXFullScreen=false` and answer `IsAttributeSettable=true` — the state a
-/// genuinely restored window is in.
+/// For `want=false` the target's sample must answer both
+/// `AXFullScreen=false` and `IsAttributeSettable=true`. A bare `false` is not
+/// the promise: an entry transition can report `false` before it commits, and
+/// committing on that read would report a successful restore on a window that
+/// ends up fullscreen.
 ///
 /// Element-level failures during the wait (a recreated window object answers
 /// `kAXErrorInvalidUIElement`) do not end it: the retry is attempted again on
@@ -1682,44 +1718,84 @@ fn settle_window_fullscreen(
     let mut last_observed;
     loop {
         let mut reached = false;
-        match app_window_fullscreen_snapshot(app.as_ptr(), action, role)? {
+        match app_window_fullscreen_snapshot(app.as_ptr(), el_ptr, action, role)? {
             Some(set) => {
-                let any_fullscreen = set.iter().any(|w| w.fullscreen);
+                // The *target* window's own sample, when it is enumerable. A
+                // sibling's state is never this verb's promise: gating on "any
+                // window fullscreen" turns a no-op restore on a normal window
+                // into a timeout while another window of the same app is
+                // fullscreen. `is_target` is a `safe_cf_equal` match, so it
+                // survives the transition recreating the object.
+                let target = set.iter().find(|w| w.is_target);
                 if want {
-                    // The *target* window must be the one fullscreen — an app
-                    // can have several windows, and another window's state is
-                    // not this verb's promise. A read error is the window
-                    // object being recreated mid-transition; the app-level
-                    // snapshot is then the only readable evidence.
-                    reached = match read_fullscreen_state(el_ptr, action, role) {
-                        Ok(Some(true)) => true,
-                        Err(_) => any_fullscreen,
-                        _ => false,
+                    // The fresh sample is the evidence; while the target is
+                    // missing from `AXWindows` (mid-recreation) the cached
+                    // handle is read directly, and a sibling can never
+                    // satisfy the promise in its place.
+                    reached = match target {
+                        Some(sample) => {
+                            last_observed = describe_window_fullscreen_sample(&set, want);
+                            sample.fullscreen
+                        }
+                        None => match read_fullscreen_state(el_ptr, action, role) {
+                            Ok(Some(true)) => {
+                                last_observed = describe_window_fullscreen_sample(&set, want);
+                                true
+                            }
+                            Ok(state) => {
+                                last_observed = format!(
+                                    "{}; the cached target handle reads AXFullScreen={state:?}",
+                                    describe_window_fullscreen_sample(&set, want)
+                                );
+                                false
+                            }
+                            Err(err) => {
+                                last_observed = format!(
+                                    "{}; the cached target handle could not be read: {err}",
+                                    describe_window_fullscreen_sample(&set, want)
+                                );
+                                false
+                            }
+                        },
                     };
-                    last_observed = describe_window_fullscreen_sample(&set, want);
-                } else if any_fullscreen {
-                    last_observed = describe_window_fullscreen_sample(&set, want);
                 } else {
-                    match (
-                        read_fullscreen_state(el_ptr, action, role),
-                        is_attr_settable(el_ptr, "AXFullScreen"),
-                    ) {
-                        (Ok(Some(false)), Ok(true)) => {
+                    match target {
+                        // A `false` read only commits together with
+                        // `IsAttributeSettable=true`; a sibling fullscreen
+                        // window does not block a target that already holds
+                        // both.
+                        Some(sample) if !sample.fullscreen && sample.settable => {
                             reached = true;
                             last_observed = describe_window_fullscreen_sample(&set, want);
                         }
-                        (Ok(state), Ok(settable)) => {
-                            last_observed = format!(
-                                "no window reports fullscreen, but the target element reads \
-                                 AXFullScreen={state:?} (settable={settable})"
-                            );
+                        Some(_) => {
+                            last_observed = describe_window_fullscreen_sample(&set, want);
                         }
-                        (Err(err), _) | (_, Err(err)) => {
-                            last_observed = format!(
-                                "no window reports fullscreen, but the target element could \
-                                 not be read: {err}"
-                            );
-                        }
+                        // The target is not enumerable: its cached handle is
+                        // the remaining evidence. No app-level fallback — a
+                        // sibling's fullscreen state must not decide this
+                        // verb.
+                        None => match (
+                            read_fullscreen_state(el_ptr, action, role),
+                            is_attr_settable(el_ptr, "AXFullScreen"),
+                        ) {
+                            (Ok(Some(false)), Ok(true)) => {
+                                reached = true;
+                                last_observed = describe_window_fullscreen_sample(&set, want);
+                            }
+                            (Ok(state), Ok(settable)) => {
+                                last_observed = format!(
+                                    "the target window is not enumerable and reads \
+                                     AXFullScreen={state:?} (settable={settable})"
+                                );
+                            }
+                            (Err(err), _) | (_, Err(err)) => {
+                                last_observed = format!(
+                                    "the target window is not enumerable and could not be \
+                                     read: {err}"
+                                );
+                            }
+                        },
                     }
                 }
                 if reached && previous.as_deref() == Some(set.as_slice()) {
@@ -1729,9 +1805,9 @@ fn settle_window_fullscreen(
                 }
                 previous = Some(set);
             }
-            // An unreadable window is transition churn, not a settled state;
-            // note it so a *stable* set after it can never be mistaken for
-            // persistence.
+            // A window object that was invalidated under us is transition
+            // churn, not a settled state; note it so a *stable* set after it
+            // can never be mistaken for persistence.
             None => {
                 streak = 0;
                 previous = None;
@@ -3805,16 +3881,14 @@ impl Provider for MacOSProvider {
         // Native fullscreen is the only macOS window state with a readable
         // *and* writable attribute; the green button's `AXPress` /
         // `AXZoomWindow` are toggles with no readable state (see
-        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). An already-fullscreen window
-        // satisfies the verb whatever the settability probe answers: while
-        // the entry transition runs the attribute transiently reads `false`
-        // *and* not settable, which is exactly when a repeated maximize
-        // arrives (the probe answered `ActionNotSupported` for a window the
-        // settle then found fullscreen). Only a window that is not fullscreen
-        // and cannot be set fullscreen is unsupported — resolve that before
-        // clearing `AXMinimized`, so a refused verb makes no partial change
-        // (tenet 1). The settle loop still confirms the state, so a maximize
-        // racing an exit cannot no-op on a stale `true` read.
+        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). A window that already reads
+        // `AXFullScreen=true` is committed and satisfies the verb whatever
+        // the settability probe answers; that is the state a repeated
+        // maximize lands in. Only a window that is not fullscreen and cannot
+        // be set fullscreen is unsupported — resolve that before clearing
+        // `AXMinimized`, so a refused verb makes no partial change (tenet 1).
+        // The settle loop still confirms the state, so a maximize racing an
+        // exit cannot no-op on a stale `true` read.
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
         if fullscreen != Some(true) && !is_attr_settable(ax.as_ptr(), "AXFullScreen")? {
             return Err(Error::ActionNotSupported {
@@ -3842,7 +3916,10 @@ impl Provider for MacOSProvider {
         // Restore clears the minimized state and the fullscreen state. A
         // window supports restore if either state is reachable: `AXMinimized`
         // settable or `AXFullScreen` settable. Each clear is attempted only
-        // when applicable (a missing attribute would no-op).
+        // when applicable (a missing attribute would no-op). These are
+        // capability probes, not state reads: only an explicit `false` from
+        // both refuses the verb, and a failed probe propagates as a platform
+        // error rather than being read as unsupported (tenet 1).
         let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
         let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
         if !minimized_settable && !fullscreen_settable {
@@ -4518,6 +4595,36 @@ mod tests {
         // maximize/restore idempotency is about (tenet 1).
         let result = settle_window_fullscreen(std::ptr::null(), true, "maximize", Role::Window);
         assert!(matches!(result, Err(Error::Platform { .. })));
+    }
+
+    #[test]
+    fn describe_window_fullscreen_sample_names_the_target() {
+        let sample = |is_target: bool, fullscreen: bool, settable: bool| WindowFullscreenSample {
+            size: (0.0, 0.0),
+            fullscreen,
+            main: false,
+            settable,
+            is_target,
+        };
+        // A fullscreen *sibling* must not stand in for the target's state in
+        // the timeout diagnosis: the target clause is what makes the message
+        // actionable, and the aggregate counts alone would read as if the
+        // target were the fullscreen one.
+        let described = describe_window_fullscreen_sample(
+            &[sample(false, true, true), sample(true, false, true)],
+            false,
+        );
+        assert!(
+            described.contains("the target window reports AXFullScreen=false (settable=true)"),
+            "{described}"
+        );
+        // The target can be transiently absent from `AXWindows`; the
+        // diagnosis must say so rather than imply a target state.
+        let absent = describe_window_fullscreen_sample(&[sample(false, false, false)], false);
+        assert!(
+            absent.contains("the target window is not enumerable"),
+            "{absent}"
+        );
     }
 
     #[test]
