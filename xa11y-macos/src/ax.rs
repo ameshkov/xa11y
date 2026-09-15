@@ -4070,6 +4070,19 @@ impl Provider for MacOSProvider {
         }
     }
 
+    /// Release the cache entry behind an element core narrowed away.
+    ///
+    /// `get_children` hands core elements it built with their cache entry
+    /// retained (it has no way to know which the caller keeps), so a child
+    /// core collects and then drops — unmatched, deduplicated, `:nth`-ed
+    /// out, truncated by `limit`, or abandoned with a failed sibling — stays
+    /// in `handle_cache` for the process lifetime unless this evicts it. The
+    /// handle is minted per snapshot (`cache_element`), so the element core
+    /// is discarding is its only holder.
+    fn discard_element(&self, element: &ElementData) {
+        self.evict_cached(element.handle);
+    }
+
     /// Enumerate the macOS shell surfaces: the frontmost application's menu
     /// bar, each process's status items, the Dock, Finder's desktop, and
     /// native status-item menus while they are open.
@@ -5198,6 +5211,27 @@ mod tests {
         assert!(
             sink.evicted().is_empty(),
             "a released element's handle must stay resolvable"
+        );
+    }
+
+    #[test]
+    fn discard_element_evicts_the_handle() {
+        let provider = MacOSProvider::new().expect("provider construction");
+        // A null AXUIElement stands in for a live one: the cache stores and
+        // resolves it either way, and dropping it is a no-op.
+        let handle = provider.cache_element(AXElement::from_owned(std::ptr::null_mut()));
+        let mut data = ElementData::for_role(Role::Unknown);
+        data.handle = handle;
+        assert!(
+            provider.get_cached(handle).is_ok(),
+            "precondition: the minted handle is cached"
+        );
+
+        provider.discard_element(&data);
+
+        assert!(
+            provider.get_cached(handle).is_err(),
+            "core's discard hook must evict the handle it is handed"
         );
     }
 

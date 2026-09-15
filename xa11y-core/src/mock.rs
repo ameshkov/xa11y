@@ -101,6 +101,9 @@ pub struct MockProvider {
     /// snapshots own no platform resources, so this exists to make the
     /// lifecycle contract observable in unit tests.
     discarded: Mutex<Vec<u64>>,
+    /// Handle whose `get_children` must fail, to exercise core's error paths.
+    /// `None` (the default) leaves the tree fully readable.
+    fail_children: Mutex<Option<u64>>,
 }
 
 impl MockProvider {
@@ -134,6 +137,20 @@ impl MockProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Make `get_children` on `handle` fail until [`MockProvider::resume_children`].
+    ///
+    /// Callers that enumerate the tree themselves (`narrow_multi_segment`,
+    /// `find_elements_group`) must release what they built before propagating
+    /// the error; this knob is how a unit test reaches that path.
+    pub fn fail_children(&self, handle: u64) {
+        *self.fail_children.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Undo [`MockProvider::fail_children`].
+    pub fn resume_children(&self) {
+        *self.fail_children.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn record(&self, el: &ElementData, action: &str, data: Option<String>) -> Result<()> {
@@ -214,6 +231,13 @@ impl Provider for MockProvider {
             }
             Some(el) => {
                 let idx = el.handle as usize;
+                if *self.fail_children.lock().unwrap_or_else(|e| e.into_inner()) == Some(el.handle)
+                {
+                    return Err(Error::Platform {
+                        code: -1,
+                        message: format!("injected get_children failure for handle {}", el.handle),
+                    });
+                }
                 // A closed element is gone (see `closed`): resolving its subtree
                 // through a stale handle would fake a live window that real
                 // providers have dropped.
@@ -931,6 +955,7 @@ pub fn build_provider() -> Arc<MockProvider> {
         nodes: Mutex::new(nodes),
         actions: Mutex::new(Vec::new()),
         discarded: Mutex::new(Vec::new()),
+        fail_children: Mutex::new(None),
     })
 }
 

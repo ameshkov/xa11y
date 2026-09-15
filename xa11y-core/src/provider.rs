@@ -275,10 +275,20 @@ pub trait Provider: Send + Sync {
         let mut ours = false;
         for segment in segments {
             let mut next_candidates = Vec::new();
+            // A provider call that fails mid-segment leaves the candidates
+            // collected before it in hand; they reach no caller, so they are
+            // released below rather than dropped by `?`.
+            let mut segment_err: Option<Error> = None;
             for candidate in &candidates {
                 match segment.combinator {
                     Combinator::Child => {
-                        let children = self.get_children(Some(candidate))?;
+                        let children = match self.get_children(Some(candidate)) {
+                            Ok(children) => children,
+                            Err(err) => {
+                                segment_err = Some(err);
+                                break;
+                            }
+                        };
                         for child in children {
                             if matches_simple(&child, &segment.simple) {
                                 next_candidates.push(child);
@@ -297,12 +307,30 @@ pub trait Provider: Send + Sync {
                                 simple: segment.simple.clone(),
                             }],
                         };
-                        let mut sub_results =
-                            self.find_elements(candidate, &sub_selector, None, Some(max_depth))?;
-                        next_candidates.append(&mut sub_results);
+                        match self.find_elements(candidate, &sub_selector, None, Some(max_depth)) {
+                            Ok(mut sub_results) => next_candidates.append(&mut sub_results),
+                            Err(err) => {
+                                segment_err = Some(err);
+                                break;
+                            }
+                        }
                     }
                     Combinator::Root => unreachable!(),
                 }
+            }
+            if let Some(err) = segment_err {
+                // Everything this segment built so far, and — past the first
+                // round — the input candidates themselves, reaches no caller
+                // when the pass aborts: release them before returning.
+                for dropped in next_candidates.drain(..) {
+                    self.discard_element(&dropped);
+                }
+                if ours {
+                    for dropped in candidates.drain(..) {
+                        self.discard_element(&dropped);
+                    }
+                }
+                return Err(err);
             }
             // The input candidates are not carried forward: a node the
             // remaining segments did not keep reaches no caller. The first
@@ -727,5 +755,43 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name.as_deref(), Some("Back"));
         assert_eq!(provider.discarded(), vec![forward.handle]);
+    }
+
+    #[test]
+    fn narrowing_releases_what_it_built_when_a_segment_fails() {
+        let provider = build_provider();
+        let (window, toolbar, content) = window_and_children(&provider);
+        let toolbar_children = provider
+            .get_children(Some(&toolbar))
+            .expect("toolbar children");
+        let back = toolbar_children
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Back"))
+            .expect("Back button")
+            .handle;
+        let forward = toolbar_children
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Forward"))
+            .expect("Forward button")
+            .handle;
+
+        // The second round lists the toolbar's buttons, then fails on the
+        // content group: the two buttons it already collected, plus the two
+        // first-round candidates it was iterating, all reach no caller.
+        provider.fail_children(content.handle);
+        let group = SelectorGroup::parse("window > * > button").expect("test selector parses");
+        let err = provider
+            .narrow_multi_segment(vec![window], &group.clauses[0].segments[1..], 10, None)
+            .expect_err("the injected child-listing failure propagates");
+
+        assert!(
+            matches!(err, Error::Platform { .. }),
+            "the injected failure must surface unchanged, got {err:?}"
+        );
+        assert_eq!(
+            provider.discarded(),
+            vec![back, forward, toolbar.handle, content.handle],
+            "a failed segment must release what it built, not strand it"
+        );
     }
 }
