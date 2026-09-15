@@ -342,79 +342,72 @@ mod tests {
             None
         }
 
+        /// [`main_window`] for `verb`, polled out of the transition churn: a
+        /// fullscreen transition transiently removes the real window from
+        /// `App.windows()`, so a one-shot lookup right after a verb reads the
+        /// absence as "the window is gone".
+        fn wait_for_window(app: &App, verb: &str) -> Element {
+            let what = if verb == "maximize" {
+                "a maximizable window"
+            } else {
+                "a restorable window"
+            };
+            wait_until(Duration::from_secs(5), what, || main_window(app, verb))
+        }
+
+        /// Wait until the window advertising `verb` reports `want` as its
+        /// fullscreen state.
+        ///
+        /// `wait_until` returns on any `Some`, so the predicate filters `want`
+        /// explicitly; [`fullscreen`] answers `None` while the target is
+        /// transiently absent, and that unknown must not be read as the
+        /// opposite verdict.
+        fn wait_for_fullscreen(app: &App, verb: &str, want: bool, what: &str) {
+            wait_until(Duration::from_secs(5), what, || {
+                fullscreen(app, verb)
+                    .filter(|fullscreen| *fullscreen == want)
+                    .map(|_| ())
+            });
+        }
+
         let app = h::app_root();
-        let win = wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app, "maximize")
-        });
+        let win = wait_for_window(&app, "maximize");
         let _guard = MaximizeGuard { win: win.clone() };
 
         // maximize commits.
         win.maximize().expect("maximize must succeed");
-        // `wait_until` returns on any `Some`, so filter for the promised
-        // state: a bare `fullscreen(&app, "maximize")` would also accept
-        // `Some(false)`.
-        wait_until(
-            Duration::from_secs(5),
-            "window to report fullscreen",
-            || {
-                fullscreen(&app, "maximize")
-                    .filter(|fullscreen| *fullscreen)
-                    .map(|_| ())
-            },
-        );
+        wait_for_fullscreen(&app, "maximize", true, "window to report fullscreen");
 
         // A repeated maximize must not toggle the window back out. Give the
         // (would-be) toggle time to land before asserting the state is still
         // fullscreen — the exit transition is what the old zoom-button press
         // started.
-        wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app, "maximize")
-        })
-        .maximize()
-        .expect("repeated maximize must succeed");
+        wait_for_window(&app, "maximize")
+            .maximize()
+            .expect("repeated maximize must succeed");
         std::thread::sleep(Duration::from_secs(2));
-        // `fullscreen` answers `None` while the target is transiently absent,
-        // so poll for the promise instead of collapsing the unknown to
-        // `false`: a transition that outlasts the sleep must not read as a
-        // failed no-op.
-        wait_until(
-            Duration::from_secs(5),
+        wait_for_fullscreen(
+            &app,
+            "maximize",
+            true,
             "the window to remain fullscreen after a second maximize",
-            || {
-                fullscreen(&app, "maximize")
-                    .filter(|fullscreen| *fullscreen)
-                    .map(|_| ())
-            },
         );
 
         // restore commits, and a repeated restore must not re-enter
         // fullscreen.
-        wait_until(Duration::from_secs(5), "a restorable window", || {
-            main_window(&app, "restore")
-        })
-        .restore()
-        .expect("restore must succeed");
-        wait_until(Duration::from_secs(5), "window to report restored", || {
-            fullscreen(&app, "restore")
-                .filter(|fullscreen| !*fullscreen)
-                .map(|_| ())
-        });
-        wait_until(Duration::from_secs(5), "a restorable window", || {
-            main_window(&app, "restore")
-        })
-        .restore()
-        .expect("repeated restore must succeed");
+        wait_for_window(&app, "restore")
+            .restore()
+            .expect("restore must succeed");
+        wait_for_fullscreen(&app, "restore", false, "window to report restored");
+        wait_for_window(&app, "restore")
+            .restore()
+            .expect("repeated restore must succeed");
         std::thread::sleep(Duration::from_secs(2));
-        // As above: poll for the restored state rather than treating the
-        // temporarily absent window as "still fullscreen".
-        wait_until(
-            Duration::from_secs(5),
+        wait_for_fullscreen(
+            &app,
+            "restore",
+            false,
             "the window to remain restored after a second restore",
-            || {
-                fullscreen(&app, "restore")
-                    .filter(|fullscreen| !*fullscreen)
-                    .map(|_| ())
-            },
         );
 
         // maximize -> restore -> maximize -> restore ends where every call
@@ -429,22 +422,18 @@ mod tests {
             // Each step waits for the verb it is about to run: `maximize` and
             // `restore` are advertised independently, so a maximize lookup
             // cannot stand in for a restore call.
-            let (verb, what) = if expected_fullscreen {
-                ("maximize", "a maximizable window")
+            let verb = if expected_fullscreen {
+                "maximize"
             } else {
-                ("restore", "a restorable window")
+                "restore"
             };
-            let w = wait_until(Duration::from_secs(5), what, || main_window(&app, verb));
+            let w = wait_for_window(&app, verb);
             if expected_fullscreen {
                 w.maximize().expect("maximize must succeed");
             } else {
                 w.restore().expect("restore must succeed");
             }
-            wait_until(Duration::from_secs(5), "sequence step to settle", || {
-                fullscreen(&app, verb)
-                    .filter(|fullscreen| *fullscreen == expected_fullscreen)
-                    .map(|_| ())
-            });
+            wait_for_fullscreen(&app, verb, expected_fullscreen, "sequence step to settle");
             std::thread::sleep(Duration::from_millis(1500));
         }
     }

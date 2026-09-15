@@ -92,8 +92,10 @@ Window state reads follow the same split. `minimized`, `maximized`, and
 element is not a window or because the platform cannot report the state.
 macOS reads `minimized` and `fullscreen`
 (`AXMinimized` / `AXFullScreen`) on window-like elements; there is no AX
-attribute for the zoom state, so `maximized` is always `None` on macOS.
-After a `maximize`, `fullscreen` reports the state instead.
+attribute for the zoom state (`AXZoomed` is not declared in the SDK, and live
+windows answer `kAXErrorAttributeUnsupported` for it), so `maximized` is
+always `None` on macOS. After a `maximize`, `fullscreen` reports the state
+instead.
 Windows reads `minimized` and `maximized` from
 `WindowPattern.CurrentWindowVisualState` but cannot report `fullscreen`;
 Linux reads `minimized` from the AT-SPI `ICONIFIED` bit and cannot report
@@ -137,18 +139,13 @@ promises.
 The fullscreen transition is asynchronous and macOS reports transient values
 while it runs: a window entering fullscreen can briefly read
 `AXFullScreen=false`, and a set issued mid-transition is discarded rather
-than queued. On a fullscreen-capable window both verbs poll the
-application's window set and re-issue the absolute set until the promised
-state holds consistently; a transition that never commits fails with a
-timeout error rather than reporting success. A window that is not fullscreen
-and whose `AXFullScreen` is not settable has no fullscreen state to settle,
-so `Restore` only clears `AXMinimized` for it and returns without polling.
-A window that reads fullscreen but cannot clear the state does not advertise
-`restore` at all.
-`maximized` cannot be read on macOS, so the state is reported as
-`fullscreen`. `AXZoomed` matches the AppKit *property* `NSWindow.isZoomed`,
-is not declared in the SDK headers, and live windows answer
-`kAXErrorAttributeUnsupported` for it.
+than queued. The provider polls the window's fullscreen state and re-issues
+the absolute set until the promised state holds; a transition that never
+commits fails with a timeout error rather than reporting success. A window
+that is not fullscreen and whose `AXFullScreen` is not settable has no
+fullscreen state to settle, so `Restore` only clears `AXMinimized` and
+returns without polling. A window that reads fullscreen but cannot clear the
+state does not advertise `restore` at all.
 
 ### SetValue: text vs numeric
 

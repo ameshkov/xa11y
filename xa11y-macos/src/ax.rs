@@ -1501,50 +1501,20 @@ fn activate_owning_app(el_ptr: AXUIElementRef, action: &str, role: Role) -> Resu
 /// The deminiaturize half of `activate` / `maximize`: neither `AXRaise` nor
 /// setting `AXFullScreen` clears `AXMinimized`, so a minimized window must
 /// have its minimized flag cleared first or the verb returns success while
-/// the window stays in the Dock. Error-preserving: only a definitive
-/// unsupported / no-value answer (`RawAttr::Absent`) means "not set"; a
-/// failed or malformed read is a platform error (tenet 1), the same
-/// distinction `restore()` makes.
+/// the window stays in the Dock. Error-preserving through [`read_bool_attr`]:
+/// only a definitive unsupported / no-value answer means "not set"; a failed
+/// or malformed read is a platform error (tenet 1), the same distinction
+/// `restore()` makes.
 fn clear_bool_attr_if_true(
     el_ptr: AXUIElementRef,
     attr_name: &str,
     action: &str,
     role: Role,
-) -> Result<bool> {
-    let was_true = match read_raw_attr(el_ptr, attr_name) {
-        RawAttr::Value(v) => {
-            let is_boolean = unsafe { safe_cf_get_type_id(v) == safe_cf_boolean_get_type_id() };
-            if !is_boolean {
-                unsafe { safe_cf_release(v) };
-                return Err(Error::Platform {
-                    code: -1,
-                    message: format!(
-                        "{attr_name} returned a non-boolean value while running {action} on a \
-                         {}; the state is unknown, not false",
-                        role
-                    ),
-                });
-            }
-            let b = unsafe { safe_cf_boolean_get_value(v) };
-            unsafe { safe_cf_release(v) };
-            b
-        }
-        RawAttr::Absent => false,
-        RawAttr::Unanswered(code) => {
-            return Err(Error::Platform {
-                code: code as i64,
-                message: format!(
-                    "{attr_name} read failed while running {action} on a {} (AXError {code}); \
-                     the state is unknown, not false",
-                    role
-                ),
-            });
-        }
-    };
-    if was_true {
+) -> Result<()> {
+    if read_bool_attr(el_ptr, attr_name, action, role)?.unwrap_or(false) {
         set_bool_attr(el_ptr, attr_name, false, action, role)?;
     }
-    Ok(was_true)
+    Ok(())
 }
 
 /// How long `maximize` / `restore` wait for the fullscreen transition to
@@ -1597,8 +1567,13 @@ const WINDOW_FULLSCREEN_SETTLE_GRACE: Duration = Duration::from_millis(700);
 
 /// Read a boolean AX attribute with the tenet-1 distinction: a failed read is
 /// an error (the state is unknown, not false), an absent / unsupported
-/// attribute is `Ok(None)` — the same distinction `clear_bool_attr_if_true`
-/// draws, and what `read_fullscreen_state` is made of.
+/// attribute is `Ok(None)`.
+///
+/// The one strict reader behind [`read_fullscreen_state`], the
+/// maximize/restore probes, [`clear_bool_attr_if_true`] and the `actions`
+/// advertisement, so a malformed answer cannot be accepted by one surface and
+/// rejected by another (tenet 3). `action` names the operation for the error
+/// text.
 fn read_bool_attr(
     el_ptr: AXUIElementRef,
     attr_name: &str,
@@ -1616,8 +1591,8 @@ fn read_bool_attr(
                 return Err(Error::Platform {
                     code: -1,
                     message: format!(
-                        "{attr_name} returned a non-boolean value while {action} was settling \
-                         the window on a {role}; the state is unknown, not false"
+                        "{attr_name} returned a non-boolean value while handling {action} on a \
+                         {role}; the state is unknown, not false"
                     ),
                 });
             }
@@ -1629,8 +1604,8 @@ fn read_bool_attr(
         RawAttr::Unanswered(code) => Err(Error::Platform {
             code: code as i64,
             message: format!(
-                "{attr_name} read failed while {action} was settling the window on a {role} \
-                 (AXError {code}); the state is unknown, not false"
+                "{attr_name} read failed while handling {action} on a {role} (AXError {code}); \
+                 the state is unknown, not false"
             ),
         }),
     }
@@ -1643,45 +1618,34 @@ fn read_fullscreen_state(el_ptr: AXUIElementRef, action: &str, role: Role) -> Re
     read_bool_attr(el_ptr, "AXFullScreen", action, role)
 }
 
-/// Read one of the two window-state booleans (`AXMinimized` /
-/// `AXFullScreen`) for the `actions` advertisement.
+/// The four window-state readings `maximize` / `restore` and the `actions`
+/// advertisement decide from: the two state booleans and their settability.
 ///
-/// The batch snapshot maps a malformed boolean to `None` — it cannot tell one
-/// from the unsupported-attribute sentinel — but the verb implementations
-/// read these attributes strictly and reject a malformed value. Advertising
-/// from the lossy value would promise a call that deterministically rejects
-/// on the same read (tenet 3), so the advertisement reads the state itself,
-/// with the verb implementations' error distinction.
-fn read_advertised_window_state(
-    element: AXUIElementRef,
-    attr_name: &str,
-    role: Role,
-) -> Result<Option<bool>> {
-    match read_raw_attr(element, attr_name) {
-        RawAttr::Value(v) => {
-            if unsafe { safe_cf_get_type_id(v) } == unsafe { safe_cf_boolean_get_type_id() } {
-                let b = unsafe { safe_cf_boolean_get_value(v) };
-                unsafe { safe_cf_release(v) };
-                Ok(Some(b))
-            } else {
-                unsafe { safe_cf_release(v) };
-                Err(Error::Platform {
-                    code: -1,
-                    message: format!(
-                        "{attr_name} answered a non-boolean value while advertising the window \
-                         actions on a {role}; the state is unknown, not false"
-                    ),
-                })
-            }
-        }
-        RawAttr::Absent => Ok(None),
-        RawAttr::Unanswered(code) => Err(Error::Platform {
-            code: code as i64,
-            message: format!(
-                "{attr_name} read failed while advertising the window actions on a {role} \
-                 (AXError {code}); the state is unknown, not false"
-            ),
-        }),
+/// The settability flags answer "would a write be honored?", not "what is the
+/// state" (see [`is_attr_settable`]). A `false` can mean a negative probe or
+/// "not probed because the decision did not need it": [`maximize`] skips a
+/// probe its predicate already decides, so an irrelevant probe failure cannot
+/// fail the verb. The predicates are written so either reading is safe.
+struct WindowState {
+    minimized: Option<bool>,
+    fullscreen: Option<bool>,
+    minimized_settable: bool,
+    fullscreen_settable: bool,
+}
+
+impl WindowState {
+    /// Probe all four readings strictly: a malformed or failed read is a
+    /// platform error (tenet 1), an absent attribute is `None` / not settable.
+    ///
+    /// The read order matches the verb implementations, so a failure surfaces
+    /// at the same probe as before.
+    fn probe(el_ptr: AXUIElementRef, action: &str, role: Role) -> Result<Self> {
+        Ok(Self {
+            minimized: read_bool_attr(el_ptr, "AXMinimized", action, role)?,
+            fullscreen: read_fullscreen_state(el_ptr, action, role)?,
+            minimized_settable: is_attr_settable(el_ptr, "AXMinimized")?,
+            fullscreen_settable: is_attr_settable(el_ptr, "AXFullScreen")?,
+        })
     }
 }
 
@@ -1693,18 +1657,9 @@ fn read_advertised_window_state(
 /// success while the window stays in the Dock. Shared by the verb
 /// implementation and the `actions` advertisement, so a window that would
 /// honor the call never disappears from `actions` (tenet 3).
-///
-/// `fullscreen_settable` and `minimized_settable` are only consulted when the
-/// caller could not skip the corresponding probe; a `false` stands for "the
-/// state does not need it" as much as for a negative probe.
-fn maximize_supported(
-    minimized: Option<bool>,
-    minimized_settable: bool,
-    fullscreen: Option<bool>,
-    fullscreen_settable: bool,
-) -> bool {
-    (fullscreen == Some(true) || fullscreen_settable)
-        && (minimized != Some(true) || minimized_settable)
+fn maximize_supported(state: &WindowState) -> bool {
+    (state.fullscreen == Some(true) || state.fullscreen_settable)
+        && (state.minimized != Some(true) || state.minimized_settable)
 }
 
 /// Whether `restore` can act on a window: every state that reads `true` must
@@ -1714,15 +1669,10 @@ fn maximize_supported(
 /// restore that never happened) — and at least one state must be reachable.
 /// Shared by the verb implementation and the `actions` advertisement, so an
 /// advertised `restore` always matches the dispatch (tenet 3).
-fn restore_supported(
-    minimized: Option<bool>,
-    fullscreen: Option<bool>,
-    minimized_settable: bool,
-    fullscreen_settable: bool,
-) -> bool {
-    (minimized != Some(true) || minimized_settable)
-        && (fullscreen != Some(true) || fullscreen_settable)
-        && (minimized_settable || fullscreen_settable)
+fn restore_supported(state: &WindowState) -> bool {
+    (state.minimized != Some(true) || state.minimized_settable)
+        && (state.fullscreen != Some(true) || state.fullscreen_settable)
+        && (state.minimized_settable || state.fullscreen_settable)
 }
 
 /// Read the window's `AXSize` as `(width, height)`; the same error
@@ -1749,11 +1699,13 @@ fn read_size_attr(el_ptr: AXUIElementRef, action: &str, role: Role) -> Result<Op
 }
 
 /// The window data one settle sample is built from.
+///
+/// The derived equality is what the settle run compares: a sample that differs
+/// from the previous one breaks the identical-run streak (see [`SettleRun`]).
 #[derive(Clone, PartialEq, Debug)]
 struct WindowFullscreenSample {
     size: (f64, f64),
     fullscreen: bool,
-    main: bool,
     /// `IsAttributeSettable(AXFullScreen)`. A genuine restore reads `false`
     /// *and* settable, but so does an entry transient (the transient
     /// withdraws the value, not the capability), so the pair is the state the
@@ -1782,8 +1734,8 @@ struct WindowFullscreenSample {
 /// rule the enumerating callers apply ([`is_gone_ax_element`]).
 ///
 /// Absent `AXFullScreen` reads as `false` (a window without a fullscreen
-/// surface is by definition not fullscreen); an absent `AXSize` / `AXMain`
-/// makes the sample unreadable.
+/// surface is by definition not fullscreen); an absent `AXSize` makes the
+/// sample unreadable.
 ///
 /// `target` is the window the verb was invoked on; the sample it matches is
 /// tagged [`WindowFullscreenSample::is_target`] so the settle check can read
@@ -1814,11 +1766,6 @@ fn app_window_fullscreen_snapshot(
             Err(err) if is_gone_ax_element(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
-        let main = match read_bool_attr(window.as_ptr(), "AXMain", action, role) {
-            Ok(v) => v.unwrap_or_default(),
-            Err(err) if is_gone_ax_element(&err) => return Ok(None),
-            Err(err) => return Err(err),
-        };
         // The settability probe is churn under the same rule: an object
         // invalidated mid-transition answers `kAXErrorInvalidUIElement`, and
         // any other error is a real failure.
@@ -1832,7 +1779,6 @@ fn app_window_fullscreen_snapshot(
         samples.push(WindowFullscreenSample {
             size,
             fullscreen,
-            main,
             settable,
             is_target,
         });
@@ -1868,6 +1814,269 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
             "leave fullscreen"
         },
     )
+}
+
+/// The answer one attribute read gave on a single settle poll.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum AttrProbe {
+    /// The attribute answered a boolean.
+    Value(bool),
+    /// The attribute does not exist on this window (no such surface).
+    Absent,
+    /// The object was invalidated mid-transition (`kAXErrorInvalidUIElement`):
+    /// churn to retry, not a state. Carries the error for the timeout
+    /// diagnosis.
+    Churn(String),
+}
+
+impl AttrProbe {
+    /// The boolean the probe answered, if any.
+    fn value(&self) -> Option<bool> {
+        match self {
+            AttrProbe::Value(v) => Some(*v),
+            AttrProbe::Absent | AttrProbe::Churn(_) => None,
+        }
+    }
+}
+
+/// Fold a boolean-attribute read into a probe: the invalidated-object code is
+/// transition churn, every other failure propagates (tenet 1).
+fn probe_bool(result: Result<Option<bool>>) -> Result<AttrProbe> {
+    match result {
+        Ok(Some(v)) => Ok(AttrProbe::Value(v)),
+        Ok(None) => Ok(AttrProbe::Absent),
+        Err(err) if is_gone_ax_element(&err) => Ok(AttrProbe::Churn(err.to_string())),
+        Err(err) => Err(err),
+    }
+}
+
+/// Fold a settability read into a probe. The probe answers a bare bool, so it
+/// cannot be absent.
+fn probe_settable(result: Result<bool>) -> Result<AttrProbe> {
+    match result {
+        Ok(v) => Ok(AttrProbe::Value(v)),
+        Err(err) if is_gone_ax_element(&err) => Ok(AttrProbe::Churn(err.to_string())),
+        Err(err) => Err(err),
+    }
+}
+
+/// What one poll learned about the verb's target window.
+enum TargetSample {
+    /// The target's own sample from the app's enumerated window set.
+    Enumerated(WindowFullscreenSample),
+    /// The target was not in the enumerated set; its cached handle answered.
+    /// `settable` is `None` when the verb did not need the probe.
+    Cached {
+        fullscreen: AttrProbe,
+        settable: Option<AttrProbe>,
+    },
+}
+
+/// Observe the target window once: its fresh sample when it is in `set` (the
+/// transition can recreate the object, and the enumerated copy is the live
+/// one), otherwise its cached handle.
+fn observe_target(
+    set: &[WindowFullscreenSample],
+    target: AXUIElementRef,
+    want: bool,
+    action: &str,
+    role: Role,
+) -> Result<TargetSample> {
+    if let Some(sample) = set.iter().find(|w| w.is_target) {
+        return Ok(TargetSample::Enumerated(sample.clone()));
+    }
+    let fullscreen = probe_bool(read_fullscreen_state(target, action, role))?;
+    // `restore` needs the settability to tell a committed clear from the
+    // entry transient; `maximize` needs it only to skip a write on a state
+    // the window refuses to write.
+    let settable = if !want || fullscreen == AttrProbe::Value(true) {
+        Some(probe_settable(is_attr_settable(target, "AXFullScreen"))?)
+    } else {
+        None
+    };
+    Ok(TargetSample::Cached {
+        fullscreen,
+        settable,
+    })
+}
+
+/// Evaluate a target sample against the verb's promise: whether the promised
+/// state holds, and the settability to consult before re-issuing the set
+/// (only meaningful when the promise holds).
+fn evaluate_sample(want: bool, sample: &TargetSample) -> (bool, Option<bool>) {
+    match sample {
+        TargetSample::Enumerated(sample) => (
+            if want {
+                sample.fullscreen
+            } else {
+                // The restore promise is the pair: a bare `false` is also
+                // what the entry transient reports.
+                !sample.fullscreen && sample.settable
+            },
+            Some(sample.settable),
+        ),
+        TargetSample::Cached {
+            fullscreen,
+            settable,
+        } => {
+            let state = fullscreen.value();
+            let settable = settable.as_ref().and_then(AttrProbe::value);
+            let reached = if want {
+                // A churned settability probe has to be retried: it decides
+                // whether the no-op write may be skipped.
+                state == Some(true) && settable.is_some()
+            } else {
+                state == Some(false) && settable == Some(true)
+            };
+            (reached, settable)
+        }
+    }
+}
+
+/// One poll of the app's window set and the target's state in it.
+enum Poll {
+    /// The app did not answer a readable sample — an invalidated object
+    /// mid-transition; the next poll retries.
+    Unreadable,
+    /// The app answered; `set` is its full window set and `target` the
+    /// target's own state.
+    Readable {
+        set: Vec<WindowFullscreenSample>,
+        target: TargetSample,
+    },
+}
+
+impl Poll {
+    /// Whether the target's state came from the enumerated set this poll.
+    fn target_enumerated(&self) -> bool {
+        matches!(
+            self,
+            Poll::Readable {
+                target: TargetSample::Enumerated(_),
+                ..
+            }
+        )
+    }
+}
+
+/// Poll the target's state, preferring its fresh sample from the app's window
+/// set to the cached handle.
+fn poll_window_fullscreen(
+    app: AXUIElementRef,
+    target: AXUIElementRef,
+    want: bool,
+    action: &str,
+    role: Role,
+) -> Result<Poll> {
+    let Some(set) = app_window_fullscreen_snapshot(app, target, action, role)? else {
+        return Ok(Poll::Unreadable);
+    };
+    let target = observe_target(&set, target, want, action, role)?;
+    Ok(Poll::Readable { set, target })
+}
+
+/// The confirmation bookkeeping behind [`settle_window_fullscreen`]: the
+/// promise counts as committed once the desired state held for consecutive
+/// identical samples of the app's window set and either a transition boundary
+/// was seen or the run spans [`WINDOW_FULLSCREEN_SETTLE_GRACE`].
+#[derive(Default)]
+struct SettleRun {
+    /// The previous readable window set; a changed set breaks the streak.
+    previous: Option<Vec<WindowFullscreenSample>>,
+    /// Consecutive identical readable samples that held the promise.
+    streak: usize,
+    /// When the current streak started.
+    held_since: Option<Instant>,
+    /// A transition boundary was observed: an unreadable sample, or a target
+    /// state away from the promise. After one, the streak alone confirms.
+    boundary_seen: bool,
+    /// When the cached handle took over as the evidence (the target is off
+    /// the enumerated set). A cached read cannot advance the streak — the
+    /// remaining set is the transition's shell — so it confirms on its own
+    /// grace run.
+    cached_held_since: Option<Instant>,
+}
+
+impl SettleRun {
+    /// Fold one poll in. `reached` is [`evaluate_sample`]'s verdict.
+    fn observe(&mut self, poll: &Poll, reached: bool, now: Instant) {
+        if let Poll::Readable { set, .. } = poll {
+            if reached
+                && poll.target_enumerated()
+                && self.previous.as_deref() == Some(set.as_slice())
+            {
+                if self.streak == 0 {
+                    self.held_since = Some(now);
+                }
+                self.streak += 1;
+                self.cached_held_since = None;
+            } else if reached && !poll.target_enumerated() {
+                self.cached_held_since.get_or_insert(now);
+                self.streak = 0;
+                self.held_since = None;
+            } else {
+                self.reset();
+            }
+            self.previous = Some(set.clone());
+        } else {
+            self.reset();
+            self.previous = None;
+        }
+        if !reached {
+            self.boundary_seen = true;
+        }
+    }
+
+    /// Whether the promise is confirmed as committed.
+    fn confirmed(&self, now: Instant) -> bool {
+        let cached = self
+            .cached_held_since
+            .is_some_and(|since| now.duration_since(since) >= WINDOW_FULLSCREEN_SETTLE_GRACE);
+        cached || settle_confirmed(self.streak, self.boundary_seen, self.held_since, now)
+    }
+
+    fn reset(&mut self) {
+        self.streak = 0;
+        self.held_since = None;
+        self.cached_held_since = None;
+    }
+}
+
+/// Render one poll for the timeout diagnosis (tenet 6: only the failure path
+/// formats it).
+fn describe_poll(poll: &Poll, want: bool) -> String {
+    match poll {
+        Poll::Unreadable => "the app did not answer a readable sample of its windows".to_string(),
+        Poll::Readable { set, target } => {
+            let set = describe_window_fullscreen_sample(set, want);
+            match target {
+                // The aggregate description already names the target's state.
+                TargetSample::Enumerated(_) => set,
+                TargetSample::Cached {
+                    fullscreen,
+                    settable,
+                } => format!(
+                    "{set}; the cached target handle {}",
+                    describe_cached_target(fullscreen, settable.as_ref())
+                ),
+            }
+        }
+    }
+}
+
+/// The cached handle's clause of the timeout diagnosis.
+fn describe_cached_target(fullscreen: &AttrProbe, settable: Option<&AttrProbe>) -> String {
+    match (fullscreen, settable) {
+        (AttrProbe::Churn(err), _) => format!("could not be read: {err}"),
+        (AttrProbe::Absent, _) => "has no AXFullScreen attribute".to_string(),
+        (AttrProbe::Value(state), Some(AttrProbe::Value(settable))) => {
+            format!("reads AXFullScreen={state} (settable={settable})")
+        }
+        (AttrProbe::Value(state), Some(AttrProbe::Churn(err))) => {
+            format!("reads AXFullScreen={state} but its settability probe was invalidated: {err}")
+        }
+        (AttrProbe::Value(state), _) => format!("reads AXFullScreen={state}"),
+    }
 }
 
 /// Wait for the fullscreen transition to commit or clear, re-issuing the
@@ -1921,258 +2130,41 @@ fn settle_window_fullscreen(
 ) -> Result<()> {
     let app = owning_app_element(el_ptr, action, role)?;
     let deadline = Instant::now() + WINDOW_FULLSCREEN_SETTLE_BUDGET;
-    let mut previous: Option<Vec<WindowFullscreenSample>> = None;
-    let mut streak = 0usize;
-    // When the current run of identical desired samples started; `None`
-    // whenever the run breaks. `streak` counts samples, this measures how
-    // long the desired state has actually held.
-    let mut held_since: Option<Instant> = None;
-    // Whether the loop has seen a transition boundary: an unreadable sample,
-    // or a target state away from the desired value. After one, a short run
-    // of desired samples is post-transition evidence.
-    let mut boundary_seen = false;
-    // When the cached handle took over as the evidence (the target is missing
-    // from `AXWindows`); `None` whenever it is enumerable again. A cached
-    // read cannot advance the sample streak (see below), so its own held
-    // duration is what confirms a target that stays off the enumerated set,
-    // e.g. one on another Space.
-    let mut cached_held_since: Option<Instant> = None;
-    // The last expected (invalidated-object) retry-set failure, kept out of
-    // `last_observed` so the diagnosis stays bounded across ~100 retries
-    // (tenet 6: context is collected on the failure path only).
+    let mut run = SettleRun::default();
+    // The last expected (invalidated-object) retry-set failure, recorded for
+    // the deadline diagnosis. Kept apart from the poll so the diagnosis stays
+    // bounded across ~100 retries (tenet 6: context is collected on the
+    // failure path only).
     let mut last_set_error: Option<String> = None;
-    let mut last_observed;
     loop {
-        let mut reached = false;
-        // The target sample's `IsAttributeSettable(AXFullScreen)` when it was
-        // read, for deciding whether an already-desired state needs a write.
-        let mut sample_settable: Option<bool> = None;
-        match app_window_fullscreen_snapshot(app.as_ptr(), el_ptr, action, role)? {
-            Some(set) => {
-                // The *target* window's own sample, when it is enumerable. A
-                // sibling's state is never this verb's promise: gating on "any
-                // window fullscreen" turns a no-op restore on a normal window
-                // into a timeout while another window of the same app is
-                // fullscreen. `is_target` is a `safe_cf_equal` match, so it
-                // survives the transition recreating the object.
-                let target = set.iter().find(|w| w.is_target);
-                if want {
-                    // The fresh sample is the evidence; while the target is
-                    // missing from `AXWindows` (mid-recreation) the cached
-                    // handle is read directly, and a sibling can never
-                    // satisfy the promise in its place.
-                    reached = match target {
-                        Some(sample) => {
-                            last_observed = describe_window_fullscreen_sample(&set, want);
-                            sample_settable = Some(sample.settable);
-                            sample.fullscreen
-                        }
-                        None => match read_fullscreen_state(el_ptr, action, role) {
-                            // The cached read is part of the diagnosis: a
-                            // timeout that follows a successful cached read
-                            // must say so, not just that the target is
-                            // missing from `AXWindows`.
-                            Ok(state) => {
-                                // A cached fullscreen target carries its
-                                // settability too: the write below is skipped
-                                // for a state the window cannot write, and a
-                                // cached maximize must get the same no-op
-                                // instead of a rejected set. The probe follows
-                                // the loop's churn policy: an invalidated
-                                // object leaves the sample unconfirmed (the
-                                // next iteration retries), while a real
-                                // failure propagates.
-                                if state == Some(true) {
-                                    match is_attr_settable(el_ptr, "AXFullScreen") {
-                                        Ok(settable) => {
-                                            sample_settable = Some(settable);
-                                            last_observed = format!(
-                                                "{}; the cached target handle reads \
-                                                 AXFullScreen={state:?}",
-                                                describe_window_fullscreen_sample(&set, want)
-                                            );
-                                            true
-                                        }
-                                        Err(err) if is_gone_ax_element(&err) => {
-                                            last_observed = format!(
-                                                "{}; the cached target handle could not be \
-                                                 probed: {err}",
-                                                describe_window_fullscreen_sample(&set, want)
-                                            );
-                                            false
-                                        }
-                                        Err(err) => return Err(err),
-                                    }
-                                } else {
-                                    last_observed = format!(
-                                        "{}; the cached target handle reads AXFullScreen={state:?}",
-                                        describe_window_fullscreen_sample(&set, want)
-                                    );
-                                    false
-                                }
-                            }
-                            // Only an invalidated handle is churn: the target
-                            // can be absent from `AXWindows` while AppKit
-                            // recreates its object. Any other read failure is
-                            // a real platform error and must not be retried
-                            // into a generic timeout, the same rule the
-                            // snapshot above applies (tenet 1).
-                            Err(err) if is_gone_ax_element(&err) => {
-                                last_observed = format!(
-                                    "{}; the cached target handle could not be read: {err}",
-                                    describe_window_fullscreen_sample(&set, want)
-                                );
-                                false
-                            }
-                            Err(err) => return Err(err),
-                        },
-                    };
-                } else {
-                    match target {
-                        // The desired state is `false` *and* settable; the
-                        // entry transient reports the same pair, which is what
-                        // the confirmation's grace period rules out. A sibling
-                        // fullscreen window does not block a target that
-                        // already holds both.
-                        Some(sample) if !sample.fullscreen && sample.settable => {
-                            reached = true;
-                            sample_settable = Some(sample.settable);
-                            last_observed = describe_window_fullscreen_sample(&set, want);
-                        }
-                        Some(_) => {
-                            last_observed = describe_window_fullscreen_sample(&set, want);
-                        }
-                        // The target is not enumerable: its cached handle is
-                        // the remaining evidence. No app-level fallback — a
-                        // sibling's fullscreen state must not decide this
-                        // verb.
-                        None => match (
-                            read_fullscreen_state(el_ptr, action, role),
-                            is_attr_settable(el_ptr, "AXFullScreen"),
-                        ) {
-                            (Ok(Some(false)), Ok(true)) => {
-                                reached = true;
-                                sample_settable = Some(true);
-                                // The cached read is the evidence that the
-                                // promise holds; record it in the diagnosis
-                                // like the maximize branch does, so a timeout
-                                // that follows says more than "the target was
-                                // not enumerable".
-                                last_observed = format!(
-                                    "{}; the cached target handle reads AXFullScreen=false \
-                                     (settable=true)",
-                                    describe_window_fullscreen_sample(&set, want)
-                                );
-                            }
-                            (Ok(state), Ok(settable)) => {
-                                last_observed = format!(
-                                    "the target window is not enumerable and reads \
-                                     AXFullScreen={state:?} (settable={settable})"
-                                );
-                            }
-                            // A real failure from *either* probe propagates,
-                            // even when the other probe reported the
-                            // invalidated-handle churn: pairing the results in
-                            // one or-pattern binds only the first error and
-                            // could swallow the second as churn.
-                            (Err(churn), Err(real))
-                                if is_gone_ax_element(&churn) && !is_gone_ax_element(&real) =>
-                            {
-                                return Err(real);
-                            }
-                            (Err(real), _) if !is_gone_ax_element(&real) => return Err(real),
-                            (_, Err(real)) if !is_gone_ax_element(&real) => return Err(real),
-                            // What remains is the invalidated-handle churn on
-                            // at least one probe: retry, recording it for the
-                            // timeout diagnosis.
-                            (Err(err), _) | (_, Err(err)) => {
-                                last_observed = format!(
-                                    "the target window is not enumerable and could not be \
-                                     read: {err}"
-                                );
-                            }
-                        },
-                    }
-                }
-                // The consecutive-sample promise is the *target's* own
-                // sample. A cached-handle read keeps the loop polling while
-                // the target is missing from `AXWindows`, but a missing target
-                // must not advance the streak by itself: the set that remains
-                // is the transition's shell window(s), identical across
-                // samples, so a stale cached `true` could satisfy the promise
-                // in ~150ms without the recreated window ever reporting the
-                // state.
-                if reached && target.is_some() && previous.as_deref() == Some(set.as_slice()) {
-                    if streak == 0 {
-                        held_since = Some(Instant::now());
-                    }
-                    streak += 1;
-                    cached_held_since = None;
-                } else if reached && target.is_none() {
-                    // The cached handle is the only evidence while the target
-                    // is missing from `AXWindows`. It cannot advance the
-                    // sample streak (above), but a target that stays missing
-                    // for longer than a transition while the cached read holds
-                    // the promise is not mid-recreation: it is off the
-                    // enumerated set (another Space), and refusing to confirm
-                    // would time the verb out after the state committed.
-                    if cached_held_since.is_none() {
-                        cached_held_since = Some(Instant::now());
-                    }
-                    streak = 0;
-                    held_since = None;
-                } else {
-                    streak = 0;
-                    held_since = None;
-                    cached_held_since = None;
-                }
-                previous = Some(set);
-            }
-            // A window object that was invalidated under us is transition
-            // churn, not a settled state; note it so a *stable* set after it
-            // can never be mistaken for persistence.
-            None => {
-                streak = 0;
-                held_since = None;
-                cached_held_since = None;
-                boundary_seen = true;
-                previous = None;
-                last_observed =
-                    "the app did not answer a readable sample of its windows".to_string();
-            }
-        }
-        // A state away from the desired value is a transition boundary: it
-        // is what lets the confirmation trust a short run of samples (see
-        // `settle_confirmed`). Set after the match so the cached-handle
-        // branches count too.
-        if !reached {
-            boundary_seen = true;
-        }
         let now = Instant::now();
-        let cached_confirmed = reached
-            && cached_held_since
-                .is_some_and(|since| now.duration_since(since) >= WINDOW_FULLSCREEN_SETTLE_GRACE);
-        if settle_confirmed(streak, boundary_seen, held_since, now) || cached_confirmed {
+        let poll = poll_window_fullscreen(app.as_ptr(), el_ptr, want, action, role)?;
+        let (reached, settable) = match &poll {
+            Poll::Readable { target, .. } => evaluate_sample(want, target),
+            Poll::Unreadable => (false, None),
+        };
+        run.observe(&poll, reached, now);
+        if run.confirmed(now) {
             return Ok(());
         }
         // Re-issue the absolute set while the promise is unconfirmed — not
         // only when the state still reads the wrong value: the entry
         // transient reads the desired pair for a while (see the constants),
         // and a set that lands mid-transition is discarded, so the loop keeps
-        // issuing until `settle_confirmed` proves the state committed.
-        // Setting the desired value on a window that already holds it is a
-        // no-op. An already-desired state on an attribute the window refuses
-        // to write (`AXFullScreen=true` with `IsAttributeSettable=false`) has
-        // nothing to set: issuing the write can be rejected and turn an
-        // advertised no-op `maximize` into a failure, while the confirmation
-        // above still validates the read. The one expected failure is the
-        // invalidated object (`kAXErrorInvalidUIElement`): the set is retried
-        // on the next tick and the failure is recorded for the deadline
-        // diagnosis, superseded by a later successful retry. Every other
-        // failure is real — the settability probe and the snapshot reads
-        // propagate theirs — so it must not be retried into a generic
-        // timeout; it returns with its original code (tenet 1, tenet 6).
-        if !(reached && sample_settable == Some(false)) {
+        // issuing until the confirmation proves the state committed. Setting
+        // the desired value on a window that already holds it is a no-op. An
+        // already-desired state on an attribute the window refuses to write
+        // (`AXFullScreen=true` with `IsAttributeSettable=false`) has nothing
+        // to set: issuing the write can be rejected and turn an advertised
+        // no-op `maximize` into a failure, while the confirmation above still
+        // validates the read. The one expected failure is the invalidated
+        // object (`kAXErrorInvalidUIElement`): the set is retried on the next
+        // tick and recorded for the deadline diagnosis, superseded by a later
+        // successful retry. Every other failure is real — the settability
+        // probe and the snapshot reads propagate theirs — so it must not be
+        // retried into a generic timeout; it returns with its original code
+        // (tenet 1, tenet 6).
+        if !(reached && settable == Some(false)) {
             match set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
                 Ok(()) => {
                     // A later successful retry supersedes the recorded
@@ -2185,15 +2177,15 @@ fn settle_window_fullscreen(
             }
         }
         if Instant::now() >= deadline {
+            let mut last = describe_poll(&poll, want);
+            if let Some(err) = last_set_error {
+                last = format!("{last}; the last retry set failed: {err}");
+            }
             let condition = if want {
                 "window enters fullscreen (AXFullScreen=true)"
             } else {
                 "window leaves fullscreen (AXFullScreen=false)"
             };
-            let mut last = last_observed;
-            if let Some(err) = last_set_error {
-                last = format!("{last}; the last retry set failed: {err}");
-            }
             return Err(Error::timeout(WINDOW_FULLSCREEN_SETTLE_BUDGET).diagnose(
                 xa11y_core::Diagnosis::new()
                     .condition(condition)
@@ -3112,11 +3104,8 @@ fn build_snapshot_data(
             // on a window that cannot fullscreen (System Settings, for
             // example) the button only classic-zooms, which is not what
             // `maximize` promises (tenet 3).
-            let minimized = read_advertised_window_state(element, "AXMinimized", role)?;
-            let fullscreen = read_advertised_window_state(element, "AXFullScreen", role)?;
-            let minimized_settable = is_attr_settable(element, "AXMinimized")?;
-            let fullscreen_settable = is_attr_settable(element, "AXFullScreen")?;
-            if minimized_settable {
+            let state = WindowState::probe(element, "the window actions", role)?;
+            if state.minimized_settable {
                 push(&mut actions, "minimize");
             }
             // An already-committed fullscreen window satisfies `maximize`
@@ -3125,24 +3114,14 @@ fn build_snapshot_data(
             // no-op, so both states are part of the shared predicate: a
             // repeated `maximize`, and a maximize that brings the window back
             // on-screen, stay advertised.
-            if maximize_supported(
-                minimized,
-                minimized_settable,
-                fullscreen,
-                fullscreen_settable,
-            ) {
+            if maximize_supported(&state) {
                 push(&mut actions, "maximize");
             }
             // `restore()` accepts a window when either state is reachable OR
             // it already reads fullscreen, except for a minimized state whose
             // attribute is not settable — that combination is refused before
             // any mutation, so it must not be advertised.
-            if restore_supported(
-                minimized,
-                fullscreen,
-                minimized_settable,
-                fullscreen_settable,
-            ) {
+            if restore_supported(&state) {
                 push(&mut actions, "restore");
             }
             // `close` is advertised when the window exposes a close button —
@@ -3880,23 +3859,17 @@ impl Provider for MacOSProvider {
                 walk_limit,
             );
 
-            // Bucket phase-1 hits by clause + their doc-order walk position.
-            let mut by_clause: Vec<Vec<(usize, AXElement)>> =
-                (0..group.clauses.len()).map(|_| Vec::new()).collect();
-            for (walk_pos, (clause_idx, ax)) in phase1.into_iter().enumerate() {
-                by_clause[clause_idx].push((walk_pos, ax));
-            }
-
+            // Snapshot phase-1 hits in walk order, bucketed by the clause each
+            // belongs to. The per-clause entries keep their original walk
+            // positions, so bucketing as we snapshot cannot affect the merge.
             let mut dropped = false;
             let mut data_by_clause: Vec<Vec<(usize, AXUIElementRef, ElementData)>> =
                 (0..group.clauses.len()).map(|_| Vec::new()).collect();
-            for (clause_idx, hits) in by_clause.into_iter().enumerate() {
-                for (pos, ax) in &hits {
-                    match self.build_element_data(ax, root_data.pid) {
-                        Ok(data) => data_by_clause[clause_idx].push((*pos, ax.as_ptr(), data)),
-                        Err(err) if is_gone_ax_element(&err) => dropped = true,
-                        Err(err) => return Err(err),
-                    }
+            for (pos, (clause_idx, ax)) in phase1.into_iter().enumerate() {
+                match self.build_element_data(&ax, root_data.pid) {
+                    Ok(data) => data_by_clause[clause_idx].push((pos, ax.as_ptr(), data)),
+                    Err(err) if is_gone_ax_element(&err) => dropped = true,
+                    Err(err) => return Err(err),
                 }
             }
 
@@ -4391,20 +4364,22 @@ impl Provider for MacOSProvider {
         // still confirms the state, so a maximize racing an exit cannot
         // no-op on a stale `true` read.
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
-        // The shared predicate keeps this acceptance rule and the `actions`
-        // advertisement in lockstep; each probe is skipped when the state
-        // read already decides it.
+        // Each settability probe is skipped when the state read already
+        // decides the predicate; the unprobed `false` is the "not needed"
+        // reading `WindowState` documents. The shared predicate keeps this
+        // acceptance rule and the `actions` advertisement in lockstep.
         let fullscreen_settable =
             fullscreen != Some(true) && is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
         let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
         let minimized_settable =
             minimized == Some(true) && is_attr_settable(ax.as_ptr(), "AXMinimized")?;
-        if !maximize_supported(
+        let state = WindowState {
             minimized,
             minimized_settable,
             fullscreen,
             fullscreen_settable,
-        ) {
+        };
+        if !maximize_supported(&state) {
             return Err(Error::ActionNotSupported {
                 action: "maximize".to_string(),
                 role: element.role,
@@ -4438,22 +4413,14 @@ impl Provider for MacOSProvider {
         // `restore_supported` is the same predicate the `actions`
         // advertisement uses, so an advertised `restore` cannot
         // deterministically reject here (tenet 3).
-        let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "restore", element.role)?;
-        let fullscreen = read_fullscreen_state(ax.as_ptr(), "restore", element.role)?;
-        let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
-        let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        if !restore_supported(
-            minimized,
-            fullscreen,
-            minimized_settable,
-            fullscreen_settable,
-        ) {
+        let state = WindowState::probe(ax.as_ptr(), "restore", element.role)?;
+        if !restore_supported(&state) {
             return Err(Error::ActionNotSupported {
                 action: "restore".to_string(),
                 role: element.role,
             });
         }
-        if minimized_settable {
+        if state.minimized_settable {
             set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
         }
         // Never press the green button here: the press toggles, so a window
@@ -4462,8 +4429,11 @@ impl Provider for MacOSProvider {
         // set when the window is already restored; the settle loop re-issues
         // the clear until the confirmation has ruled out an entry transient
         // that reports `false` with the attribute still settable (see
-        // [`WINDOW_FULLSCREEN_SETTLE_GRACE`]).
-        if fullscreen_settable || fullscreen == Some(true) {
+        // [`WINDOW_FULLSCREEN_SETTLE_GRACE`]). A window that already reads
+        // fullscreen is settable once `restore_supported` has passed — the
+        // predicate refuses that state otherwise — so the settability flag
+        // alone says whether there is a fullscreen state to clear.
+        if state.fullscreen_settable {
             settle_window_fullscreen(ax.as_ptr(), false, "restore", element.role)?;
         }
         Ok(())
@@ -5172,12 +5142,144 @@ mod tests {
         ));
     }
 
+    /// A `WindowFullscreenSample` for the settle-run tests.
+    fn settle_sample(fullscreen: bool, settable: bool) -> WindowFullscreenSample {
+        WindowFullscreenSample {
+            size: (100.0, 100.0),
+            fullscreen,
+            settable,
+            is_target: true,
+        }
+    }
+
+    /// A readable poll whose target carries `fullscreen` / `settable`, with the
+    /// same sample in the app's window set.
+    fn settle_poll(fullscreen: bool, settable: bool) -> Poll {
+        let sample = settle_sample(fullscreen, settable);
+        Poll::Readable {
+            set: vec![sample.clone()],
+            target: TargetSample::Enumerated(sample),
+        }
+    }
+
+    #[test]
+    fn settle_run_requires_the_grace_when_no_boundary_was_seen() {
+        let t0 = Instant::now();
+        let poll = settle_poll(true, true);
+        let mut run = SettleRun::default();
+
+        // Three observed samples leave the run short: the first is only the
+        // comparison baseline, and a run without a boundary must also span
+        // the grace period.
+        for step in 0..WINDOW_FULLSCREEN_SETTLE_SAMPLES {
+            run.observe(&poll, true, t0 + Duration::from_millis(50 * step as u64));
+        }
+        assert!(!run.confirmed(t0 + Duration::from_millis(100)));
+
+        // Still identical once the counted run has spanned the grace.
+        let grace_end = t0 + Duration::from_millis(50) + WINDOW_FULLSCREEN_SETTLE_GRACE;
+        run.observe(&poll, true, grace_end);
+        assert!(run.confirmed(grace_end));
+    }
+
+    #[test]
+    fn settle_run_takes_the_short_streak_after_a_boundary() {
+        let t0 = Instant::now();
+        let poll = settle_poll(true, true);
+        let mut run = SettleRun::default();
+
+        // A target state away from the promise is a transition boundary; the
+        // readable poll still records the set for the next comparison.
+        run.observe(&poll, false, t0);
+        for step in 0..WINDOW_FULLSCREEN_SETTLE_SAMPLES {
+            run.observe(
+                &poll,
+                true,
+                t0 + Duration::from_millis(50 * (step as u64 + 1)),
+            );
+        }
+        // Post-boundary samples are evidence: no grace is needed.
+        assert!(run.confirmed(t0 + Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn settle_run_breaks_the_streak_when_the_sample_set_changes() {
+        let t0 = Instant::now();
+        let first = settle_poll(true, true);
+        let moved_sample = WindowFullscreenSample {
+            size: (200.0, 100.0),
+            ..settle_sample(true, true)
+        };
+        let moved = Poll::Readable {
+            set: vec![moved_sample.clone()],
+            target: TargetSample::Enumerated(moved_sample),
+        };
+        let mut run = SettleRun::default();
+
+        // One boundary, then a run on the first set.
+        run.observe(&first, false, t0);
+        run.observe(&first, true, t0 + Duration::from_millis(50));
+        // A geometry change is not the settled state: the run starts over.
+        run.observe(&moved, true, t0 + Duration::from_millis(100));
+        run.observe(&moved, true, t0 + Duration::from_millis(150));
+        run.observe(&moved, true, t0 + Duration::from_millis(200));
+        // Only two samples since the change, so even the boundary's short
+        // streak is not reached.
+        assert!(!run.confirmed(t0 + Duration::from_millis(200)));
+
+        run.observe(&moved, true, t0 + Duration::from_millis(250));
+        assert!(run.confirmed(t0 + Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn settle_run_resets_on_an_unreadable_sample() {
+        let t0 = Instant::now();
+        let poll = settle_poll(true, true);
+        let mut run = SettleRun::default();
+
+        run.observe(&poll, true, t0);
+        run.observe(&poll, true, t0 + Duration::from_millis(50));
+        run.observe(&Poll::Unreadable, false, t0 + Duration::from_millis(100));
+        // The next readable sample is the new comparison baseline, not a
+        // streak increment; the unreadable poll is the transition boundary.
+        run.observe(&poll, true, t0 + Duration::from_millis(150));
+        run.observe(&poll, true, t0 + Duration::from_millis(200));
+        run.observe(&poll, true, t0 + Duration::from_millis(250));
+        assert!(!run.confirmed(t0 + Duration::from_millis(250)));
+
+        run.observe(&poll, true, t0 + Duration::from_millis(300));
+        assert!(run.confirmed(t0 + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn settle_run_confirms_a_cached_target_only_on_its_grace_run() {
+        let t0 = Instant::now();
+        let cached = Poll::Readable {
+            set: Vec::new(),
+            target: TargetSample::Cached {
+                fullscreen: AttrProbe::Value(true),
+                settable: Some(AttrProbe::Value(false)),
+            },
+        };
+        let mut run = SettleRun::default();
+
+        // The cached handle cannot advance the sample streak — the remaining
+        // set is the transition's shell — and the boundary shortcut does not
+        // apply to it: only its own grace run confirms.
+        for step in 0..5 {
+            run.observe(&cached, true, t0 + Duration::from_millis(50 * step));
+        }
+        assert!(!run.confirmed(t0 + Duration::from_millis(200)));
+
+        run.observe(&cached, true, t0 + WINDOW_FULLSCREEN_SETTLE_GRACE);
+        assert!(run.confirmed(t0 + WINDOW_FULLSCREEN_SETTLE_GRACE));
+    }
+
     #[test]
     fn describe_window_fullscreen_sample_names_the_target() {
         let sample = |is_target: bool, fullscreen: bool, settable: bool| WindowFullscreenSample {
             size: (0.0, 0.0),
             fullscreen,
-            main: false,
             settable,
             is_target,
         };
@@ -5263,44 +5365,144 @@ mod tests {
 
     #[test]
     fn window_verb_predicates_cover_the_advertised_combinations() {
+        // `minimized_settable` is only consulted while `minimized` reads
+        // `true`; `fullscreen_settable` only while `fullscreen` does not. The
+        // unprobed `false` in either slot is the "state does not need it"
+        // reading the `maximize` probe order produces, so the same fixtures
+        // stand for both the fully probed and the conditional call site.
+        let state = |minimized: Option<bool>,
+                     minimized_settable: bool,
+                     fullscreen: Option<bool>,
+                     fullscreen_settable: bool| WindowState {
+            minimized,
+            minimized_settable,
+            fullscreen,
+            fullscreen_settable,
+        };
+
         // `maximize`: a committed fullscreen window is accepted whatever the
         // settability probe answers — the repeated-maximize case the
         // advertisement must not drop.
-        assert!(maximize_supported(None, false, Some(true), false));
-        assert!(maximize_supported(Some(false), false, Some(true), true));
-        assert!(maximize_supported(Some(false), false, Some(false), true));
-        assert!(maximize_supported(None, false, None, true));
+        assert!(maximize_supported(&state(None, false, Some(true), false)));
+        assert!(maximize_supported(&state(
+            Some(false),
+            false,
+            Some(true),
+            true
+        )));
+        assert!(maximize_supported(&state(
+            Some(false),
+            false,
+            Some(false),
+            true
+        )));
+        assert!(maximize_supported(&state(None, false, None, true)));
         // A minimized window whose flag cannot be cleared stays in the Dock
         // while the settle only checks fullscreen, so the verb is refused
         // before mutating — and never advertised.
-        assert!(!maximize_supported(Some(true), false, Some(false), true));
-        assert!(!maximize_supported(Some(true), false, Some(true), false));
-        assert!(maximize_supported(Some(true), true, Some(false), true));
+        assert!(!maximize_supported(&state(
+            Some(true),
+            false,
+            Some(false),
+            true
+        )));
+        assert!(!maximize_supported(&state(
+            Some(true),
+            false,
+            Some(true),
+            false
+        )));
+        assert!(maximize_supported(&state(
+            Some(true),
+            true,
+            Some(false),
+            true
+        )));
         // Not fullscreen and not writable: `ActionNotSupported`, never
         // advertised.
-        assert!(!maximize_supported(Some(false), false, Some(false), false));
-        assert!(!maximize_supported(None, false, None, false));
+        assert!(!maximize_supported(&state(
+            Some(false),
+            false,
+            Some(false),
+            false
+        )));
+        assert!(!maximize_supported(&state(None, false, None, false)));
 
         // `restore`: at least one state must be reachable, and every state
         // that reads `true` must be clearable.
-        assert!(restore_supported(Some(false), Some(true), true, true));
-        assert!(restore_supported(Some(false), Some(false), true, false));
-        assert!(restore_supported(Some(false), Some(false), false, true));
-        assert!(restore_supported(None, None, false, true));
-        assert!(restore_supported(Some(true), Some(false), true, false));
-        assert!(restore_supported(Some(true), Some(true), true, true));
+        assert!(restore_supported(&state(
+            Some(false),
+            true,
+            Some(true),
+            true
+        )));
+        assert!(restore_supported(&state(
+            Some(false),
+            true,
+            Some(false),
+            false
+        )));
+        assert!(restore_supported(&state(
+            Some(false),
+            false,
+            Some(false),
+            true
+        )));
+        assert!(restore_supported(&state(None, false, None, true)));
+        assert!(restore_supported(&state(
+            Some(true),
+            true,
+            Some(false),
+            false
+        )));
+        assert!(restore_supported(&state(
+            Some(true),
+            true,
+            Some(true),
+            true
+        )));
         // A minimized state whose attribute is not settable cannot be
         // cleared; `restore` refuses before mutating anything.
-        assert!(!restore_supported(Some(true), Some(false), false, true));
-        assert!(!restore_supported(Some(true), Some(true), false, false));
-        assert!(!restore_supported(Some(true), Some(true), false, true));
+        assert!(!restore_supported(&state(
+            Some(true),
+            false,
+            Some(false),
+            true
+        )));
+        assert!(!restore_supported(&state(
+            Some(true),
+            false,
+            Some(true),
+            false
+        )));
+        assert!(!restore_supported(&state(
+            Some(true),
+            false,
+            Some(true),
+            true
+        )));
         // A fullscreen state whose attribute is not settable cannot be
         // cleared: the settle could only time out, so the advertised restore
         // must reject it up front.
-        assert!(!restore_supported(Some(false), Some(true), true, false));
-        assert!(!restore_supported(Some(false), Some(true), false, false));
+        assert!(!restore_supported(&state(
+            Some(false),
+            true,
+            Some(true),
+            false
+        )));
+        assert!(!restore_supported(&state(
+            Some(false),
+            false,
+            Some(true),
+            false
+        )));
         // Neither state reachable, nothing committed.
-        assert!(!restore_supported(Some(false), Some(false), false, false));
+        assert!(!restore_supported(&state(
+            Some(false),
+            false,
+            Some(false),
+            false
+        )));
     }
 
     #[test]

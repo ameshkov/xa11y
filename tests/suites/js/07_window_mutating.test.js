@@ -44,22 +44,31 @@ async function waitForWindow(app, verb, what) {
   // settle loop promises the *state*, not that the window is enumerable the
   // instant the verb returns. A one-shot lookup right after a verb reads that
   // absence as "the window is gone", so every repeated call waits for it.
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    const win = await windowAdvertising(app, verb);
-    if (win) return win;
-    await sleep(100);
-  }
-  throw new Error(`Timed out waiting for ${what}`);
+  return waitUntil(() => windowAdvertising(app, verb), 5000, what);
 }
 
 async function waitUntil(predicate, timeoutMs, what) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await predicate()) return;
+    const result = await predicate();
+    if (result) return result;
     await sleep(100);
   }
   throw new Error(`Timed out waiting for ${what}`);
+}
+
+async function restoreWindowBestEffort(app) {
+  // waitForWindow with `restore`, not a one-shot lookup and not a `maximize`
+  // lookup: the transition can have the real window out of app.windows(), and
+  // a window that advertises `maximize` does not necessarily advertise the
+  // `restore` this cleanup needs. Never throws: cleanup must not replace the
+  // original failure.
+  try {
+    const current = await waitForWindow(app, 'restore', 'a restorable window');
+    await current.restore();
+  } catch (_cleanup) {
+    // best-effort cleanup; the original error wins
+  }
 }
 
 async function dialogWindow(app) {
@@ -256,16 +265,7 @@ test('a window that advertises maximize is maximized and restored', async () => 
       await sleep(1500);
     }
   } catch (err) {
-    try {
-      // waitForWindow with `restore`, not a one-shot lookup and not a
-      // `maximize` lookup: the transition can have the real window out of
-      // app.windows(), and a window that advertises `maximize` does not
-      // necessarily advertise the `restore` this cleanup needs.
-      const current = await waitForWindow(app, 'restore', 'a restorable window');
-      await current.restore();
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
@@ -367,16 +367,7 @@ test('Locator maximize()/restore() dispatch through the async binding', async ()
     await locator.maximize();
     await locator.restore();
   } catch (err) {
-    try {
-      // Same failure-preserving cleanup as the element path: a one-shot
-      // lookup can miss the window while the transition has it out of
-      // app.windows(), and the lookup waits for `restore` — the verb the
-      // cleanup actually calls.
-      const current = await waitForWindow(app, 'restore', 'a restorable window');
-      await current.restore();
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });

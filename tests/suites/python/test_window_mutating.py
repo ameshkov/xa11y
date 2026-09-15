@@ -72,28 +72,40 @@ def _wait_for_window(app: xa11y.App, verb: str, what: str) -> xa11y.Element:
     absence as "the window is gone", so every repeated call waits for the real
     window first.
     """
-    deadline = time.monotonic() + 5.0
-    while True:
-        win = _window_advertising(app, verb)
-        if win is not None:
-            return win
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"timed out waiting for {what}")
-        time.sleep(0.1)
+    return _wait_until(lambda: _window_advertising(app, verb), 5.0, what)
 
 
-def _wait_until(predicate, timeout: float, what: str) -> None:
-    """Poll `predicate` until it returns true, or `timeout` (seconds) elapses.
+def _wait_until(predicate, timeout: float, what: str):
+    """Poll `predicate` until it returns truthy, or `timeout` (seconds) elapses.
 
-    Raises with a description on timeout — a dead poll is a fixture
-    regression, not a skip (mirrors ``wait_until`` in the Rust integ suite).
+    Returns the truthy value, so a caller that needs the polled object (e.g.
+    ``_wait_for_window``) reuses the same loop. Raises with a description on
+    timeout — a dead poll is a fixture regression, not a skip (mirrors
+    ``wait_until`` in the Rust integ suite).
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if predicate():
-            return
+        result = predicate()
+        if result:
+            return result
         time.sleep(0.1)
     raise AssertionError(f"timed out waiting for {what}")
+
+
+def _restore_window_best_effort(app: xa11y.App) -> None:
+    """Best-effort restore of the real window, for cleanup rails.
+
+    ``_wait_for_window`` with `restore`, not a one-shot lookup and not a
+    `maximize` lookup: the transition can have the real window out of
+    ``App.windows()``, and a window that advertises `maximize` does not
+    necessarily advertise the `restore` this cleanup needs. Never raises:
+    cleanup must not replace the original failure.
+    """
+    try:
+        current = _wait_for_window(app, "restore", "a restorable window")
+        current.restore()
+    except Exception:  # best-effort cleanup; the original error wins
+        pass
 
 
 def _window_named(app: xa11y.App, dialog_name: str) -> xa11y.Element | None:
@@ -341,10 +353,10 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             else:
                 current.restore()
             _wait_until(
-                lambda bound=expected: _window_reads_maximized(
-                    app, "maximize" if bound else "restore"
-                )
-                is bound,
+                lambda bound=expected: (
+                    _window_reads_maximized(app, "maximize" if bound else "restore")
+                    is bound
+                ),
                 5.0,
                 f"the window to read maximized={expected} during the alternating sequence",
             )
@@ -352,15 +364,7 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
         # not be left maximized for the suites after this one.
-        # ``_wait_for_window`` with `restore`, not a one-shot lookup and not a
-        # `maximize` lookup: the transition can have the real window out of
-        # ``App.windows()``, and a window that advertises `maximize` does not
-        # necessarily advertise the `restore` this cleanup needs.
-        try:
-            current = _wait_for_window(app, "restore", "a restorable window")
-            current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        _restore_window_best_effort(app)
         raise
 
 
@@ -753,15 +757,8 @@ def test_locator_maximize_and_restore(app: xa11y.App) -> None:
         locator.maximize()
         locator.restore()
     except Exception:
-        # Same failure-preserving cleanup as the element path: a one-shot
-        # lookup can miss the window while the transition has it out of
-        # ``App.windows()``, and the lookup waits for `restore` — the verb
-        # this cleanup actually calls.
-        try:
-            current = _wait_for_window(app, "restore", "a restorable window")
-            current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        # Same failure-preserving cleanup as the element path.
+        _restore_window_best_effort(app)
         raise
 
 
