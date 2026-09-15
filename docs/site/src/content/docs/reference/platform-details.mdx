@@ -140,9 +140,11 @@ while it runs: a window entering fullscreen can briefly read
 than queued. On a fullscreen-capable window both verbs poll the
 application's window set and re-issue the absolute set until the promised
 state holds consistently; a transition that never commits fails with a
-timeout error rather than reporting success. A window whose `AXFullScreen`
-is not settable has no fullscreen state to settle, so `Restore` only clears
-`AXMinimized` for it and returns without polling.
+timeout error rather than reporting success. A window that is not fullscreen
+and whose `AXFullScreen` is not settable has no fullscreen state to settle,
+so `Restore` only clears `AXMinimized` for it and returns without polling.
+A window that reads fullscreen but cannot clear the state does not advertise
+`restore` at all.
 `maximized` cannot be read on macOS, so the state is reported as
 `fullscreen`. `AXZoomed` matches the AppKit *property* `NSWindow.isZoomed`,
 is not declared in the SDK headers, and live windows answer

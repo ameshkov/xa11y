@@ -1845,13 +1845,21 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
 /// ([`WindowFullscreenSample::is_target`]): an app can have several windows,
 /// and a sibling's fullscreen state is not this verb's promise. While the
 /// target is missing from `AXWindows` (mid-recreation, or on another Space),
-/// its cached handle is read directly instead.
+/// its cached handle is read directly instead. A cached read cannot advance
+/// the sample streak — the remaining set is the transition's shell — so it
+/// confirms on its own [`WINDOW_FULLSCREEN_SETTLE_GRACE`] run: that is longer
+/// than a recreation, so a target still absent after it is off the enumerated
+/// set, not mid-transition, and the verb must not time out on it.
 ///
 /// A set that lands while the previous transition is still running is
 /// discarded by AppKit rather than queued, so every iteration whose promise
 /// is not yet confirmed re-issues `AXFullScreen = want`. Absolute sets make
 /// that safe: setting `true` on a fullscreen window is a no-op (verified on
-/// AppKit, WebKit and Chromium windows).
+/// AppKit, WebKit and Chromium windows). The one exception is a read that
+/// already holds the desired state on an attribute the window does not allow
+/// writing (`AXFullScreen=true` with `IsAttributeSettable=false`): there is
+/// nothing a set could change, and issuing it anyway can be rejected, which
+/// would turn an advertised no-op `maximize` into a failure.
 ///
 /// For `want=false` the target's sample must answer both
 /// `AXFullScreen=false` and `IsAttributeSettable=true`. A bare `false` is not
@@ -1881,9 +1889,22 @@ fn settle_window_fullscreen(
     // or a target state away from the desired value. After one, a short run
     // of desired samples is post-transition evidence.
     let mut boundary_seen = false;
+    // When the cached handle took over as the evidence (the target is missing
+    // from `AXWindows`); `None` whenever it is enumerable again. A cached
+    // read cannot advance the sample streak (see below), so its own held
+    // duration is what confirms a target that stays off the enumerated set,
+    // e.g. one on another Space.
+    let mut cached_held_since: Option<Instant> = None;
+    // The last expected (invalidated-object) retry-set failure, kept out of
+    // `last_observed` so the diagnosis stays bounded across ~100 retries
+    // (tenet 6: context is collected on the failure path only).
+    let mut last_set_error: Option<String> = None;
     let mut last_observed;
     loop {
         let mut reached = false;
+        // The target sample's `IsAttributeSettable(AXFullScreen)` when it was
+        // read, for deciding whether an already-desired state needs a write.
+        let mut sample_settable: Option<bool> = None;
         match app_window_fullscreen_snapshot(app.as_ptr(), el_ptr, action, role)? {
             Some(set) => {
                 // The *target* window's own sample, when it is enumerable. A
@@ -1901,6 +1922,7 @@ fn settle_window_fullscreen(
                     reached = match target {
                         Some(sample) => {
                             last_observed = describe_window_fullscreen_sample(&set, want);
+                            sample_settable = Some(sample.settable);
                             sample.fullscreen
                         }
                         None => match read_fullscreen_state(el_ptr, action, role) {
@@ -1940,6 +1962,7 @@ fn settle_window_fullscreen(
                         // already holds both.
                         Some(sample) if !sample.fullscreen && sample.settable => {
                             reached = true;
+                            sample_settable = Some(sample.settable);
                             last_observed = describe_window_fullscreen_sample(&set, want);
                         }
                         Some(_) => {
@@ -1955,6 +1978,7 @@ fn settle_window_fullscreen(
                         ) {
                             (Ok(Some(false)), Ok(true)) => {
                                 reached = true;
+                                sample_settable = Some(true);
                                 // The cached read is the evidence that the
                                 // promise holds; record it in the diagnosis
                                 // like the maximize branch does, so a timeout
@@ -2009,9 +2033,24 @@ fn settle_window_fullscreen(
                         held_since = Some(Instant::now());
                     }
                     streak += 1;
+                    cached_held_since = None;
+                } else if reached && target.is_none() {
+                    // The cached handle is the only evidence while the target
+                    // is missing from `AXWindows`. It cannot advance the
+                    // sample streak (above), but a target that stays missing
+                    // for longer than a transition while the cached read holds
+                    // the promise is not mid-recreation: it is off the
+                    // enumerated set (another Space), and refusing to confirm
+                    // would time the verb out after the state committed.
+                    if cached_held_since.is_none() {
+                        cached_held_since = Some(Instant::now());
+                    }
+                    streak = 0;
+                    held_since = None;
                 } else {
                     streak = 0;
                     held_since = None;
+                    cached_held_since = None;
                 }
                 previous = Some(set);
             }
@@ -2021,6 +2060,7 @@ fn settle_window_fullscreen(
             None => {
                 streak = 0;
                 held_since = None;
+                cached_held_since = None;
                 boundary_seen = true;
                 previous = None;
                 last_observed =
@@ -2034,7 +2074,11 @@ fn settle_window_fullscreen(
         if !reached {
             boundary_seen = true;
         }
-        if settle_confirmed(streak, boundary_seen, held_since, Instant::now()) {
+        let now = Instant::now();
+        let cached_confirmed = reached
+            && cached_held_since
+                .is_some_and(|since| now.duration_since(since) >= WINDOW_FULLSCREEN_SETTLE_GRACE);
+        if settle_confirmed(streak, boundary_seen, held_since, now) || cached_confirmed {
             return Ok(());
         }
         // Re-issue the absolute set while the promise is unconfirmed — not
@@ -2043,17 +2087,24 @@ fn settle_window_fullscreen(
         // and a set that lands mid-transition is discarded, so the loop keeps
         // issuing until `settle_confirmed` proves the state committed.
         // Setting the desired value on a window that already holds it is a
-        // no-op. The one expected failure is the invalidated object
-        // (`kAXErrorInvalidUIElement`): the set is retried on the next tick
-        // and the error is recorded for the deadline diagnosis. Every other
-        // failure is real — the settability probe and the snapshot reads
-        // propagate theirs — so it must not be retried into a generic
-        // timeout; it returns with its original code (tenet 1, tenet 6).
-        if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
-            if !is_gone_ax_element(&err) {
-                return Err(err);
+        // no-op. An already-desired state on an attribute the window refuses
+        // to write (`AXFullScreen=true` with `IsAttributeSettable=false`) has
+        // nothing to set: issuing the write can be rejected and turn an
+        // advertised no-op `maximize` into a failure, while the confirmation
+        // above still validates the read. The one expected failure is the
+        // invalidated object (`kAXErrorInvalidUIElement`): the set is retried
+        // on the next tick and the error is recorded for the deadline
+        // diagnosis. Every other failure is real — the settability probe and
+        // the snapshot reads propagate theirs — so it must not be retried
+        // into a generic timeout; it returns with its original code (tenet 1,
+        // tenet 6).
+        if !(reached && sample_settable == Some(false)) {
+            if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
+                if !is_gone_ax_element(&err) {
+                    return Err(err);
+                }
+                last_set_error = Some(err.to_string());
             }
-            last_observed = format!("{last_observed}; the retry set failed: {err}");
         }
         if Instant::now() >= deadline {
             let condition = if want {
@@ -2061,10 +2112,14 @@ fn settle_window_fullscreen(
             } else {
                 "window leaves fullscreen (AXFullScreen=false)"
             };
+            let mut last = last_observed;
+            if let Some(err) = last_set_error {
+                last = format!("{last}; the last retry set failed: {err}");
+            }
             return Err(Error::timeout(WINDOW_FULLSCREEN_SETTLE_BUDGET).diagnose(
                 xa11y_core::Diagnosis::new()
                     .condition(condition)
-                    .last_observed(last_observed),
+                    .last_observed(last),
             ));
         }
         std::thread::sleep(WINDOW_FULLSCREEN_SETTLE_INTERVAL);
@@ -2618,6 +2673,18 @@ impl MacOSProvider {
         handle
     }
 
+    /// Remove a cached handle that no consumer can resolve any more: the
+    /// snapshot that minted it failed, or the pass that built it was
+    /// discarded (see `find_elements_group`). Dropping the `ElementData`
+    /// alone does not release the cache entry, and the cache has no other
+    /// eviction.
+    fn evict_cached(&self, handle: u64) {
+        self.handle_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle);
+    }
+
     /// Look up a cached AXElement by handle.
     fn get_cached(&self, handle: u64) -> Result<AXElement> {
         self.handle_cache
@@ -2646,10 +2713,7 @@ impl MacOSProvider {
         match build_snapshot_data(ax.as_ptr(), pid, handle) {
             Ok(data) => Ok(data),
             Err(err) => {
-                self.handle_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&handle);
+                self.evict_cached(handle);
                 Err(err)
             }
         }
@@ -3758,6 +3822,16 @@ impl Provider for MacOSProvider {
 
             if !dropped || walk_limit.is_none() {
                 break data_by_clause;
+            }
+            // The bounded pass is discarded and re-walked: release the
+            // handles its successful snapshots minted, or the retry caches a
+            // second set for the same candidates while the first pass's
+            // entries stay in the cache with no consumer that can resolve
+            // them.
+            for clause in &data_by_clause {
+                for (_, _, data) in clause {
+                    self.evict_cached(data.handle);
+                }
             }
             walk_limit = None;
         };
