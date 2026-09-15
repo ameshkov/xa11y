@@ -2744,10 +2744,11 @@ impl MacOSProvider {
     }
 
     /// Remove a cached handle that no consumer can resolve any more: the
-    /// snapshot that minted it failed, or the pass that built it was
-    /// discarded (see `find_elements_group`). Dropping the `ElementData`
-    /// alone does not release the cache entry, and the cache has no other
-    /// eviction.
+    /// snapshot that minted it failed, or the element carrying it was dropped
+    /// before reaching a caller (see [`Cached`] and
+    /// [`Provider::discard_element`](xa11y_core::Provider::discard_element)).
+    /// Dropping the `ElementData` alone does not release the cache entry, and
+    /// the cache has no other eviction.
     fn evict_cached(&self, handle: u64) {
         self.handle_cache
             .lock()
@@ -2774,19 +2775,112 @@ impl MacOSProvider {
     /// A failed snapshot evicts the handle again: no `ElementData` carrying
     /// it was returned, so nothing can resolve it, and a window invalidated
     /// mid-transition would otherwise leave an unreachable AX object in the
-    /// cache for every candidate an enumerating caller drops (see
-    /// `find_elements_group` and `get_children`). The handle is never handed
-    /// to a consumer on this path, so the eviction cannot invalidate a live
-    /// element.
-    fn build_element_data(&self, ax: &AXElement, pid: Option<u32>) -> Result<ElementData> {
+    /// cache. A successful one comes back as [`Cached`], which evicts the
+    /// handle if the element is dropped before a caller receives it no matter
+    /// which path drops it.
+    fn build_element_data<'a>(&'a self, ax: &AXElement, pid: Option<u32>) -> Result<Cached<'a>> {
         let handle = self.cache_element(ax.clone());
         match build_snapshot_data(ax.as_ptr(), pid, handle) {
-            Ok(data) => Ok(data),
+            Ok(data) => Ok(Cached::new(self, data)),
             Err(err) => {
                 self.evict_cached(handle);
                 Err(err)
             }
         }
+    }
+}
+
+/// Where a dropped [`Cached`] releases its handle.
+///
+/// A trait rather than a direct `&MacOSProvider` so the guard's drop
+/// semantics are unit-testable without a live provider (see the tests).
+trait EvictHandle: Sync {
+    fn evict_handle(&self, handle: u64);
+}
+
+impl EvictHandle for MacOSProvider {
+    fn evict_handle(&self, handle: u64) {
+        self.evict_cached(handle);
+    }
+}
+
+/// [`Cached::release`]'s other half: evicts the handle on drop unless the
+/// element reached a caller.
+struct HandleGuard<'a> {
+    sink: &'a dyn EvictHandle,
+    handle: u64,
+    committed: bool,
+}
+
+impl HandleGuard<'_> {
+    /// The element reached a caller: its handle must stay resolvable.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for HandleGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.sink.evict_handle(self.handle);
+        }
+    }
+}
+
+/// An [`ElementData`] this provider built that has not reached a caller.
+///
+/// Dropping it releases its cache entry; [`Cached::release`] hands the
+/// element out with the entry retained. [`MacOSProvider::build_element_data`]
+/// returns this instead of a bare `ElementData`, so a built element is
+/// either released deliberately or evicted — an early return, a dedup, a
+/// `limit` truncation, or core's narrowing cannot strand an `AXUIElement` in
+/// the cache. Field reads and writes go through `Deref` / `DerefMut`.
+struct Cached<'a> {
+    guard: HandleGuard<'a>,
+    data: ElementData,
+}
+
+impl<'a> Cached<'a> {
+    fn new(sink: &'a dyn EvictHandle, data: ElementData) -> Self {
+        Self {
+            guard: HandleGuard {
+                sink,
+                handle: data.handle,
+                committed: false,
+            },
+            data,
+        }
+    }
+
+    /// Hand the element to a caller: its cache entry must stay resolvable.
+    fn release(self) -> ElementData {
+        // `Cached` has no `Drop`, so its fields move out freely; committing
+        // the guard first is what stops the eviction.
+        let Self { guard, data } = self;
+        guard.commit();
+        data
+    }
+
+    /// A copy of the element for a call that borrows it while this guard keeps
+    /// the cache entry alive. Core's narrowing does not take ownership of the
+    /// candidates it is handed (the caller may hold clones), so the guard, not
+    /// core, releases the anchor when it is done.
+    fn borrowed(&self) -> ElementData {
+        self.data.clone()
+    }
+}
+
+impl std::ops::Deref for Cached<'_> {
+    type Target = ElementData;
+
+    fn deref(&self) -> &ElementData {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for Cached<'_> {
+    fn deref_mut(&mut self) -> &mut ElementData {
+        &mut self.data
     }
 }
 
@@ -3420,7 +3514,7 @@ impl MacOSProvider {
     fn menu_bar_surface(
         &self,
         apps: &[(i32, String)],
-    ) -> Result<Option<(ShellSurfaceKind, ElementData)>> {
+    ) -> Result<Option<(ShellSurfaceKind, Cached<'_>)>> {
         let system_wide = AXElement::from_owned(unsafe { safe_ax_create_system_wide() });
         if system_wide.is_null() {
             return Err(Error::Platform {
@@ -3505,8 +3599,8 @@ impl MacOSProvider {
     /// surface and the fan-out continues, which is the policy the scan-cost
     /// measurement demanded. Enumerating the processes at all is the caller's
     /// job, and that failure does propagate.
-    fn status_item_surfaces(&self, apps: &[(i32, String)]) -> Vec<(ShellSurfaceKind, ElementData)> {
-        let mut surfaces: Vec<(ShellSurfaceKind, ElementData)> = apps
+    fn status_item_surfaces(&self, apps: &[(i32, String)]) -> Vec<(ShellSurfaceKind, Cached<'_>)> {
+        let mut surfaces: Vec<(ShellSurfaceKind, Cached<'_>)> = apps
             .par_iter()
             .filter_map(|(pid, app_name)| {
                 let app_element =
@@ -3578,10 +3672,10 @@ impl MacOSProvider {
     /// Each probe carries the same per-element timeout as the rest of shell
     /// discovery. An app that does not answer contributes no flyout, matching
     /// the documented failure policy of the status-item fan-out above.
-    fn shown_status_menu_surfaces(
-        &self,
-        status_items: &[(ShellSurfaceKind, ElementData)],
-    ) -> Result<Vec<(ShellSurfaceKind, ElementData)>> {
+    fn shown_status_menu_surfaces<'a>(
+        &'a self,
+        status_items: &[(ShellSurfaceKind, Cached<'a>)],
+    ) -> Result<Vec<(ShellSurfaceKind, Cached<'a>)>> {
         let mut surfaces = Vec::new();
         let mut seen_menus: Vec<AXElement> = Vec::new();
 
@@ -3661,7 +3755,7 @@ impl MacOSProvider {
     fn dock_surface(
         &self,
         apps: &[(i32, String)],
-    ) -> Result<Option<(ShellSurfaceKind, ElementData)>> {
+    ) -> Result<Option<(ShellSurfaceKind, Cached<'_>)>> {
         let Some((pid, name)) = apps.iter().find(|(_, name)| name.as_str() == "Dock") else {
             return Ok(None);
         };
@@ -3697,7 +3791,7 @@ impl MacOSProvider {
     fn desktop_surface(
         &self,
         apps: &[(i32, String)],
-    ) -> Result<Option<(ShellSurfaceKind, ElementData)>> {
+    ) -> Result<Option<(ShellSurfaceKind, Cached<'_>)>> {
         let Some((pid, _)) = apps.iter().find(|(_, name)| name.as_str() == "Finder") else {
             return Ok(None);
         };
@@ -3759,20 +3853,22 @@ impl Provider for MacOSProvider {
                 // fullscreen transitions and on close) is no longer part of
                 // this parent's live surface, so it is dropped; every other
                 // failure propagates (tenet 1).
-                let built: Vec<Result<ElementData>> = filtered
+                let built: Vec<Result<Cached<'_>>> = filtered
                     .par_iter()
                     .map(|child| self.build_element_data(child, element_data.pid))
                     .collect();
-                let mut results = Vec::with_capacity(built.len());
+                let mut results: Vec<Cached<'_>> = Vec::with_capacity(built.len());
                 for data in built {
                     match data {
                         Ok(data) => results.push(data),
                         Err(err) if is_gone_ax_element(&err) => {}
+                        // The guards in `results` release their handles on
+                        // this return: the caller never received them.
                         Err(err) => return Err(err),
                     }
                 }
 
-                Ok(results)
+                Ok(results.into_iter().map(Cached::release).collect())
             }
         }
     }
@@ -3848,7 +3944,7 @@ impl Provider for MacOSProvider {
         // second pass has no bound left to hide a match, and a drop there is
         // the ordinary concurrent-mutation case the retry signal covers.
         let mut walk_limit = phase1_walk_limit;
-        let phase1_data_by_clause: Vec<Vec<(usize, AXUIElementRef, ElementData)>> = loop {
+        let phase1_data_by_clause: Vec<Vec<(usize, AXUIElementRef, Cached<'_>)>> = loop {
             let phase1: Vec<(usize, AXElement)> = self.collect_matching_ax_group(
                 &root_ax,
                 root_data.role,
@@ -3863,7 +3959,7 @@ impl Provider for MacOSProvider {
             // belongs to. The per-clause entries keep their original walk
             // positions, so bucketing as we snapshot cannot affect the merge.
             let mut dropped = false;
-            let mut data_by_clause: Vec<Vec<(usize, AXUIElementRef, ElementData)>> =
+            let mut data_by_clause: Vec<Vec<(usize, AXUIElementRef, Cached<'_>)>> =
                 (0..group.clauses.len()).map(|_| Vec::new()).collect();
             for (pos, (clause_idx, ax)) in phase1.into_iter().enumerate() {
                 match self.build_element_data(&ax, root_data.pid) {
@@ -3876,20 +3972,15 @@ impl Provider for MacOSProvider {
             if !dropped || walk_limit.is_none() {
                 break data_by_clause;
             }
-            // The bounded pass is discarded and re-walked: release the
-            // handles its successful snapshots minted, or the retry caches a
-            // second set for the same candidates while the first pass's
-            // entries stay in the cache with no consumer that can resolve
-            // them.
-            for clause in &data_by_clause {
-                for (_, _, data) in clause {
-                    self.evict_cached(data.handle);
-                }
-            }
+            // The bounded pass is discarded and re-walked. Dropping it here
+            // is what releases the handles its successful snapshots minted:
+            // letting the retry keep them would cache a second set for the
+            // same candidates while the first pass's entries stay with no
+            // consumer that can resolve them.
             walk_limit = None;
         };
 
-        let mut merged: Vec<(usize, AXUIElementRef, ElementData)> = Vec::new();
+        let mut merged: Vec<(usize, AXUIElementRef, Cached<'_>)> = Vec::new();
         for (clause_idx, mut phase1_data) in phase1_data_by_clause.into_iter().enumerate() {
             if phase1_data.is_empty() {
                 continue;
@@ -3917,8 +4008,13 @@ impl Provider for MacOSProvider {
             // descendant at its phase-1 ancestor's walk_pos so the doc-order
             // sort puts cross-clause results in the right global order.
             for (anchor_pos, _anchor_ptr, head) in phase1_data {
+                // The anchor is lent to narrowing, not given up: core releases
+                // only the elements it built during the pass, so the guard
+                // stays and evicts the anchor's cache entry when this loop
+                // moves on. The narrowed elements come back released and are
+                // guarded here until the merge decides their fate.
                 let narrowed = self.narrow_multi_segment(
-                    vec![head],
+                    vec![head.borrowed()],
                     &clause.segments[1..],
                     max_depth_val,
                     None,
@@ -3931,7 +4027,7 @@ impl Provider for MacOSProvider {
                         .get_cached(n.handle)
                         .map(|ax| ax.as_ptr())
                         .unwrap_or(std::ptr::null());
-                    merged.push((anchor_pos, ptr, n));
+                    merged.push((anchor_pos, ptr, Cached::new(self, n)));
                 }
             }
         }
@@ -3940,7 +4036,10 @@ impl Provider for MacOSProvider {
         // AXUIElement pointer identity ensures `X, X` collapses correctly.
         merged.sort_by_key(|(pos, _, _)| *pos);
         let mut seen: HashSet<usize> = HashSet::new();
-        let mut out: Vec<ElementData> = Vec::with_capacity(merged.len());
+        // Guarded: a duplicate and a truncated tail are drops like any other
+        // abandonment, and they release their cache entry on the way out
+        // (see [`Cached`]).
+        let mut out: Vec<Cached<'_>> = Vec::with_capacity(merged.len());
         for (_, ptr, data) in merged {
             // Null pointers (resolution failures) can't be sensibly deduped;
             // treat each null as its own key so we keep the element.
@@ -3953,7 +4052,7 @@ impl Provider for MacOSProvider {
         if let Some(l) = limit {
             out.truncate(l);
         }
-        Ok(out)
+        Ok(out.into_iter().map(Cached::release).collect())
     }
 
     fn get_parent(&self, element: &ElementData) -> Result<Option<ElementData>> {
@@ -3965,7 +4064,7 @@ impl Provider for MacOSProvider {
                 }
                 // Check if parent is an application — if so, still return it
                 let data = self.build_element_data(&parent_ax, element.pid)?;
-                Ok(Some(data))
+                Ok(Some(data.release()))
             }
             None => Ok(None),
         }
@@ -4013,7 +4112,10 @@ impl Provider for MacOSProvider {
             });
         }
 
-        let mut surfaces: Vec<(ShellSurfaceKind, ElementData)> = Vec::new();
+        // Every surface is held guarded until the listing is complete: the
+        // `?` on a later surface must release the ones already built, not
+        // strand their AX objects in the handle cache (see [`Cached`]).
+        let mut surfaces: Vec<(ShellSurfaceKind, Cached<'_>)> = Vec::new();
         if let Some(menu_bar) = self.menu_bar_surface(&apps)? {
             surfaces.push(menu_bar);
         }
@@ -4027,7 +4129,10 @@ impl Provider for MacOSProvider {
             surfaces.push(desktop);
         }
         surfaces.extend(shown_menus);
-        Ok(surfaces)
+        Ok(surfaces
+            .into_iter()
+            .map(|(kind, data)| (kind, data.release()))
+            .collect())
     }
 
     /// Enumerate top-level applications via CGWindowList — the canonical
@@ -4037,7 +4142,10 @@ impl Provider for MacOSProvider {
     /// CGWindowList name (which is more consistent across launches).
     fn list_apps(&self) -> Result<Vec<ElementData>> {
         let apps = Self::list_gui_apps();
-        let mut results = Vec::new();
+        // Guarded until the listing is complete: a later unreachable process
+        // or a classified-out `Role::Unknown` node must not strand the
+        // handles of the apps already built (see [`Cached`]).
+        let mut results: Vec<Cached<'_>> = Vec::new();
         for (pid, app_name) in &apps {
             let app_element = AXElement::from_owned(unsafe { safe_ax_create_application(*pid) });
             if app_element.is_null() {
@@ -4075,7 +4183,7 @@ impl Provider for MacOSProvider {
             data.role = Role::Application;
             results.push(data);
         }
-        Ok(results)
+        Ok(results.into_iter().map(Cached::release).collect())
     }
 
     /// Attach to an application directly by pid via
@@ -4153,7 +4261,7 @@ impl Provider for MacOSProvider {
                 // `windows()` on such a node fails with an honest
                 // ActionNotSupported rather than pretending the process has
                 // no windows.
-                Ok(data)
+                Ok(data.release())
             }
             AX_ERROR_CANNOT_COMPLETE
             | AX_ERROR_INVALID_UI_ELEMENT
@@ -4232,7 +4340,7 @@ impl Provider for MacOSProvider {
                 data.name = Some(name);
             }
         }
-        Ok(data)
+        Ok(data.release())
     }
 
     // ── Common actions ──────────────────────────────────────────────
@@ -5044,6 +5152,54 @@ impl MacOSProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An [`EvictHandle`] that records the handles it is asked to release.
+    #[derive(Default)]
+    struct CountingSink {
+        handles: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl CountingSink {
+        fn evicted(&self) -> Vec<u64> {
+            self.handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl EvictHandle for CountingSink {
+        fn evict_handle(&self, handle: u64) {
+            self.handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(handle);
+        }
+    }
+
+    fn cached_fixture(sink: &CountingSink) -> Cached<'_> {
+        let mut data = ElementData::for_role(Role::Unknown);
+        data.handle = 7;
+        Cached::new(sink, data)
+    }
+
+    #[test]
+    fn cached_drop_evicts_the_handle() {
+        let sink = CountingSink::default();
+        drop(cached_fixture(&sink));
+        assert_eq!(sink.evicted(), vec![7]);
+    }
+
+    #[test]
+    fn cached_release_keeps_the_handle() {
+        let sink = CountingSink::default();
+        let data = cached_fixture(&sink).release();
+        assert_eq!(data.handle, 7);
+        assert!(
+            sink.evicted().is_empty(),
+            "a released element's handle must stay resolvable"
+        );
+    }
 
     #[test]
     fn objc_exception_is_caught_by_c_wrapper() {

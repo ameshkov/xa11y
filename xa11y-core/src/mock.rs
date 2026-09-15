@@ -96,6 +96,11 @@ pub struct MockProvider {
     /// Interior-mutable so window verbs can mutate state/bounds in place.
     nodes: Mutex<Vec<MockNode>>,
     actions: Mutex<Vec<ActionLogEntry>>,
+    /// Handles core discarded without returning their elements to a caller,
+    /// in the order [`Provider::discard_element`] reported them. The mock's
+    /// snapshots own no platform resources, so this exists to make the
+    /// lifecycle contract observable in unit tests.
+    discarded: Mutex<Vec<u64>>,
 }
 
 impl MockProvider {
@@ -110,6 +115,22 @@ impl MockProvider {
     /// Clear the action log.
     pub fn clear_actions(&self) {
         self.actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Return a clone of the discard log recorded so far.
+    pub fn discarded(&self) -> Vec<u64> {
+        self.discarded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Clear the discard log.
+    pub fn clear_discarded(&self) {
+        self.discarded
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -217,6 +238,13 @@ impl Provider for MockProvider {
             return Ok(None);
         }
         Ok(nodes[idx].parent.map(|i| nodes[i].data.clone()))
+    }
+
+    fn discard_element(&self, element: &ElementData) {
+        self.discarded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(element.handle);
     }
 
     fn list_apps(&self) -> Result<Vec<ElementData>> {
@@ -902,6 +930,7 @@ pub fn build_provider() -> Arc<MockProvider> {
     Arc::new(MockProvider {
         nodes: Mutex::new(nodes),
         actions: Mutex::new(Vec::new()),
+        discarded: Mutex::new(Vec::new()),
     })
 }
 
