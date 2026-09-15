@@ -1935,16 +1935,39 @@ fn settle_window_fullscreen(
                                 // settability too: the write below is skipped
                                 // for a state the window cannot write, and a
                                 // cached maximize must get the same no-op
-                                // instead of a rejected set.
+                                // instead of a rejected set. The probe follows
+                                // the loop's churn policy: an invalidated
+                                // object leaves the sample unconfirmed (the
+                                // next iteration retries), while a real
+                                // failure propagates.
                                 if state == Some(true) {
-                                    let settable = is_attr_settable(el_ptr, "AXFullScreen")?;
-                                    sample_settable = Some(settable);
+                                    match is_attr_settable(el_ptr, "AXFullScreen") {
+                                        Ok(settable) => {
+                                            sample_settable = Some(settable);
+                                            last_observed = format!(
+                                                "{}; the cached target handle reads \
+                                                 AXFullScreen={state:?}",
+                                                describe_window_fullscreen_sample(&set, want)
+                                            );
+                                            true
+                                        }
+                                        Err(err) if is_gone_ax_element(&err) => {
+                                            last_observed = format!(
+                                                "{}; the cached target handle could not be \
+                                                 probed: {err}",
+                                                describe_window_fullscreen_sample(&set, want)
+                                            );
+                                            false
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
+                                } else {
+                                    last_observed = format!(
+                                        "{}; the cached target handle reads AXFullScreen={state:?}",
+                                        describe_window_fullscreen_sample(&set, want)
+                                    );
+                                    false
                                 }
-                                last_observed = format!(
-                                    "{}; the cached target handle reads AXFullScreen={state:?}",
-                                    describe_window_fullscreen_sample(&set, want)
-                                );
-                                state == Some(true)
                             }
                             // Only an invalidated handle is churn: the target
                             // can be absent from `AXWindows` while AppKit
