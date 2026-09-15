@@ -35,19 +35,25 @@ pub trait Provider: Send + Sync {
     /// Release a provider-built element core is dropping without returning it
     /// to a caller.
     ///
-    /// Core calls this for elements it obtained from the provider *during a
-    /// multi-segment narrowing pass* and then filtered, deduplicated, or
-    /// truncated away (see [`narrow_multi_segment`](Self::narrow_multi_segment)).
-    /// It is never called for the candidates the caller passed in: the caller
-    /// may still hold clones of those, and releasing one would invalidate the
-    /// others.
+    /// Core calls this for elements that it built through the provider during
+    /// a locator pass and then dropped without returning them to a caller:
+    /// the narrowing loop in
+    /// [`narrow_multi_segment`](Self::narrow_multi_segment) (unmatched
+    /// children, duplicates, `:nth` and `limit` drops, a segment that
+    /// aborted) and the rootless merge in `Locator::resolve_group`
+    /// (duplicates, the `limit` tail, and the `list_apps` anchors no clause
+    /// kept). It is never called for candidates the caller passed in and
+    /// still holds clones of, because releasing one value says nothing about
+    /// the handle's last reference.
     ///
-    /// A backend whose elements own platform resources overrides this to
-    /// release them. macOS keeps an `AXUIElement` per `handle` in a cache with
-    /// no other eviction, and mints a fresh handle for every element it returns
-    /// from `get_children` / `find_elements`, so the element passed here is the
-    /// only value backing its handle and the entry can go. The default is a
-    /// no-op for backends whose snapshots own nothing.
+    /// A backend that retains platform objects in a handle cache with no other
+    /// eviction must override this to release the entry: macOS keeps an
+    /// `AXUIElement` per `handle`, and mints a fresh handle for every element
+    /// it returns from `get_children` / `find_elements`, so the element passed
+    /// here is the only value backing its key. That per-snapshot uniqueness is
+    /// the precondition for overriding — a backend that shares one handle
+    /// between live elements would invalidate the others by evicting it. The
+    /// default is a no-op for backends whose snapshots own nothing.
     ///
     /// An element that reaches a caller is the caller's to hold and drop; core
     /// does not call this for it.
