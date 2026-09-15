@@ -266,11 +266,12 @@ mod tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     fn maximize_restore_roundtrip() {
-        // macOS: maximize presses the window's zoom button (there is no
-        // zoom-state AX attribute; see `WindowZoom` in xa11y-macos), and the
-        // state the press leaves behind is AXFullScreen. restore() undoes it.
-        // The read-back is polled because the bridge can round-trip
-        // asynchronously. Windows maximize is not asserted here — the winit
+        // macOS: maximize drives the window's native fullscreen state
+        // (AXFullScreen) — the only readable *and* writable window state —
+        // and restore clears it. There is no readable zoom state (`AXZoomed`
+        // is not an AX attribute), so the read-back is polled: the bridge
+        // round-trips asynchronously and a transition transiently reports the
+        // previous state. Windows maximize is not asserted here — the winit
         // window's TransformPattern coverage is tracked as a gap in
         // tests/matrix.yaml.
         struct MaximizeGuard {
@@ -285,22 +286,156 @@ mod tests {
             }
         }
 
+        /// The test app's real window: the one advertising `verb` that the
+        /// next call is about to run.
+        ///
+        /// Parameterized by the verb because `maximize` and `restore` are
+        /// advertised independently: a committed fullscreen window keeps
+        /// `maximize` even when `AXFullScreen` is no longer settable, and
+        /// `restore` is refused in exactly that state — so a lookup pinned to
+        /// `maximize` cannot stand in for a restore call.
+        ///
+        /// A fullscreen transition transiently replaces the real window with a
+        /// shell window (empty title, `AXUnknown` subrole, no actions) that a
+        /// bare `"window"` selector matches. Selecting by the advertised
+        /// capability pins every poll and every repeated call to the window
+        /// the verbs actually act on.
+        ///
+        /// Strict, like the other assertion lookups in this file: an
+        /// enumeration failure must surface as itself, not as the five-second
+        /// "no maximizable window" timeout (cf. [`dialog_window_result`]).
+        fn main_window(app: &App, verb: &str) -> Option<Element> {
+            main_window_result(app, verb).expect("App::windows() enumeration must succeed")
+        }
+
+        /// [`main_window`] as a `Result`: `Ok(None)` means no window really
+        /// advertises `verb`; an enumeration failure is `Err` and must not
+        /// masquerade as an absent window.
+        fn main_window_result(app: &App, verb: &str) -> Result<Option<Element>> {
+            Ok(app
+                .windows()?
+                .into_iter()
+                .find(|w| w.actions.iter().any(|a| a == verb)))
+        }
+
+        /// The state of the window advertising `verb`, or `None` while it is
+        /// unknown (the real window is transiently absent mid-transition, or
+        /// neither getter answered).
+        ///
+        /// `verb` is the capability the caller is waiting on: on macOS a
+        /// restored window can advertise `restore` while `maximize` is absent
+        /// (the two verbs are independent), so the restored waits select by
+        /// `restore`.
+        ///
+        /// Unknown is not `false`: collapsing it to restored would let a
+        /// restored wait pass without observing anything. macOS reports the
+        /// state as `fullscreen` (AXFullScreen) and leaves `maximized` `None`;
+        /// Windows is the reverse.
+        fn fullscreen(app: &App, verb: &str) -> Option<bool> {
+            let w = main_window(app, verb)?;
+            if w.states.maximized == Some(true) || w.states.fullscreen == Some(true) {
+                return Some(true);
+            }
+            if w.states.maximized.is_some() || w.states.fullscreen.is_some() {
+                return Some(false);
+            }
+            None
+        }
+
+        /// [`main_window`] for `verb`, polled out of the transition churn: a
+        /// fullscreen transition transiently removes the real window from
+        /// `App.windows()`, so a one-shot lookup right after a verb reads the
+        /// absence as "the window is gone".
+        fn wait_for_window(app: &App, verb: &str) -> Element {
+            let what = if verb == "maximize" {
+                "a maximizable window"
+            } else {
+                "a restorable window"
+            };
+            wait_until(Duration::from_secs(5), what, || main_window(app, verb))
+        }
+
+        /// Wait until the window advertising `verb` reports `want` as its
+        /// fullscreen state.
+        ///
+        /// `wait_until` returns on any `Some`, so the predicate filters `want`
+        /// explicitly; [`fullscreen`] answers `None` while the target is
+        /// transiently absent, and that unknown must not be read as the
+        /// opposite verdict.
+        fn wait_for_fullscreen(app: &App, verb: &str, want: bool, what: &str) {
+            wait_until(Duration::from_secs(5), what, || {
+                fullscreen(app, verb)
+                    .filter(|fullscreen| *fullscreen == want)
+                    .map(|_| ())
+            });
+        }
+
         let app = h::app_root();
-        let win = h::one(&app, "window");
+        let win = wait_for_window(&app, "maximize");
         let _guard = MaximizeGuard { win: win.clone() };
+
+        // maximize commits.
         win.maximize().expect("maximize must succeed");
-        wait_until(Duration::from_secs(5), "window to report maximized", || {
-            let w = h::one(&app, "window");
-            // macOS reports the zoomed state as `fullscreen` (AXFullScreen).
-            (w.states.maximized == Some(true) || w.states.fullscreen == Some(true)).then_some(())
-        });
-        win.restore().expect("restore must succeed");
-        wait_until(Duration::from_secs(5), "window to report restored", || {
-            let w = h::one(&app, "window");
-            let still_zoomed =
-                w.states.maximized == Some(true) || w.states.fullscreen == Some(true);
-            (!still_zoomed).then_some(())
-        });
+        wait_for_fullscreen(&app, "maximize", true, "window to report fullscreen");
+
+        // A repeated maximize must not toggle the window back out. Give the
+        // (would-be) toggle time to land before asserting the state is still
+        // fullscreen — the exit transition is what the old zoom-button press
+        // started.
+        wait_for_window(&app, "maximize")
+            .maximize()
+            .expect("repeated maximize must succeed");
+        std::thread::sleep(Duration::from_secs(2));
+        wait_for_fullscreen(
+            &app,
+            "maximize",
+            true,
+            "the window to remain fullscreen after a second maximize",
+        );
+
+        // restore commits, and a repeated restore must not re-enter
+        // fullscreen.
+        wait_for_window(&app, "restore")
+            .restore()
+            .expect("restore must succeed");
+        wait_for_fullscreen(&app, "restore", false, "window to report restored");
+        wait_for_window(&app, "restore")
+            .restore()
+            .expect("repeated restore must succeed");
+        std::thread::sleep(Duration::from_secs(2));
+        wait_for_fullscreen(
+            &app,
+            "restore",
+            false,
+            "the window to remain restored after a second restore",
+        );
+
+        // maximize -> restore -> maximize -> restore ends where every call
+        // promises; no call may toggle the state the next one sets.
+        //
+        // Each step lets the previous transition finish before the next call:
+        // driving a new fullscreen change into an animation still in flight
+        // makes the window server leave the transition shell behind as a
+        // visible extra window (the verbs still land on the right state, but
+        // the shell then breaks the shared app for the tests after this one).
+        for expected_fullscreen in [true, false, true, false] {
+            // Each step waits for the verb it is about to run: `maximize` and
+            // `restore` are advertised independently, so a maximize lookup
+            // cannot stand in for a restore call.
+            let verb = if expected_fullscreen {
+                "maximize"
+            } else {
+                "restore"
+            };
+            let w = wait_for_window(&app, verb);
+            if expected_fullscreen {
+                w.maximize().expect("maximize must succeed");
+            } else {
+                w.restore().expect("restore must succeed");
+            }
+            wait_for_fullscreen(&app, verb, expected_fullscreen, "sequence step to settle");
+            std::thread::sleep(Duration::from_millis(1500));
+        }
     }
 
     #[test]

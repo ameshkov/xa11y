@@ -274,6 +274,11 @@ impl Locator {
         let mut out: Vec<ElementData> = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for app in &apps {
+            // Whether a single-segment clause kept the app element itself in
+            // `out`. An app that reaches no caller is core's to release, like
+            // any other element this pass built (see
+            // [`Provider::discard_element`]).
+            let mut app_in_out = false;
             // (2a) The app element itself may match the selector — e.g.
             // `application` or `application button`. `find_elements_group`
             // only emits *descendants* of its root, so we test the app
@@ -289,6 +294,7 @@ impl Locator {
                 if clause.segments.len() == 1 {
                     if seen.insert(app.handle) {
                         out.push(app.clone());
+                        app_in_out = true;
                     }
                     continue;
                 }
@@ -306,6 +312,8 @@ impl Locator {
                 for d in narrowed {
                     if seen.insert(d.handle) {
                         out.push(d);
+                    } else {
+                        self.provider.discard_element(&d);
                     }
                 }
             }
@@ -315,11 +323,21 @@ impl Locator {
             for d in per_app {
                 if seen.insert(d.handle) {
                     out.push(d);
+                } else {
+                    self.provider.discard_element(&d);
                 }
+            }
+
+            if !app_in_out {
+                self.provider.discard_element(app);
             }
         }
         if let Some(l) = limit {
-            out.truncate(l);
+            if out.len() > l {
+                for dropped in out.drain(l..) {
+                    self.provider.discard_element(&dropped);
+                }
+            }
         }
         Ok(out)
     }
@@ -956,6 +974,7 @@ mod tests {
 
     use super::*;
     use crate::mock::build_provider;
+    use crate::Role;
 
     fn root_locator(selector: &str) -> Locator {
         let provider = build_provider();
@@ -1758,5 +1777,53 @@ mod tests {
         assert!(capped.ends_with("… (+7 more lines truncated)"), "{capped}");
         // Under the cap: unchanged, no marker.
         assert_eq!(truncate_lines("a\nb", 3), "a\nb");
+    }
+
+    #[test]
+    fn rootless_narrowing_releases_the_app_anchor() {
+        // Rootless discovery enumerates apps via `list_apps`; an app that no
+        // clause keeps reaches no caller, so the merge must release it (see
+        // `Provider::discard_element`).
+        let provider = build_provider();
+        let app = provider.get_children(None).expect("mock root").remove(0);
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let loc = Locator::new(provider_dyn, None, "application > window");
+
+        let elements = loc.elements().expect("multi-segment search");
+
+        assert_eq!(names(&elements), vec!["Main Window"]);
+        assert_eq!(provider.discarded(), vec![app.handle]);
+    }
+
+    #[test]
+    fn rootless_truncation_releases_the_dropped_matches() {
+        let provider = build_provider();
+        let app = provider.get_children(None).expect("mock root").remove(0);
+        let window = provider
+            .get_children(Some(&app))
+            .expect("app children")
+            .into_iter()
+            .find(|e| e.name.as_deref() == Some("Main Window"))
+            .expect("Main Window");
+        let content = provider
+            .get_children(Some(&window))
+            .expect("window children")
+            .into_iter()
+            .find(|e| e.role == Role::Group)
+            .expect("content group");
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        // `.nth(1)` bounds the rootless merge at one result, so the second
+        // match on `.element()`'s resolution is dropped.
+        let loc = Locator::new(provider_dyn, None, "application > window > *").nth(1);
+
+        let el = loc.element().expect("bounded multi-segment search");
+
+        assert_eq!(el.data().role, Role::Toolbar);
+        // The intermediate window the narrowing pass built, the app anchor,
+        // and the truncated tail — none reaches a caller.
+        assert_eq!(
+            provider.discarded(),
+            vec![window.handle, app.handle, content.handle]
+        );
     }
 }

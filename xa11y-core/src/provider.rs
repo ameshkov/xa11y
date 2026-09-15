@@ -32,6 +32,33 @@ pub trait Provider: Send + Sync {
     /// Returns `None` for top-level (application) elements.
     fn get_parent(&self, element: &ElementData) -> Result<Option<ElementData>>;
 
+    /// Release a provider-built element core is dropping without returning it
+    /// to a caller.
+    ///
+    /// Core calls this for elements that it built through the provider during
+    /// a locator pass and then dropped without returning them to a caller:
+    /// the narrowing loop in
+    /// [`narrow_multi_segment`](Self::narrow_multi_segment) (unmatched
+    /// children, duplicates, `:nth` and `limit` drops, a segment that
+    /// aborted) and the rootless merge in `Locator::resolve_group`
+    /// (duplicates, the `limit` tail, and the `list_apps` anchors no clause
+    /// kept). It is never called for candidates the caller passed in and
+    /// still holds clones of, because releasing one value says nothing about
+    /// the handle's last reference.
+    ///
+    /// A backend that retains platform objects in a handle cache with no other
+    /// eviction must override this to release the entry: macOS keeps an
+    /// `AXUIElement` per `handle`, and mints a fresh handle for every element
+    /// it returns from `get_children` / `find_elements`, so the element passed
+    /// here is the only value backing its key. That per-snapshot uniqueness is
+    /// the precondition for overriding — a backend that shares one handle
+    /// between live elements would invalidate the others by evicting it. The
+    /// default is a no-op for backends whose snapshots own nothing.
+    ///
+    /// An element that reaches a caller is the caller's to hold and drop; core
+    /// does not call this for it.
+    fn discard_element(&self, _element: &ElementData) {}
+
     /// Enumerate top-level applications visible to this provider.
     ///
     /// Backends return one `ElementData` per application, always with
@@ -247,15 +274,35 @@ pub trait Provider: Send + Sync {
         max_depth: u32,
         limit: Option<usize>,
     ) -> Result<Vec<ElementData>> {
+        // Whether the candidates in hand were built by this pass. Only those
+        // are core's to release: the caller-supplied input may be aliased
+        // elsewhere (the caller can hold clones), and releasing one value says
+        // nothing about the handle's last reference (see `discard_element`).
+        let mut ours = false;
         for segment in segments {
             let mut next_candidates = Vec::new();
+            // A provider call that fails mid-segment leaves the candidates
+            // collected before it in hand; they reach no caller, so they are
+            // released below rather than dropped by `?`.
+            let mut segment_err: Option<Error> = None;
             for candidate in &candidates {
                 match segment.combinator {
                     Combinator::Child => {
-                        let children = self.get_children(Some(candidate))?;
+                        let children = match self.get_children(Some(candidate)) {
+                            Ok(children) => children,
+                            Err(err) => {
+                                segment_err = Some(err);
+                                break;
+                            }
+                        };
                         for child in children {
                             if matches_simple(&child, &segment.simple) {
                                 next_candidates.push(child);
+                            } else {
+                                // A child that could not match this segment is
+                                // not carried forward; release it (see
+                                // [`Provider::discard_element`]).
+                                self.discard_element(&child);
                             }
                         }
                     }
@@ -266,29 +313,83 @@ pub trait Provider: Send + Sync {
                                 simple: segment.simple.clone(),
                             }],
                         };
-                        let mut sub_results =
-                            self.find_elements(candidate, &sub_selector, None, Some(max_depth))?;
-                        next_candidates.append(&mut sub_results);
+                        match self.find_elements(candidate, &sub_selector, None, Some(max_depth)) {
+                            Ok(mut sub_results) => next_candidates.append(&mut sub_results),
+                            Err(err) => {
+                                segment_err = Some(err);
+                                break;
+                            }
+                        }
                     }
                     Combinator::Root => unreachable!(),
                 }
             }
+            if let Some(err) = segment_err {
+                // Everything this segment built so far, and — past the first
+                // round — the input candidates themselves, reaches no caller
+                // when the pass aborts: release them before returning.
+                for dropped in next_candidates.drain(..) {
+                    self.discard_element(&dropped);
+                }
+                if ours {
+                    for dropped in candidates.drain(..) {
+                        self.discard_element(&dropped);
+                    }
+                }
+                return Err(err);
+            }
+            // The input candidates are not carried forward: a node the
+            // remaining segments did not keep reaches no caller. The first
+            // round is the caller's input, and is only dropped.
+            if ours {
+                for dropped in candidates.drain(..) {
+                    self.discard_element(&dropped);
+                }
+            } else {
+                candidates.clear();
+            }
             let mut seen = std::collections::HashSet::new();
-            next_candidates.retain(|e| seen.insert(e.handle));
+            next_candidates.retain(|e| {
+                let fresh = seen.insert(e.handle);
+                if !fresh {
+                    // A duplicate of a candidate already kept under this
+                    // segment's match.
+                    self.discard_element(e);
+                }
+                fresh
+            });
             candidates = next_candidates;
+            ours = true;
         }
 
         // Apply :nth on last segment
         if let Some(nth) = segments.last().and_then(|s| s.simple.nth) {
             if nth <= candidates.len() {
-                candidates = vec![candidates.remove(nth - 1)];
+                let kept = candidates.remove(nth - 1);
+                for dropped in candidates.drain(..) {
+                    if ours {
+                        self.discard_element(&dropped);
+                    }
+                }
+                candidates.push(kept);
             } else {
-                candidates.clear();
+                for dropped in candidates.drain(..) {
+                    if ours {
+                        self.discard_element(&dropped);
+                    }
+                }
             }
         }
 
         if let Some(limit) = limit {
-            candidates.truncate(limit);
+            while candidates.len() > limit {
+                // The length check rules out an empty vector.
+                if let Some(dropped) = candidates.pop() {
+                    if ours {
+                        self.discard_element(&dropped);
+                    }
+                }
+            }
         }
 
         Ok(candidates)
@@ -483,6 +584,13 @@ impl<T: Provider + ?Sized> Provider for &T {
     ) -> Result<Vec<ElementData>> {
         (**self).narrow_multi_segment(candidates, segments, max_depth, limit)
     }
+    // Delegated explicitly (despite having a default impl) so a concrete
+    // provider's resource release isn't bypassed when it is used through a
+    // shared reference — the default body on `&T` is a no-op, and a macOS
+    // provider would silently keep every narrowed-away element in its cache.
+    fn discard_element(&self, element: &ElementData) {
+        (**self).discard_element(element)
+    }
     fn press(&self, element: &ElementData) -> Result<()> {
         (**self).press(element)
     }
@@ -554,5 +662,142 @@ impl<T: Provider + ?Sized> Provider for &T {
     }
     fn subscribe(&self, element: &ElementData) -> Result<Subscription> {
         (**self).subscribe(element)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::{build_provider, MockProvider};
+    use crate::role::Role;
+
+    /// The mock's `Main Window` plus its `toolbar` and `group` children.
+    fn window_and_children(provider: &MockProvider) -> (ElementData, ElementData, ElementData) {
+        let app = provider.get_children(None).expect("mock root").remove(0);
+        let window = provider
+            .get_children(Some(&app))
+            .expect("app children")
+            .into_iter()
+            .find(|e| e.name.as_deref() == Some("Main Window"))
+            .expect("Main Window");
+        let children = provider
+            .get_children(Some(&window))
+            .expect("window children");
+        let toolbar = children
+            .iter()
+            .find(|e| e.role == Role::Toolbar)
+            .expect("toolbar");
+        let content = children
+            .iter()
+            .find(|e| e.role == Role::Group)
+            .expect("content group");
+        (window, toolbar.clone(), content.clone())
+    }
+
+    /// Narrow `anchor` through `selector`'s segments after the leading one, as
+    /// [`Provider::find_elements_group`] does for a multi-segment clause.
+    fn narrow(
+        provider: &MockProvider,
+        anchor: ElementData,
+        selector: &str,
+        limit: Option<usize>,
+    ) -> Vec<ElementData> {
+        let group = SelectorGroup::parse(selector).expect("test selector parses");
+        provider
+            .narrow_multi_segment(vec![anchor], &group.clauses[0].segments[1..], 10, limit)
+            .expect("narrowing succeeds")
+    }
+
+    #[test]
+    fn narrowing_discards_children_that_cannot_match() {
+        let provider = build_provider();
+        let (window, toolbar, content) = window_and_children(&provider);
+        let anchor = window.handle;
+
+        let out = narrow(&provider, window, "window > button", None);
+
+        assert!(out.is_empty(), "no direct child of the window is a button");
+        // Both non-matching children, but not the caller-supplied anchor: the
+        // caller may still hold clones of it.
+        assert_eq!(provider.discarded(), vec![toolbar.handle, content.handle]);
+        assert!(
+            !provider.discarded().contains(&anchor),
+            "core must not release a candidate the caller supplied"
+        );
+    }
+
+    #[test]
+    fn narrowing_discards_the_truncated_tail() {
+        let provider = build_provider();
+        let (_, toolbar, _) = window_and_children(&provider);
+        let forward = provider
+            .get_children(Some(&toolbar))
+            .expect("toolbar children")
+            .into_iter()
+            .find(|e| e.name.as_deref() == Some("Forward"))
+            .expect("Forward button");
+
+        let out = narrow(&provider, toolbar, "toolbar > button", Some(1));
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name.as_deref(), Some("Back"));
+        // Only the truncated `Forward`: the anchor was the caller's.
+        assert_eq!(provider.discarded(), vec![forward.handle]);
+    }
+
+    #[test]
+    fn narrowing_discards_the_children_outside_nth() {
+        let provider = build_provider();
+        let (_, toolbar, _) = window_and_children(&provider);
+        let forward = provider
+            .get_children(Some(&toolbar))
+            .expect("toolbar children")
+            .into_iter()
+            .find(|e| e.name.as_deref() == Some("Forward"))
+            .expect("Forward button");
+
+        let out = narrow(&provider, toolbar, "toolbar > button:nth(1)", None);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name.as_deref(), Some("Back"));
+        assert_eq!(provider.discarded(), vec![forward.handle]);
+    }
+
+    #[test]
+    fn narrowing_releases_what_it_built_when_a_segment_fails() {
+        let provider = build_provider();
+        let (window, toolbar, content) = window_and_children(&provider);
+        let toolbar_children = provider
+            .get_children(Some(&toolbar))
+            .expect("toolbar children");
+        let back = toolbar_children
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Back"))
+            .expect("Back button")
+            .handle;
+        let forward = toolbar_children
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Forward"))
+            .expect("Forward button")
+            .handle;
+
+        // The second round lists the toolbar's buttons, then fails on the
+        // content group: the two buttons it already collected, plus the two
+        // first-round candidates it was iterating, all reach no caller.
+        provider.fail_children(content.handle);
+        let group = SelectorGroup::parse("window > * > button").expect("test selector parses");
+        let err = provider
+            .narrow_multi_segment(vec![window], &group.clauses[0].segments[1..], 10, None)
+            .expect_err("the injected child-listing failure propagates");
+
+        assert!(
+            matches!(err, Error::Platform { .. }),
+            "the injected failure must surface unchanged, got {err:?}"
+        );
+        assert_eq!(
+            provider.discarded(),
+            vec![back, forward, toolbar.handle, content.handle],
+            "a failed segment must release what it built, not strand it"
+        );
     }
 }

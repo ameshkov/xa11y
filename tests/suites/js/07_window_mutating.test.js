@@ -38,13 +38,37 @@ async function windowAdvertising(app, verb) {
   return windows.find((w) => w.actions.includes(verb)) || null;
 }
 
+async function waitForWindow(app, verb, what) {
+  // A fullscreen transition transiently removes the real window from
+  // app.windows() (a shell window appears in its place), and the provider's
+  // settle loop promises the *state*, not that the window is enumerable the
+  // instant the verb returns. A one-shot lookup right after a verb reads that
+  // absence as "the window is gone", so every repeated call waits for it.
+  return waitUntil(() => windowAdvertising(app, verb), 5000, what);
+}
+
 async function waitUntil(predicate, timeoutMs, what) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await predicate()) return;
+    const result = await predicate();
+    if (result) return result;
     await sleep(100);
   }
   throw new Error(`Timed out waiting for ${what}`);
+}
+
+async function restoreWindowBestEffort(app) {
+  // waitForWindow with `restore`, not a one-shot lookup and not a `maximize`
+  // lookup: the transition can have the real window out of app.windows(), and
+  // a window that advertises `maximize` does not necessarily advertise the
+  // `restore` this cleanup needs. Never throws: cleanup must not replace the
+  // original failure.
+  try {
+    const current = await waitForWindow(app, 'restore', 'a restorable window');
+    await current.restore();
+  } catch (_cleanup) {
+    // best-effort cleanup; the original error wins
+  }
 }
 
 async function dialogWindow(app) {
@@ -149,6 +173,28 @@ test('a window that advertises minimize is minimized and restored', async () => 
   }
 });
 
+async function windowReadsMaximized(app, verb) {
+  // `verb` is the capability the caller is waiting on: on macOS a restored
+  // window can advertise `restore` while `maximize` is absent (the two verbs
+  // are independent — `maximize` needs AXFullScreen settable, `restore` can
+  // be a minimize-only window), so the false-state waits select by `restore`
+  // and the true-state waits by `maximize`.
+  //
+  // The state is platform-specific: Windows reports `maximized`, macOS
+  // reports the native fullscreen state as `fullscreen` (its `maximized`
+  // stays null). Both are checked so the assertion is portable.
+  //
+  // null while the state is unknown: no window advertising `verb` is
+  // enumerable (the transition transiently removes the real window), or
+  // neither getter answered. Boolean(null) would read that as "restored" and
+  // let the state waits below pass without observing anything.
+  const win = await windowAdvertising(app, verb);
+  if (!win) return null;
+  if (win.maximized === true || win.fullscreen === true) return true;
+  if (win.maximized === false || win.fullscreen === false) return false;
+  return null;
+}
+
 test('a window that advertises maximize is maximized and restored', async () => {
   const app = await getApp();
   const win = await windowAdvertising(app, 'maximize');
@@ -157,16 +203,69 @@ test('a window that advertises maximize is maximized and restored', async () => 
   }
   try {
     await win.maximize();
-    await win.restore();
-  } catch (err) {
-    try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
+    await waitUntil(
+      async () => (await windowReadsMaximized(app, 'maximize')) === true,
+      5000,
+      'window to report maximized'
+    );
+    // Repeated calls must be idempotent, not toggles: the old macOS provider
+    // pressed the window's zoom button, so a second maximize exited
+    // fullscreen (issue #399). Re-read the window first: the platform can
+    // recreate the window object during the transition.
+    let current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    await current.maximize();
+    await sleep(2000);
+    await waitUntil(
+      async () => (await windowReadsMaximized(app, 'maximize')) === true,
+      5000,
+      'the window to remain maximized after a second maximize'
+    );
+    current = await waitForWindow(app, 'restore', 'a restorable window');
+    await current.restore();
+    await waitUntil(
+      async () => (await windowReadsMaximized(app, 'restore')) === false,
+      5000,
+      'window to report restored'
+    );
+    current = await waitForWindow(app, 'restore', 'a restorable window');
+    await current.restore();
+    await sleep(2000);
+    await waitUntil(
+      async () => (await windowReadsMaximized(app, 'restore')) === false,
+      5000,
+      'the window to remain restored after a second restore'
+    );
+    // maximize -> restore -> maximize -> restore ends where every call
+    // promises; no call may toggle the state the next one sets. Each step
+    // lets the previous transition finish before the next call, because
+    // driving a new fullscreen change into an animation still in flight
+    // makes the window server leave the transition shell behind.
+    for (const expected of [true, false, true, false]) {
+      // Wait for the verb about to run: `maximize` and `restore` are
+      // advertised independently (a committed fullscreen window can keep
+      // `maximize` while its AXFullScreen is no longer settable, and
+      // `restore` is refused in exactly that state), so a lookup pinned to
+      // `maximize` cannot stand in for a restore call.
+      const verb = expected ? 'maximize' : 'restore';
+      current = await waitForWindow(
+        app,
+        verb,
+        expected ? 'a maximizable window' : 'a restorable window'
+      );
+      if (expected) {
+        await current.maximize();
+      } else {
         await current.restore();
       }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
+      await waitUntil(
+        async () => (await windowReadsMaximized(app, expected ? 'maximize' : 'restore')) === expected,
+        5000,
+        `the window to read maximized=${expected} during the alternating sequence`
+      );
+      await sleep(1500);
     }
+  } catch (err) {
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
@@ -268,14 +367,7 @@ test('Locator maximize()/restore() dispatch through the async binding', async ()
     await locator.maximize();
     await locator.restore();
   } catch (err) {
-    try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
