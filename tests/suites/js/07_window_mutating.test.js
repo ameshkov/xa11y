@@ -205,14 +205,14 @@ test('a window that advertises maximize is maximized and restored', async () => 
       5000,
       'the window to remain maximized after a second maximize'
     );
-    current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    current = await waitForWindow(app, 'restore', 'a restorable window');
     await current.restore();
     await waitUntil(
       async () => (await windowReadsMaximized(app)) === false,
       5000,
       'window to report restored'
     );
-    current = await waitForWindow(app, 'maximize', 'a maximizable window');
+    current = await waitForWindow(app, 'restore', 'a restorable window');
     await current.restore();
     await sleep(2000);
     await waitUntil(
@@ -226,7 +226,17 @@ test('a window that advertises maximize is maximized and restored', async () => 
     // driving a new fullscreen change into an animation still in flight
     // makes the window server leave the transition shell behind.
     for (const expected of [true, false, true, false]) {
-      current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      // Wait for the verb about to run: `maximize` and `restore` are
+      // advertised independently (a committed fullscreen window can keep
+      // `maximize` while its AXFullScreen is no longer settable, and
+      // `restore` is refused in exactly that state), so a lookup pinned to
+      // `maximize` cannot stand in for a restore call.
+      const verb = expected ? 'maximize' : 'restore';
+      current = await waitForWindow(
+        app,
+        verb,
+        expected ? 'a maximizable window' : 'a restorable window'
+      );
       if (expected) {
         await current.maximize();
       } else {
@@ -241,10 +251,11 @@ test('a window that advertises maximize is maximized and restored', async () => 
     }
   } catch (err) {
     try {
-      // waitForWindow, not a one-shot lookup: the transition can have the
-      // real window out of app.windows(), and a null here would leave the
-      // shared app fullscreen for the suites after this one.
-      const current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      // waitForWindow with `restore`, not a one-shot lookup and not a
+      // `maximize` lookup: the transition can have the real window out of
+      // app.windows(), and a window that advertises `maximize` does not
+      // necessarily advertise the `restore` this cleanup needs.
+      const current = await waitForWindow(app, 'restore', 'a restorable window');
       await current.restore();
     } catch (_cleanup) {
       // best-effort cleanup; the original error wins
@@ -353,8 +364,9 @@ test('Locator maximize()/restore() dispatch through the async binding', async ()
     try {
       // Same failure-preserving cleanup as the element path: a one-shot
       // lookup can miss the window while the transition has it out of
-      // app.windows(), leaving the shared app fullscreen.
-      const current = await waitForWindow(app, 'maximize', 'a maximizable window');
+      // app.windows(), and the lookup waits for `restore` — the verb the
+      // cleanup actually calls.
+      const current = await waitForWindow(app, 'restore', 'a restorable window');
       await current.restore();
     } catch (_cleanup) {
       // best-effort cleanup; the original error wins

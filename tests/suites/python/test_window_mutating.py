@@ -298,7 +298,7 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             5.0,
             "the window to remain maximized after a second maximize",
         )
-        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current = _wait_for_window(app, "restore", "a restorable window")
         current.restore()
         _wait_until(
             lambda: _window_reads_maximized(app) is False,
@@ -306,7 +306,7 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             "window to report restored",
         )
         # A repeated restore must not re-enter the maximized state.
-        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current = _wait_for_window(app, "restore", "a restorable window")
         current.restore()
         time.sleep(2.0)
         _wait_until(
@@ -320,7 +320,16 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         # driving a new fullscreen change into an animation still in flight
         # makes the window server leave the transition shell behind.
         for expected in (True, False, True, False):
-            current = _wait_for_window(app, "maximize", "a maximizable window")
+            # Wait for the verb about to run: `maximize` and `restore` are
+            # advertised independently (a committed fullscreen window can keep
+            # `maximize` while its AXFullScreen is no longer settable, and
+            # `restore` is refused in exactly that state), so a lookup pinned
+            # to `maximize` cannot stand in for a restore call.
+            current = _wait_for_window(
+                app,
+                "maximize" if expected else "restore",
+                "a maximizable window" if expected else "a restorable window",
+            )
             if expected:
                 current.maximize()
             else:
@@ -333,12 +342,13 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             time.sleep(1.5)
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
-        # not be left maximized for the suites after this one. ``_wait_for_window``,
-        # not a one-shot lookup: the transition can have the real window out
-        # of ``App.windows()``, and a ``None`` here would leave the shared app
-        # fullscreen for the suites after this one.
+        # not be left maximized for the suites after this one.
+        # ``_wait_for_window`` with `restore`, not a one-shot lookup and not a
+        # `maximize` lookup: the transition can have the real window out of
+        # ``App.windows()``, and a window that advertises `maximize` does not
+        # necessarily advertise the `restore` this cleanup needs.
         try:
-            current = _wait_for_window(app, "maximize", "a maximizable window")
+            current = _wait_for_window(app, "restore", "a restorable window")
             current.restore()
         except Exception:  # best-effort cleanup; the original error wins
             pass
@@ -736,9 +746,10 @@ def test_locator_maximize_and_restore(app: xa11y.App) -> None:
     except Exception:
         # Same failure-preserving cleanup as the element path: a one-shot
         # lookup can miss the window while the transition has it out of
-        # ``App.windows()``, leaving the shared app fullscreen.
+        # ``App.windows()``, and the lookup waits for `restore` — the verb
+        # this cleanup actually calls.
         try:
-            current = _wait_for_window(app, "maximize", "a maximizable window")
+            current = _wait_for_window(app, "restore", "a restorable window")
             current.restore()
         except Exception:  # best-effort cleanup; the original error wins
             pass

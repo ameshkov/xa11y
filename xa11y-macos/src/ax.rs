@@ -1773,7 +1773,8 @@ fn app_window_fullscreen_snapshot(
     Ok(Some(samples))
 }
 
-/// A one-line description of a window set for the timeout [`Diagnosis`].
+/// A one-line description of a window set for the timeout
+/// [`xa11y_core::Diagnosis`].
 fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: bool) -> String {
     let fullscreen = samples.iter().filter(|w| w.fullscreen).count();
     let settable = samples.iter().filter(|w| w.settable).count();
@@ -1830,7 +1831,7 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
 /// Element-level failures during the wait (a recreated window object answers
 /// `kAXErrorInvalidUIElement`) do not end it: the retry is attempted again on
 /// the next tick, and an unmet promise fails at the deadline with a
-/// [`Diagnosis`] naming what was last observed (tenet 6).
+/// [`xa11y_core::Diagnosis`] naming what was last observed (tenet 6).
 fn settle_window_fullscreen(
     el_ptr: AXUIElementRef,
     want: bool,
@@ -1923,7 +1924,16 @@ fn settle_window_fullscreen(
                         ) {
                             (Ok(Some(false)), Ok(true)) => {
                                 reached = true;
-                                last_observed = describe_window_fullscreen_sample(&set, want);
+                                // The cached read is the evidence that the
+                                // promise holds; record it in the diagnosis
+                                // like the maximize branch does, so a timeout
+                                // that follows says more than "the target was
+                                // not enumerable".
+                                last_observed = format!(
+                                    "{}; the cached target handle reads AXFullScreen=false \
+                                     (settable=true)",
+                                    describe_window_fullscreen_sample(&set, want)
+                                );
                             }
                             (Ok(state), Ok(settable)) => {
                                 last_observed = format!(

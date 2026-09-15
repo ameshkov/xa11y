@@ -286,7 +286,14 @@ mod tests {
             }
         }
 
-        /// The test app's real window: the one advertising the window verbs.
+        /// The test app's real window: the one advertising `verb` that the
+        /// next call is about to run.
+        ///
+        /// Parameterized by the verb because `maximize` and `restore` are
+        /// advertised independently: a committed fullscreen window keeps
+        /// `maximize` even when `AXFullScreen` is no longer settable, and
+        /// `restore` is refused in exactly that state — so a lookup pinned to
+        /// `maximize` cannot stand in for a restore call.
         ///
         /// A fullscreen transition transiently replaces the real window with a
         /// shell window (empty title, `AXUnknown` subrole, no actions) that a
@@ -297,18 +304,18 @@ mod tests {
         /// Strict, like the other assertion lookups in this file: an
         /// enumeration failure must surface as itself, not as the five-second
         /// "no maximizable window" timeout (cf. [`dialog_window_result`]).
-        fn main_window(app: &App) -> Option<Element> {
-            main_window_result(app).expect("App::windows() enumeration must succeed")
+        fn main_window(app: &App, verb: &str) -> Option<Element> {
+            main_window_result(app, verb).expect("App::windows() enumeration must succeed")
         }
 
         /// [`main_window`] as a `Result`: `Ok(None)` means no window really
-        /// advertises the verbs; an enumeration failure is `Err` and must not
+        /// advertises `verb`; an enumeration failure is `Err` and must not
         /// masquerade as an absent window.
-        fn main_window_result(app: &App) -> Result<Option<Element>> {
+        fn main_window_result(app: &App, verb: &str) -> Result<Option<Element>> {
             Ok(app
                 .windows()?
                 .into_iter()
-                .find(|w| w.actions.iter().any(|a| a == "maximize")))
+                .find(|w| w.actions.iter().any(|a| a == verb)))
         }
 
         /// The main window's maximized/fullscreen state, or `None` while it is
@@ -320,7 +327,7 @@ mod tests {
         /// state as `fullscreen` (AXFullScreen) and leaves `maximized` `None`;
         /// Windows is the reverse.
         fn fullscreen(app: &App) -> Option<bool> {
-            let w = main_window(app)?;
+            let w = main_window(app, "maximize")?;
             if w.states.maximized == Some(true) || w.states.fullscreen == Some(true) {
                 return Some(true);
             }
@@ -332,7 +339,7 @@ mod tests {
 
         let app = h::app_root();
         let win = wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app)
+            main_window(&app, "maximize")
         });
         let _guard = MaximizeGuard { win: win.clone() };
 
@@ -355,7 +362,7 @@ mod tests {
         // fullscreen — the exit transition is what the old zoom-button press
         // started.
         wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app)
+            main_window(&app, "maximize")
         })
         .maximize()
         .expect("repeated maximize must succeed");
@@ -367,8 +374,8 @@ mod tests {
 
         // restore commits, and a repeated restore must not re-enter
         // fullscreen.
-        wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app)
+        wait_until(Duration::from_secs(5), "a restorable window", || {
+            main_window(&app, "restore")
         })
         .restore()
         .expect("restore must succeed");
@@ -377,8 +384,8 @@ mod tests {
                 .filter(|fullscreen| !*fullscreen)
                 .map(|_| ())
         });
-        wait_until(Duration::from_secs(5), "a maximizable window", || {
-            main_window(&app)
+        wait_until(Duration::from_secs(5), "a restorable window", || {
+            main_window(&app, "restore")
         })
         .restore()
         .expect("repeated restore must succeed");
@@ -397,9 +404,15 @@ mod tests {
         // visible extra window (the verbs still land on the right state, but
         // the shell then breaks the shared app for the tests after this one).
         for expected_fullscreen in [true, false, true, false] {
-            let w = wait_until(Duration::from_secs(5), "a maximizable window", || {
-                main_window(&app)
-            });
+            // Each step waits for the verb it is about to run: `maximize` and
+            // `restore` are advertised independently, so a maximize lookup
+            // cannot stand in for a restore call.
+            let (verb, what) = if expected_fullscreen {
+                ("maximize", "a maximizable window")
+            } else {
+                ("restore", "a restorable window")
+            };
+            let w = wait_until(Duration::from_secs(5), what, || main_window(&app, verb));
             if expected_fullscreen {
                 w.maximize().expect("maximize must succeed");
             } else {
