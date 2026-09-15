@@ -679,45 +679,6 @@ fn is_not_yet_reachable(err: &Error) -> bool {
     )
 }
 
-/// Recover a platform failure from a failed [`BatchAttrs::fetch`].
-///
-/// The batch fetch collapses every failure to `None`, and
-/// [`ResolvedAttrs::from_individual`] then answers "absent" for every
-/// attribute — a dead or wedged element would be built as a role-less ghost
-/// instead of carrying its failure out. Probe `AXRole` (one failure-path
-/// round-trip): a probe that is answered (`kAXErrorAttributeUnsupported` /
-/// `kAXErrorNoValue`, or a value) means the element is alive and the batch
-/// call was the thing that failed, so the individual fallback still gets its
-/// chance. A probe the process does not answer is the element's own failure:
-/// `kAXErrorInvalidUIElement` (the object no longer exists) is the churn the
-/// enumerating callers drop ([`is_gone_ax_element`]), and every other code (a
-/// messaging timeout, a wedged process) is a real platform failure the
-/// callers propagate (tenet 1).
-fn batch_failure_error(element: AXUIElementRef) -> Result<()> {
-    classify_batch_probe(read_raw_attr(element, "AXRole"))
-}
-
-/// The classification behind [`batch_failure_error`], split out so the error
-/// mapping is unit-testable without a live AX element.
-fn classify_batch_probe(probe: RawAttr) -> Result<()> {
-    match probe {
-        RawAttr::Value(v) => {
-            unsafe { safe_cf_release(v) };
-            Ok(())
-        }
-        // The process answered and said it has no role: an element without
-        // one is not a failure to read it.
-        RawAttr::Absent => Ok(()),
-        RawAttr::Unanswered(code) => Err(Error::Platform {
-            code: code as i64,
-            message: format!(
-                "batch attribute fetch failed and an AXRole probe was not answered \
-                 (AXError {code})"
-            ),
-        }),
-    }
-}
-
 /// The close button of a window, or `None` when there is none.
 ///
 /// The canonical AX close path is pressing the close button: prefer the
@@ -1303,9 +1264,44 @@ impl ResolvedAttrs {
     }
 
     /// Populate from individual AX API calls (fallback path).
-    fn from_individual(element: AXUIElementRef) -> Self {
-        Self {
-            role_str: ax_string(element, "AXRole").unwrap_or_default(),
+    ///
+    /// The batch call is an optimisation, not a requirement, so a failed
+    /// batch fetch falls back here. The read is error-preserving for
+    /// `AXRole`, the attribute that decides whether the element is surfaced
+    /// at all: an unanswered read — the object can be invalidated between
+    /// the batch fetch and this fallback, which is the transition churn the
+    /// callers handle — propagates as the platform failure instead of
+    /// becoming an empty role, because an empty role builds a
+    /// `Role::Unknown` ghost the enumerating callers can neither drop by
+    /// code nor report (tenet 1). A definitive "no role" answer
+    /// (`RawAttr::Absent`, the process answered) still builds the role-less
+    /// element, and the remaining attributes keep the tree-walk tolerance
+    /// `ax_attr` documents.
+    fn from_individual(element: AXUIElementRef) -> Result<Self> {
+        let role_str = match read_raw_attr(element, "AXRole") {
+            RawAttr::Value(v) => unsafe {
+                if safe_cf_get_type_id(v) == safe_cf_string_get_type_id() {
+                    // `wrap_under_create_rule` adopts the +1 retain; the
+                    // CFString releases on drop.
+                    CFString::wrap_under_create_rule(v as *const _).to_string()
+                } else {
+                    safe_cf_release(v);
+                    String::new()
+                }
+            },
+            RawAttr::Absent => String::new(),
+            RawAttr::Unanswered(code) => {
+                return Err(Error::Platform {
+                    code: code as i64,
+                    message: format!(
+                        "AXRole read failed while building an element snapshot (AXError \
+                         {code}); the element is unreadable, not role-less"
+                    ),
+                });
+            }
+        };
+        Ok(Self {
+            role_str,
             subrole_str: ax_string(element, "AXSubrole"),
             ax_title: ax_string(element, "AXTitle"),
             ax_description: ax_string(element, "AXDescription"),
@@ -1325,7 +1321,7 @@ impl ResolvedAttrs {
             position: ax_position(element),
             size: ax_size(element),
             identifier: ax_string(element, "AXIdentifier"),
-        }
+        })
     }
 }
 
@@ -2657,13 +2653,12 @@ fn build_snapshot_data(
         let attrs = if let Some(batch) = BatchAttrs::fetch(element) {
             ResolvedAttrs::from_batch(&batch)
         } else {
-            // A batch failure is usually benign (fall back to individual
-            // reads), but only when the element still answers: an unanswered
-            // AXRole probe is the element's own failure and must reach the
-            // enumerating callers instead of being flattened into a role-less
-            // ghost (tenet 1).
-            batch_failure_error(element)?;
-            ResolvedAttrs::from_individual(element)
+            // The batch call is an optimisation, not a requirement: fall back
+            // to individual reads. The fallback is error-preserving for
+            // `AXRole`, so an element invalidated between the batch fetch and
+            // the fallback reads carries its platform error out instead of
+            // being built as a role-less ghost (tenet 1).
+            ResolvedAttrs::from_individual(element)?
         };
 
         let role = map_ax_role(&attrs.role_str, attrs.subrole_str.as_deref());
@@ -5056,31 +5051,19 @@ mod tests {
     }
 
     #[test]
-    fn batch_failure_propagates_unanswered_role_probes() {
-        // The batch read fails for an AXUIElement invalidated mid-transition;
-        // the role probe then answers kAXErrorInvalidUIElement, and the
-        // snapshot path must carry that error so the enumerating callers drop
-        // the element instead of falling through to a role-less ghost.
-        let gone = classify_batch_probe(RawAttr::Unanswered(AX_ERROR_INVALID_UI_ELEMENT));
+    fn individual_fallback_propagates_an_unreadable_role() {
+        // The batch read can fail for an AXUIElement that is invalidated
+        // mid-transition, and the element can be invalidated again before the
+        // individual fallback reaches AXRole. That read must carry the
+        // platform error out so the enumerating callers drop the element,
+        // instead of answering an empty role that builds a ghost (tenet 1).
+        // A null AXUIElementRef fails the underlying call with
+        // kAXErrorInvalidUIElement.
+        let result = ResolvedAttrs::from_individual(std::ptr::null());
         assert!(
-            matches!(gone, Err(ref err) if is_gone_ax_element(err)),
-            "{gone:?}"
+            matches!(result, Err(Error::Platform { .. })),
+            "an unreadable role must propagate as a platform error"
         );
-        // Any other unanswered probe is the element's own failure too: a
-        // wedged process (kAXErrorCannotComplete) must not become a ghost the
-        // callers neither drop nor report (tenet 1).
-        let wedged = classify_batch_probe(RawAttr::Unanswered(AX_ERROR_CANNOT_COMPLETE));
-        assert!(
-            matches!(
-                wedged,
-                Err(Error::Platform { code, .. }) if code == AX_ERROR_CANNOT_COMPLETE as i64
-            ),
-            "{wedged:?}"
-        );
-        // An answered probe means the element is alive and the batch call was
-        // the thing that failed: the individual fallback still gets its
-        // chance, whatever the answer was.
-        assert!(classify_batch_probe(RawAttr::Absent).is_ok());
     }
 
     #[test]
