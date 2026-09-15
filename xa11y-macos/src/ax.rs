@@ -1643,6 +1643,48 @@ fn read_fullscreen_state(el_ptr: AXUIElementRef, action: &str, role: Role) -> Re
     read_bool_attr(el_ptr, "AXFullScreen", action, role)
 }
 
+/// Read one of the two window-state booleans (`AXMinimized` /
+/// `AXFullScreen`) for the `actions` advertisement.
+///
+/// The batch snapshot maps a malformed boolean to `None` — it cannot tell one
+/// from the unsupported-attribute sentinel — but the verb implementations
+/// read these attributes strictly and reject a malformed value. Advertising
+/// from the lossy value would promise a call that deterministically rejects
+/// on the same read (tenet 3), so the advertisement reads the state itself,
+/// with the verb implementations' error distinction.
+fn read_advertised_window_state(
+    element: AXUIElementRef,
+    attr_name: &str,
+    role: Role,
+) -> Result<Option<bool>> {
+    match read_raw_attr(element, attr_name) {
+        RawAttr::Value(v) => {
+            if unsafe { safe_cf_get_type_id(v) } == unsafe { safe_cf_boolean_get_type_id() } {
+                let b = unsafe { safe_cf_boolean_get_value(v) };
+                unsafe { safe_cf_release(v) };
+                Ok(Some(b))
+            } else {
+                unsafe { safe_cf_release(v) };
+                Err(Error::Platform {
+                    code: -1,
+                    message: format!(
+                        "{attr_name} answered a non-boolean value while advertising the window \
+                         actions on a {role}; the state is unknown, not false"
+                    ),
+                })
+            }
+        }
+        RawAttr::Absent => Ok(None),
+        RawAttr::Unanswered(code) => Err(Error::Platform {
+            code: code as i64,
+            message: format!(
+                "{attr_name} read failed while advertising the window actions on a {role} \
+                 (AXError {code}); the state is unknown, not false"
+            ),
+        }),
+    }
+}
+
 /// Whether `maximize` can act on a window: it can set the native fullscreen
 /// state (`true` is already committed, or the attribute is writable) and it
 /// can clear `AXMinimized` when that flag is set — an unsupported
@@ -3057,10 +3099,10 @@ fn build_snapshot_data(
             // an AX FFI round-trip — and advertise each verb from the exact
             // predicate its implementation accepts, so a caller that
             // re-enumerates after a transition never loses a verb the window
-            // would still honor (tenet 3). The state reads come from this
-            // snapshot's batch fetch (`attrs`), the same values surfaced as
-            // `states.minimized` / `states.fullscreen`, so the advertised
-            // surface and the reported state agree by construction.
+            // would still honor (tenet 3). The state reads are the strict
+            // ones the verbs dispatch on, not the snapshot's lossy batch
+            // values: a malformed boolean is a platform error in both, so
+            // `actions` cannot promise a call that rejects on the same read.
             //
             // `maximize` is the native fullscreen state, which is readable
             // *and* writable, and what the green button does on a
@@ -3070,6 +3112,8 @@ fn build_snapshot_data(
             // on a window that cannot fullscreen (System Settings, for
             // example) the button only classic-zooms, which is not what
             // `maximize` promises (tenet 3).
+            let minimized = read_advertised_window_state(element, "AXMinimized", role)?;
+            let fullscreen = read_advertised_window_state(element, "AXFullScreen", role)?;
             let minimized_settable = is_attr_settable(element, "AXMinimized")?;
             let fullscreen_settable = is_attr_settable(element, "AXFullScreen")?;
             if minimized_settable {
@@ -3082,9 +3126,9 @@ fn build_snapshot_data(
             // repeated `maximize`, and a maximize that brings the window back
             // on-screen, stay advertised.
             if maximize_supported(
-                attrs.minimized,
+                minimized,
                 minimized_settable,
-                attrs.fullscreen,
+                fullscreen,
                 fullscreen_settable,
             ) {
                 push(&mut actions, "maximize");
@@ -3094,8 +3138,8 @@ fn build_snapshot_data(
             // attribute is not settable — that combination is refused before
             // any mutation, so it must not be advertised.
             if restore_supported(
-                attrs.minimized,
-                attrs.fullscreen,
+                minimized,
+                fullscreen,
                 minimized_settable,
                 fullscreen_settable,
             ) {

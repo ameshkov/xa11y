@@ -373,9 +373,18 @@ mod tests {
         .maximize()
         .expect("repeated maximize must succeed");
         std::thread::sleep(Duration::from_secs(2));
-        assert!(
-            fullscreen(&app, "maximize").unwrap_or(false),
-            "a second maximize must be a no-op, but the window left fullscreen"
+        // `fullscreen` answers `None` while the target is transiently absent,
+        // so poll for the promise instead of collapsing the unknown to
+        // `false`: a transition that outlasts the sleep must not read as a
+        // failed no-op.
+        wait_until(
+            Duration::from_secs(5),
+            "the window to remain fullscreen after a second maximize",
+            || {
+                fullscreen(&app, "maximize")
+                    .filter(|fullscreen| *fullscreen)
+                    .map(|_| ())
+            },
         );
 
         // restore commits, and a repeated restore must not re-enter
@@ -396,9 +405,16 @@ mod tests {
         .restore()
         .expect("repeated restore must succeed");
         std::thread::sleep(Duration::from_secs(2));
-        assert!(
-            !fullscreen(&app, "restore").unwrap_or(true),
-            "a second restore must be a no-op, but the window re-entered fullscreen"
+        // As above: poll for the restored state rather than treating the
+        // temporarily absent window as "still fullscreen".
+        wait_until(
+            Duration::from_secs(5),
+            "the window to remain restored after a second restore",
+            || {
+                fullscreen(&app, "restore")
+                    .filter(|fullscreen| !*fullscreen)
+                    .map(|_| ())
+            },
         );
 
         // maximize -> restore -> maximize -> restore ends where every call
