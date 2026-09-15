@@ -1931,6 +1931,15 @@ fn settle_window_fullscreen(
                             // must say so, not just that the target is
                             // missing from `AXWindows`.
                             Ok(state) => {
+                                // A cached fullscreen target carries its
+                                // settability too: the write below is skipped
+                                // for a state the window cannot write, and a
+                                // cached maximize must get the same no-op
+                                // instead of a rejected set.
+                                if state == Some(true) {
+                                    let settable = is_attr_settable(el_ptr, "AXFullScreen")?;
+                                    sample_settable = Some(settable);
+                                }
                                 last_observed = format!(
                                     "{}; the cached target handle reads AXFullScreen={state:?}",
                                     describe_window_fullscreen_sample(&set, want)
@@ -2093,17 +2102,21 @@ fn settle_window_fullscreen(
         // advertised no-op `maximize` into a failure, while the confirmation
         // above still validates the read. The one expected failure is the
         // invalidated object (`kAXErrorInvalidUIElement`): the set is retried
-        // on the next tick and the error is recorded for the deadline
-        // diagnosis. Every other failure is real — the settability probe and
-        // the snapshot reads propagate theirs — so it must not be retried
-        // into a generic timeout; it returns with its original code (tenet 1,
-        // tenet 6).
+        // on the next tick and the failure is recorded for the deadline
+        // diagnosis, superseded by a later successful retry. Every other
+        // failure is real — the settability probe and the snapshot reads
+        // propagate theirs — so it must not be retried into a generic
+        // timeout; it returns with its original code (tenet 1, tenet 6).
         if !(reached && sample_settable == Some(false)) {
-            if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
-                if !is_gone_ax_element(&err) {
-                    return Err(err);
+            match set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
+                Ok(()) => {
+                    // A later successful retry supersedes the recorded
+                    // failure: the diagnosis must describe the last attempt,
+                    // not any attempt.
+                    last_set_error = None;
                 }
-                last_set_error = Some(err.to_string());
+                Err(err) if is_gone_ax_element(&err) => last_set_error = Some(err.to_string()),
+                Err(err) => return Err(err),
             }
         }
         if Instant::now() >= deadline {
