@@ -1503,8 +1503,8 @@ fn activate_owning_app(el_ptr: AXUIElementRef, action: &str, role: Role) -> Resu
 /// have its minimized flag cleared first or the verb returns success while
 /// the window stays in the Dock. Error-preserving: only a definitive
 /// unsupported / no-value answer (`RawAttr::Absent`) means "not set"; a
-/// failed read is a platform error (tenet 1), the same distinction
-/// `restore()` makes.
+/// failed or malformed read is a platform error (tenet 1), the same
+/// distinction `restore()` makes.
 fn clear_bool_attr_if_true(
     el_ptr: AXUIElementRef,
     attr_name: &str,
@@ -1514,7 +1514,18 @@ fn clear_bool_attr_if_true(
     let was_true = match read_raw_attr(el_ptr, attr_name) {
         RawAttr::Value(v) => {
             let is_boolean = unsafe { safe_cf_get_type_id(v) == safe_cf_boolean_get_type_id() };
-            let b = is_boolean && unsafe { safe_cf_boolean_get_value(v) };
+            if !is_boolean {
+                unsafe { safe_cf_release(v) };
+                return Err(Error::Platform {
+                    code: -1,
+                    message: format!(
+                        "{attr_name} returned a non-boolean value while running {action} on a \
+                         {}; the state is unknown, not false",
+                        role
+                    ),
+                });
+            }
+            let b = unsafe { safe_cf_boolean_get_value(v) };
             unsafe { safe_cf_release(v) };
             b
         }
@@ -1597,7 +1608,20 @@ fn read_bool_attr(
     match read_raw_attr(el_ptr, attr_name) {
         RawAttr::Value(v) => {
             let is_boolean = unsafe { safe_cf_get_type_id(v) == safe_cf_boolean_get_type_id() };
-            let b = is_boolean && unsafe { safe_cf_boolean_get_value(v) };
+            if !is_boolean {
+                // A value of another type is a malformed answer: the state
+                // is unknown, not false, and the doc above promises not to
+                // collapse that (tenet 1).
+                unsafe { safe_cf_release(v) };
+                return Err(Error::Platform {
+                    code: -1,
+                    message: format!(
+                        "{attr_name} returned a non-boolean value while {action} was settling \
+                         the window on a {role}; the state is unknown, not false"
+                    ),
+                });
+            }
+            let b = unsafe { safe_cf_boolean_get_value(v) };
             unsafe { safe_cf_release(v) };
             Ok(Some(b))
         }
@@ -2019,10 +2043,16 @@ fn settle_window_fullscreen(
         // and a set that lands mid-transition is discarded, so the loop keeps
         // issuing until `settle_confirmed` proves the state committed.
         // Setting the desired value on a window that already holds it is a
-        // no-op. A failed set is recorded instead of aborting: it is expected
-        // while the window object is mid-recreation, and the deadline below
-        // is the terminal site that reports it (tenet 6).
+        // no-op. The one expected failure is the invalidated object
+        // (`kAXErrorInvalidUIElement`): the set is retried on the next tick
+        // and the error is recorded for the deadline diagnosis. Every other
+        // failure is real — the settability probe and the snapshot reads
+        // propagate theirs — so it must not be retried into a generic
+        // timeout; it returns with its original code (tenet 1, tenet 6).
         if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
+            if !is_gone_ax_element(&err) {
+                return Err(err);
+            }
             last_observed = format!("{last_observed}; the retry set failed: {err}");
         }
         if Instant::now() >= deadline {
