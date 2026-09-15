@@ -658,37 +658,42 @@ fn is_gone_ax_element(err: &Error) -> bool {
     )
 }
 
-/// Recover the gone-element error from a failed [`BatchAttrs::fetch`].
+/// Recover a platform failure from a failed [`BatchAttrs::fetch`].
 ///
 /// The batch fetch collapses every failure to `None`, and
 /// [`ResolvedAttrs::from_individual`] then answers "absent" for every
-/// attribute — a dead element would be built as a role-less ghost instead of
-/// carrying the error the enumerating callers drop on ([`is_gone_ax_element`]).
-/// Probe `AXRole` (one failure-path round-trip) to recover the code:
-/// `kAXErrorInvalidUIElement` is the one answer that means "this object no
-/// longer exists", and a window invalidated mid-fullscreen-transition is
-/// exactly the churn the callers filter. Every other failure keeps the
-/// individual fallback — the batch call is an optimisation, not a
-/// requirement, and only this exact code is the "no longer exists" answer.
-fn batch_failure_is_gone(element: AXUIElementRef) -> Result<()> {
-    classify_batch_failure(read_raw_attr(element, "AXRole"))
+/// attribute — a dead or wedged element would be built as a role-less ghost
+/// instead of carrying its failure out. Probe `AXRole` (one failure-path
+/// round-trip): a probe that is answered (`kAXErrorAttributeUnsupported` /
+/// `kAXErrorNoValue`, or a value) means the element is alive and the batch
+/// call was the thing that failed, so the individual fallback still gets its
+/// chance. A probe the process does not answer is the element's own failure:
+/// `kAXErrorInvalidUIElement` (the object no longer exists) is the churn the
+/// enumerating callers drop ([`is_gone_ax_element`]), and every other code (a
+/// messaging timeout, a wedged process) is a real platform failure the
+/// callers propagate (tenet 1).
+fn batch_failure_error(element: AXUIElementRef) -> Result<()> {
+    classify_batch_probe(read_raw_attr(element, "AXRole"))
 }
 
-/// The classification behind [`batch_failure_is_gone`], split out so the
-/// error mapping is unit-testable without a live AX element.
-fn classify_batch_failure(probe: RawAttr) -> Result<()> {
+/// The classification behind [`batch_failure_error`], split out so the error
+/// mapping is unit-testable without a live AX element.
+fn classify_batch_probe(probe: RawAttr) -> Result<()> {
     match probe {
         RawAttr::Value(v) => {
             unsafe { safe_cf_release(v) };
             Ok(())
         }
-        RawAttr::Unanswered(code) if code == AX_ERROR_INVALID_UI_ELEMENT => Err(Error::Platform {
+        // The process answered and said it has no role: an element without
+        // one is not a failure to read it.
+        RawAttr::Absent => Ok(()),
+        RawAttr::Unanswered(code) => Err(Error::Platform {
             code: code as i64,
-            message: "batch attribute fetch failed: the element was invalidated".to_string(),
+            message: format!(
+                "batch attribute fetch failed and an AXRole probe was not answered \
+                 (AXError {code})"
+            ),
         }),
-        // The process answered (the element is alive) or failed for another
-        // reason; the individual fallback still has a chance to build it.
-        RawAttr::Absent | RawAttr::Unanswered(_) => Ok(()),
     }
 }
 
@@ -1519,7 +1524,10 @@ fn clear_bool_attr_if_true(
 ///   is not evidence of a restored window. On the AppKit windows measured on
 ///   macOS 26.4, `IsAttributeSettable(AXFullScreen)` stayed `true` through
 ///   every entry/exit sample — the transient withdraws the *value*, not the
-///   capability.
+///   capability. The transient is therefore indistinguishable from a settled
+///   window by a single sample, and only a run of samples that spans the
+///   transition can tell them apart: the confirmation waits out
+///   [`WINDOW_FULLSCREEN_SETTLE_GRACE`] as well as counting samples.
 /// * A set issued while a transition is in flight is discarded, not queued: a
 ///   `true` set followed 10 ms later by a `false` set leaves the window
 ///   fullscreen, and waiting alone never recovers it. Re-issuing the set once
@@ -1533,6 +1541,20 @@ fn clear_bool_attr_if_true(
 const WINDOW_FULLSCREEN_SETTLE_BUDGET: Duration = Duration::from_secs(5);
 const WINDOW_FULLSCREEN_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 const WINDOW_FULLSCREEN_SETTLE_SAMPLES: usize = 3;
+/// How long the desired state must be observed, without interruption, before
+/// the wait reports success — when no transition boundary has been seen (see
+/// [`settle_confirmed`]).
+///
+/// The sample streak alone is not enough: a transition that AppKit has queued
+/// but not yet started reports exactly what a settled window reports, so a
+/// confirmation shorter than the transition can confirm the pre-commit value
+/// (a `false` on entry, a `true` on exit) and return before the transition
+/// commits. The measured AppKit transition takes ~0.5 s and the window object
+/// is absent from `AXWindows` for 450–650 ms once it is under way, so the
+/// grace is that absence plus a margin. Once a boundary has been observed
+/// (the element stopped answering, or read away from the desired state) the
+/// samples after it are post-transition evidence and the streak is enough.
+const WINDOW_FULLSCREEN_SETTLE_GRACE: Duration = Duration::from_millis(700);
 
 /// Read a boolean AX attribute with the tenet-1 distinction: a failed read is
 /// an error (the state is unknown, not false), an absent / unsupported
@@ -1569,33 +1591,44 @@ fn read_fullscreen_state(el_ptr: AXUIElementRef, action: &str, role: Role) -> Re
     read_bool_attr(el_ptr, "AXFullScreen", action, role)
 }
 
-/// Whether `maximize` can act on a window: its native fullscreen state is
-/// already committed, or the `AXFullScreen` attribute is writable. Shared by
-/// the verb implementation and the `actions` advertisement, so a window that
-/// would honor the call never disappears from `actions` (tenet 3).
+/// Whether `maximize` can act on a window: it can set the native fullscreen
+/// state (`true` is already committed, or the attribute is writable) and it
+/// can clear `AXMinimized` when that flag is set — an unsupported
+/// `AXMinimized` set no-ops silently (see [`is_attr_settable`]), and the
+/// fullscreen settle only checks `AXFullScreen`, so the verb would report
+/// success while the window stays in the Dock. Shared by the verb
+/// implementation and the `actions` advertisement, so a window that would
+/// honor the call never disappears from `actions` (tenet 3).
 ///
-/// `fullscreen_settable` must be `false` when the caller did not run the
-/// probe (the implementation skips it when the state is already committed).
-fn maximize_supported(fullscreen: Option<bool>, fullscreen_settable: bool) -> bool {
-    fullscreen == Some(true) || fullscreen_settable
+/// `fullscreen_settable` and `minimized_settable` are only consulted when the
+/// caller could not skip the corresponding probe; a `false` stands for "the
+/// state does not need it" as much as for a negative probe.
+fn maximize_supported(
+    minimized: Option<bool>,
+    minimized_settable: bool,
+    fullscreen: Option<bool>,
+    fullscreen_settable: bool,
+) -> bool {
+    (fullscreen == Some(true) || fullscreen_settable)
+        && (minimized != Some(true) || minimized_settable)
 }
 
-/// Whether `restore` can act on a window: clearing either state is reachable,
-/// or the fullscreen state is already committed (a fullscreen window whose
-/// probe answers `false` is still the state `maximize` accepts, and restore
-/// must be able to leave it). A minimized state whose attribute is not
-/// writable is refused before any mutation, so it does not count as
-/// reachable. Shared by the verb implementation and the `actions`
-/// advertisement, so an advertised `restore` always matches the dispatch
-/// (tenet 3).
+/// Whether `restore` can act on a window: every state that reads `true` must
+/// be clearable — an unsupported set no-ops silently, so a window reading
+/// `AXMinimized=true` or `AXFullScreen=true` without the matching settable
+/// attribute would otherwise be advertised and then time out (or report a
+/// restore that never happened) — and at least one state must be reachable.
+/// Shared by the verb implementation and the `actions` advertisement, so an
+/// advertised `restore` always matches the dispatch (tenet 3).
 fn restore_supported(
     minimized: Option<bool>,
     fullscreen: Option<bool>,
     minimized_settable: bool,
     fullscreen_settable: bool,
 ) -> bool {
-    (minimized_settable || fullscreen_settable || fullscreen == Some(true))
-        && !(minimized == Some(true) && !minimized_settable)
+    (minimized != Some(true) || minimized_settable)
+        && (fullscreen != Some(true) || fullscreen_settable)
+        && (minimized_settable || fullscreen_settable)
 }
 
 /// Read the window's `AXSize` as `(width, height)`; the same error
@@ -1628,9 +1661,10 @@ struct WindowFullscreenSample {
     fullscreen: bool,
     main: bool,
     /// `IsAttributeSettable(AXFullScreen)`. A genuine restore reads `false`
-    /// *and* settable; the bare value alone never commits, so an entry
-    /// transition that reports `false` before it commits cannot be mistaken
-    /// for a restored window (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+    /// *and* settable, but so does an entry transient (the transient
+    /// withdraws the value, not the capability), so the pair is the state the
+    /// restore branch must observe, not proof that the transition has
+    /// committed — see [`settle_confirmed`].
     settable: bool,
     /// Whether this sample is the window the verb targets.
     ///
@@ -1747,26 +1781,30 @@ fn describe_window_fullscreen_sample(samples: &[WindowFullscreenSample], want: b
 /// `want` is the state the verb promises: `true` after `maximize`, `false`
 /// after `restore`. The wait succeeds once the desired state holds for
 /// [`WINDOW_FULLSCREEN_SETTLE_SAMPLES`] consecutive identical samples of the
-/// app's whole window set. The snapshot is application-level because the
-/// transition can recreate the window object and drop it out of `AXWindows`
-/// (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]), but the state that counts is
-/// the *target* window's own sample
+/// app's whole window set, and the run is confirmed by [`settle_confirmed`]:
+/// without a transition boundary in between, the samples must also span
+/// [`WINDOW_FULLSCREEN_SETTLE_GRACE`], because a transition AppKit has queued
+/// but not started reports exactly what a settled window reports. The
+/// snapshot is application-level because the transition can recreate the
+/// window object and drop it out of `AXWindows` (see
+/// [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]), but the state that counts is the
+/// *target* window's own sample
 /// ([`WindowFullscreenSample::is_target`]): an app can have several windows,
 /// and a sibling's fullscreen state is not this verb's promise. While the
 /// target is missing from `AXWindows` (mid-recreation, or on another Space),
 /// its cached handle is read directly instead.
 ///
 /// A set that lands while the previous transition is still running is
-/// discarded by AppKit rather than queued, so every iteration that has not
-/// committed re-issues `AXFullScreen = want`. Absolute sets make that safe:
-/// setting `true` on a fullscreen window is a no-op (verified on AppKit,
-/// WebKit and Chromium windows).
+/// discarded by AppKit rather than queued, so every iteration whose promise
+/// is not yet confirmed re-issues `AXFullScreen = want`. Absolute sets make
+/// that safe: setting `true` on a fullscreen window is a no-op (verified on
+/// AppKit, WebKit and Chromium windows).
 ///
 /// For `want=false` the target's sample must answer both
 /// `AXFullScreen=false` and `IsAttributeSettable=true`. A bare `false` is not
-/// the promise: an entry transition can report `false` before it commits, and
-/// committing on that read would report a successful restore on a window that
-/// ends up fullscreen.
+/// the promise, and neither is the pair on its own: an entry transition
+/// reports exactly that until it commits, which is what
+/// [`WINDOW_FULLSCREEN_SETTLE_GRACE`] rules out.
 ///
 /// Element-level failures during the wait (a recreated window object answers
 /// `kAXErrorInvalidUIElement`) do not end it: the retry is attempted again on
@@ -1782,6 +1820,14 @@ fn settle_window_fullscreen(
     let deadline = Instant::now() + WINDOW_FULLSCREEN_SETTLE_BUDGET;
     let mut previous: Option<Vec<WindowFullscreenSample>> = None;
     let mut streak = 0usize;
+    // When the current run of identical desired samples started; `None`
+    // whenever the run breaks. `streak` counts samples, this measures how
+    // long the desired state has actually held.
+    let mut held_since: Option<Instant> = None;
+    // Whether the loop has seen a transition boundary: an unreadable sample,
+    // or a target state away from the desired value. After one, a short run
+    // of desired samples is post-transition evidence.
+    let mut boundary_seen = false;
     let mut last_observed;
     loop {
         let mut reached = false;
@@ -1834,10 +1880,11 @@ fn settle_window_fullscreen(
                     };
                 } else {
                     match target {
-                        // A `false` read only commits together with
-                        // `IsAttributeSettable=true`; a sibling fullscreen
-                        // window does not block a target that already holds
-                        // both.
+                        // The desired state is `false` *and* settable; the
+                        // entry transient reports the same pair, which is what
+                        // the confirmation's grace period rules out. A sibling
+                        // fullscreen window does not block a target that
+                        // already holds both.
                         Some(sample) if !sample.fullscreen && sample.settable => {
                             reached = true;
                             last_observed = describe_window_fullscreen_sample(&set, want);
@@ -1896,9 +1943,13 @@ fn settle_window_fullscreen(
                 // in ~150ms without the recreated window ever reporting the
                 // state.
                 if reached && target.is_some() && previous.as_deref() == Some(set.as_slice()) {
+                    if streak == 0 {
+                        held_since = Some(Instant::now());
+                    }
                     streak += 1;
                 } else {
                     streak = 0;
+                    held_since = None;
                 }
                 previous = Some(set);
             }
@@ -1907,21 +1958,34 @@ fn settle_window_fullscreen(
             // can never be mistaken for persistence.
             None => {
                 streak = 0;
+                held_since = None;
+                boundary_seen = true;
                 previous = None;
                 last_observed =
                     "the app did not answer a readable sample of its windows".to_string();
             }
         }
-        if streak >= WINDOW_FULLSCREEN_SETTLE_SAMPLES {
+        // A state away from the desired value is a transition boundary: it
+        // is what lets the confirmation trust a short run of samples (see
+        // `settle_confirmed`). Set after the match so the cached-handle
+        // branches count too.
+        if !reached {
+            boundary_seen = true;
+        }
+        if settle_confirmed(streak, boundary_seen, held_since, Instant::now()) {
             return Ok(());
         }
-        if !reached {
-            // Record the failure instead of aborting: a set that fails while
-            // the window object is mid-recreation is expected, and the
-            // deadline below is the terminal site that reports it (tenet 6).
-            if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
-                last_observed = format!("{last_observed}; the retry set failed: {err}");
-            }
+        // Re-issue the absolute set while the promise is unconfirmed — not
+        // only when the state still reads the wrong value: the entry
+        // transient reads the desired pair for a while (see the constants),
+        // and a set that lands mid-transition is discarded, so the loop keeps
+        // issuing until `settle_confirmed` proves the state committed.
+        // Setting the desired value on a window that already holds it is a
+        // no-op. A failed set is recorded instead of aborting: it is expected
+        // while the window object is mid-recreation, and the deadline below
+        // is the terminal site that reports it (tenet 6).
+        if let Err(err) = set_bool_attr(el_ptr, "AXFullScreen", want, action, role) {
+            last_observed = format!("{last_observed}; the retry set failed: {err}");
         }
         if Instant::now() >= deadline {
             let condition = if want {
@@ -1937,6 +2001,28 @@ fn settle_window_fullscreen(
         }
         std::thread::sleep(WINDOW_FULLSCREEN_SETTLE_INTERVAL);
     }
+}
+
+/// Whether a run of identical desired samples confirms the promise.
+///
+/// The streak proves the window set stopped changing; it does not prove the
+/// desired value was committed, because a transition AppKit has queued but
+/// not started reports the pre-commit value until it moves the window (see
+/// the constants). Once a boundary has been observed — the element stopped
+/// answering, or its state was seen away from the desired value — the samples
+/// after it are post-transition evidence and the streak is enough. Without
+/// one, the run must also span [`WINDOW_FULLSCREEN_SETTLE_GRACE`]. Split out
+/// so the confirmation contract is unit-testable without a live AX element.
+fn settle_confirmed(
+    streak: usize,
+    boundary_seen: bool,
+    held_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    streak >= WINDOW_FULLSCREEN_SETTLE_SAMPLES
+        && (boundary_seen
+            || held_since
+                .is_some_and(|since| now.duration_since(since) >= WINDOW_FULLSCREEN_SETTLE_GRACE))
 }
 
 // ── Role Mapping ──────────────────────────────────────────────────────────────
@@ -2524,10 +2610,11 @@ fn build_snapshot_data(
             ResolvedAttrs::from_batch(&batch)
         } else {
             // A batch failure is usually benign (fall back to individual
-            // reads), except when it is the invalidated-handle churn: that
-            // error must reach the enumerating callers instead of being
-            // flattened into a role-less ghost (tenet 1).
-            batch_failure_is_gone(element)?;
+            // reads), but only when the element still answers: an unanswered
+            // AXRole probe is the element's own failure and must reach the
+            // enumerating callers instead of being flattened into a role-less
+            // ghost (tenet 1).
+            batch_failure_error(element)?;
             ResolvedAttrs::from_individual(element)
         };
 
@@ -2805,11 +2892,17 @@ fn build_snapshot_data(
                 push(&mut actions, "minimize");
             }
             // An already-committed fullscreen window satisfies `maximize`
-            // whatever the settability probe answers (see `maximize()`), so
-            // the current state is part of the shared predicate: a repeated
-            // `maximize` on a window that dropped out of the settable set
-            // must stay advertised.
-            if maximize_supported(attrs.fullscreen, fullscreen_settable) {
+            // whatever the settability probe answers (see `maximize()`), and
+            // a minimized flag that cannot be cleared makes the verb a silent
+            // no-op, so both states are part of the shared predicate: a
+            // repeated `maximize`, and a maximize that brings the window back
+            // on-screen, stay advertised.
+            if maximize_supported(
+                attrs.minimized,
+                minimized_settable,
+                attrs.fullscreen,
+                fullscreen_settable,
+            ) {
                 push(&mut actions, "maximize");
             }
             // `restore()` accepts a window when either state is reachable OR
@@ -4046,18 +4139,28 @@ impl Provider for MacOSProvider {
         // `AXZoomWindow` (see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]). A window
         // that already reads `AXFullScreen=true` is committed and satisfies
         // the verb whatever the settability probe answers; that is the state
-        // a repeated maximize lands in. Only a window that is not fullscreen
-        // and cannot be set fullscreen is unsupported — resolve that before
-        // clearing `AXMinimized`, so a refused verb makes no partial change
-        // (tenet 1). The settle loop still confirms the state, so a maximize
-        // racing an exit cannot no-op on a stale `true` read.
+        // a repeated maximize lands in. The verb also promises to bring the
+        // window back on-screen, so a minimized flag that cannot be cleared
+        // is unsupported too — the clear would silently no-op and the settle
+        // only checks fullscreen. Resolve both before any mutation, so a
+        // refused verb makes no partial change (tenet 1). The settle loop
+        // still confirms the state, so a maximize racing an exit cannot
+        // no-op on a stale `true` read.
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "maximize", element.role)?;
         // The shared predicate keeps this acceptance rule and the `actions`
-        // advertisement in lockstep; a committed fullscreen window passes
-        // without paying for the settability probe.
+        // advertisement in lockstep; each probe is skipped when the state
+        // read already decides it.
         let fullscreen_settable =
             fullscreen != Some(true) && is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        if !maximize_supported(fullscreen, fullscreen_settable) {
+        let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
+        let minimized_settable =
+            minimized == Some(true) && is_attr_settable(ax.as_ptr(), "AXMinimized")?;
+        if !maximize_supported(
+            minimized,
+            minimized_settable,
+            fullscreen,
+            fullscreen_settable,
+        ) {
             return Err(Error::ActionNotSupported {
                 action: "maximize".to_string(),
                 role: element.role,
@@ -4081,28 +4184,20 @@ impl Provider for MacOSProvider {
     fn restore(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
         // Restore clears the minimized state and the fullscreen state. A
-        // window supports restore if either state is reachable: the state
-        // reads true, or its attribute is settable. Settability alone is not
-        // the state: a fullscreen window can read `AXFullScreen=true` while
-        // its probe answers false (the same read `maximize` accepts above),
-        // and skipping it because the probe is false would report a
-        // successful restore on a window that never moved. A failed probe
-        // propagates as a platform error rather than being read as
-        // unsupported (tenet 1).
+        // state that reads `true` must also be clearable: an unsupported AX
+        // set no-ops silently (see `is_attr_settable`), so accepting it would
+        // only time out in the settle, or report success after clearing the
+        // other state. At least one state must be reachable for the verb to
+        // do anything. A failed probe propagates as a platform error rather
+        // than being read as unsupported (tenet 1).
+        //
+        // `restore_supported` is the same predicate the `actions`
+        // advertisement uses, so an advertised `restore` cannot
+        // deterministically reject here (tenet 3).
         let minimized = read_bool_attr(ax.as_ptr(), "AXMinimized", "restore", element.role)?;
         let fullscreen = read_fullscreen_state(ax.as_ptr(), "restore", element.role)?;
         let minimized_settable = is_attr_settable(ax.as_ptr(), "AXMinimized")?;
         let fullscreen_settable = is_attr_settable(ax.as_ptr(), "AXFullScreen")?;
-        // A minimized state whose attribute is not settable cannot be
-        // cleared: AppKit accepts an unsupported AX set silently (see
-        // `is_attr_settable`), so attempting it would report a restore that
-        // never happened. Refuse before any partial clear (tenet 1). The
-        // fullscreen state needs no such guard — its settle loop reads the
-        // state back and fails on a no-op instead of returning early.
-        //
-        // `restore_supported` is the same predicate the `actions`
-        // advertisement uses, so an advertised `restore` cannot deterministically
-        // reject here (tenet 3).
         if !restore_supported(
             minimized,
             fullscreen,
@@ -4120,10 +4215,10 @@ impl Provider for MacOSProvider {
         // Never press the green button here: the press toggles, so a window
         // that is not fullscreen would be *entered* fullscreen by its own
         // restore. `AXFullScreen=false` is the absolute state and is safe to
-        // set when the window is already restored; the settle loop confirms
-        // the read and re-issues the clear while an entry transition
-        // transiently reports `false` (see
-        // [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
+        // set when the window is already restored; the settle loop re-issues
+        // the clear until the confirmation has ruled out an entry transient
+        // that reports `false` with the attribute still settable (see
+        // [`WINDOW_FULLSCREEN_SETTLE_GRACE`]).
         if fullscreen_settable || fullscreen == Some(true) {
             settle_window_fullscreen(ax.as_ptr(), false, "restore", element.role)?;
         }
@@ -4784,6 +4879,56 @@ mod tests {
     }
 
     #[test]
+    fn settle_confirmation_requires_the_streak_and_the_boundary_or_grace() {
+        let now = Instant::now();
+        let grace = WINDOW_FULLSCREEN_SETTLE_GRACE;
+        // No run of identical samples yet (or no run at all): not confirmed.
+        assert!(!settle_confirmed(0, false, None, now));
+        assert!(!settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES,
+            false,
+            None,
+            now
+        ));
+        // The set stopped changing, but the desired state has not held long
+        // enough to rule out a transition that has not moved the window yet:
+        // this is the entry-transient case the short streak used to accept.
+        assert!(!settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES,
+            false,
+            Some(now),
+            now
+        ));
+        assert!(!settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES - 1,
+            false,
+            Some(now - grace),
+            now
+        ));
+        // Both halves hold: the state is confirmed.
+        assert!(settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES,
+            false,
+            Some(now - grace),
+            now
+        ));
+        // A transition boundary was observed, so the samples after it are
+        // post-transition evidence and the streak alone confirms.
+        assert!(settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES,
+            true,
+            None,
+            now
+        ));
+        assert!(settle_confirmed(
+            WINDOW_FULLSCREEN_SETTLE_SAMPLES,
+            true,
+            Some(now),
+            now
+        ));
+    }
+
+    #[test]
     fn describe_window_fullscreen_sample_names_the_target() {
         let sample = |is_target: bool, fullscreen: bool, settable: bool| WindowFullscreenSample {
             size: (0.0, 0.0),
@@ -4834,21 +4979,31 @@ mod tests {
     }
 
     #[test]
-    fn batch_failure_classification_propagates_only_invalid_ui_element() {
+    fn batch_failure_propagates_unanswered_role_probes() {
         // The batch read fails for an AXUIElement invalidated mid-transition;
         // the role probe then answers kAXErrorInvalidUIElement, and the
         // snapshot path must carry that error so the enumerating callers drop
         // the element instead of falling through to a role-less ghost.
-        let gone = classify_batch_failure(RawAttr::Unanswered(AX_ERROR_INVALID_UI_ELEMENT));
+        let gone = classify_batch_probe(RawAttr::Unanswered(AX_ERROR_INVALID_UI_ELEMENT));
         assert!(
             matches!(gone, Err(ref err) if is_gone_ax_element(err)),
             "{gone:?}"
         );
-        // Every other read failure keeps the individual fallback — the batch
-        // call is an optimisation, not a requirement.
-        assert!(classify_batch_failure(RawAttr::Unanswered(AX_ERROR_CANNOT_COMPLETE)).is_ok());
-        assert!(classify_batch_failure(RawAttr::Unanswered(AX_ERROR_ACTION_UNSUPPORTED)).is_ok());
-        assert!(classify_batch_failure(RawAttr::Absent).is_ok());
+        // Any other unanswered probe is the element's own failure too: a
+        // wedged process (kAXErrorCannotComplete) must not become a ghost the
+        // callers neither drop nor report (tenet 1).
+        let wedged = classify_batch_probe(RawAttr::Unanswered(AX_ERROR_CANNOT_COMPLETE));
+        assert!(
+            matches!(
+                wedged,
+                Err(Error::Platform { code, .. }) if code == AX_ERROR_CANNOT_COMPLETE as i64
+            ),
+            "{wedged:?}"
+        );
+        // An answered probe means the element is alive and the batch call was
+        // the thing that failed: the individual fallback still gets its
+        // chance, whatever the answer was.
+        assert!(classify_batch_probe(RawAttr::Absent).is_ok());
     }
 
     #[test]
@@ -4856,28 +5011,39 @@ mod tests {
         // `maximize`: a committed fullscreen window is accepted whatever the
         // settability probe answers — the repeated-maximize case the
         // advertisement must not drop.
-        assert!(maximize_supported(Some(true), false));
-        assert!(maximize_supported(Some(true), true));
-        assert!(maximize_supported(Some(false), true));
-        assert!(maximize_supported(None, true));
+        assert!(maximize_supported(None, false, Some(true), false));
+        assert!(maximize_supported(Some(false), false, Some(true), true));
+        assert!(maximize_supported(Some(false), false, Some(false), true));
+        assert!(maximize_supported(None, false, None, true));
+        // A minimized window whose flag cannot be cleared stays in the Dock
+        // while the settle only checks fullscreen, so the verb is refused
+        // before mutating — and never advertised.
+        assert!(!maximize_supported(Some(true), false, Some(false), true));
+        assert!(!maximize_supported(Some(true), false, Some(true), false));
+        assert!(maximize_supported(Some(true), true, Some(false), true));
         // Not fullscreen and not writable: `ActionNotSupported`, never
         // advertised.
-        assert!(!maximize_supported(Some(false), false));
-        assert!(!maximize_supported(None, false));
+        assert!(!maximize_supported(Some(false), false, Some(false), false));
+        assert!(!maximize_supported(None, false, None, false));
 
-        // `restore`: either state is reachable, or fullscreen is already
-        // committed.
-        assert!(restore_supported(Some(false), Some(true), false, false));
+        // `restore`: at least one state must be reachable, and every state
+        // that reads `true` must be clearable.
+        assert!(restore_supported(Some(false), Some(true), true, true));
         assert!(restore_supported(Some(false), Some(false), true, false));
         assert!(restore_supported(Some(false), Some(false), false, true));
         assert!(restore_supported(None, None, false, true));
         assert!(restore_supported(Some(true), Some(false), true, false));
-        // The one refusal — a minimized state whose attribute is not
-        // settable — must never be advertised: `restore` returns
-        // `ActionNotSupported` before mutating anything.
+        assert!(restore_supported(Some(true), Some(true), true, true));
+        // A minimized state whose attribute is not settable cannot be
+        // cleared; `restore` refuses before mutating anything.
         assert!(!restore_supported(Some(true), Some(false), false, true));
         assert!(!restore_supported(Some(true), Some(true), false, false));
         assert!(!restore_supported(Some(true), Some(true), false, true));
+        // A fullscreen state whose attribute is not settable cannot be
+        // cleared: the settle could only time out, so the advertised restore
+        // must reject it up front.
+        assert!(!restore_supported(Some(false), Some(true), true, false));
+        assert!(!restore_supported(Some(false), Some(true), false, false));
         // Neither state reachable, nothing committed.
         assert!(!restore_supported(Some(false), Some(false), false, false));
     }
