@@ -2596,9 +2596,26 @@ impl MacOSProvider {
     /// Build an ElementData from an AXElement, caching the AX handle.
     /// Tries batch fetch (1 IPC call for 15 attributes) first, falls back
     /// to individual calls if the batch API fails.
+    ///
+    /// A failed snapshot evicts the handle again: no `ElementData` carrying
+    /// it was returned, so nothing can resolve it, and a window invalidated
+    /// mid-transition would otherwise leave an unreachable AX object in the
+    /// cache for every candidate an enumerating caller drops (see
+    /// `find_elements_group` and `get_children`). The handle is never handed
+    /// to a consumer on this path, so the eviction cannot invalidate a live
+    /// element.
     fn build_element_data(&self, ax: &AXElement, pid: Option<u32>) -> Result<ElementData> {
         let handle = self.cache_element(ax.clone());
-        build_snapshot_data(ax.as_ptr(), pid, handle)
+        match build_snapshot_data(ax.as_ptr(), pid, handle) {
+            Ok(data) => Ok(data),
+            Err(err) => {
+                self.handle_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&handle);
+                Err(err)
+            }
+        }
     }
 }
 
