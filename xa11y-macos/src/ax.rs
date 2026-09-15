@@ -1279,16 +1279,27 @@ impl ResolvedAttrs {
     /// `ax_attr` documents.
     fn from_individual(element: AXUIElementRef) -> Result<Self> {
         let role_str = match read_raw_attr(element, "AXRole") {
-            RawAttr::Value(v) => unsafe {
-                if safe_cf_get_type_id(v) == safe_cf_string_get_type_id() {
+            RawAttr::Value(v) => {
+                if unsafe { safe_cf_get_type_id(v) } == unsafe { safe_cf_string_get_type_id() } {
                     // `wrap_under_create_rule` adopts the +1 retain; the
                     // CFString releases on drop.
-                    CFString::wrap_under_create_rule(v as *const _).to_string()
+                    unsafe { CFString::wrap_under_create_rule(v as *const _) }.to_string()
                 } else {
-                    safe_cf_release(v);
-                    String::new()
+                    // A value of another type is a malformed answer, not the
+                    // definitive "no role" the `Absent` arm covers: turning
+                    // it into an empty role would rebuild the ghost this
+                    // error-preserving read exists to prevent (tenet 1),
+                    // the same distinction `ax_windows` makes for a
+                    // non-array `AXWindows`.
+                    unsafe { safe_cf_release(v) };
+                    return Err(Error::Platform {
+                        code: -1,
+                        message: "AXRole returned a non-string value; the provider answered \
+                                  malformed, not role-less"
+                            .to_string(),
+                    });
                 }
-            },
+            }
             RawAttr::Absent => String::new(),
             RawAttr::Unanswered(code) => {
                 return Err(Error::Platform {
@@ -1532,7 +1543,7 @@ fn clear_bool_attr_if_true(
 /// Native fullscreen (`AXFullScreen`) is the state these verbs drive, and it
 /// is readable *and* writable. `AXMinimized` is equally readable and
 /// writable, but it is the minimize state; the zoom state has no attribute
-/// at all. The green button's `AXPress` and `AXZoomWindow` action are toggles
+/// at all. The green button's `AXPress` and `AXZoomWindow` actions are toggles
 /// whose state cannot be read back. The transition is asynchronous and
 /// hostile to observation on macOS 26:
 ///
