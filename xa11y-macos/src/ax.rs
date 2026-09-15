@@ -658,6 +658,27 @@ fn is_gone_ax_element(err: &Error) -> bool {
     )
 }
 
+/// Whether a per-element snapshot failure means the process is not
+/// AX-reachable *right now*, rather than that the element is gone: it is
+/// still launching, busy, or has no accessibility bridge.
+///
+/// `app_by_pid` maps these codes (plus `kAXErrorNoValue`) to
+/// `SelectorNotMatched` so the core poll loop keeps retrying until its
+/// deadline. `list_apps` skips the process for the current listing instead —
+/// the app may own a window (CGWindowList saw it) before its accessibility
+/// server answers, and a freshly launched app would otherwise fail the whole
+/// listing on the one call that was about to become its discovery. Every
+/// other failure stays a real platform error and propagates (tenet 1).
+fn is_not_yet_reachable(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Platform { code, .. }
+            if *code == AX_ERROR_CANNOT_COMPLETE as i64
+                || *code == AX_ERROR_INVALID_UI_ELEMENT as i64
+                || *code == AX_ERROR_NOT_IMPLEMENTED as i64
+    )
+}
+
 /// Recover a platform failure from a failed [`BatchAttrs::fetch`].
 ///
 /// The batch fetch collapses every failure to `None`, and
@@ -3834,11 +3855,15 @@ impl Provider for MacOSProvider {
             }
             let mut data = match self.build_element_data(&app_element, Some(*pid as u32)) {
                 Ok(d) => d,
-                // The process disappeared between the CGWindowList scan and
-                // the snapshot: it is not part of the live listing any more
-                // (the same classification the `Role::Unknown` filter below
-                // applies), not a failure of the listing.
-                Err(err) if is_gone_ax_element(&err) => continue,
+                // The process is not AX-reachable right now (still launching,
+                // busy, or without an accessibility bridge) or its object was
+                // invalidated between the scan and the snapshot: it
+                // contributes no entry to this listing, and the caller's poll
+                // re-enumerates — the same codes `app_by_pid` maps to
+                // `SelectorNotMatched`. The `Role::Unknown` filter below is
+                // the other half of the same classification. Every other
+                // failure propagates (tenet 1).
+                Err(err) if is_not_yet_reachable(&err) => continue,
                 Err(err) => return Err(err),
             };
             data.name = Some(app_name.clone());
@@ -3904,13 +3929,15 @@ impl Provider for MacOSProvider {
                 }
                 let mut data = match self.build_element_data(&app_element, Some(pid)) {
                     Ok(d) => d,
-                    // The process exited between the attach probe above and
-                    // the snapshot: the same "not reachable (yet)" reading
-                    // the probe maps to `SelectorNotMatched`, so the core's
-                    // poll loop keeps retrying until its deadline.
-                    Err(err) if is_gone_ax_element(&err) => {
+                    // The process became unreachable between the attach probe
+                    // above and the snapshot (it exited, or its accessibility
+                    // server stopped answering): the same "not reachable
+                    // (yet)" reading the probe maps to `SelectorNotMatched`,
+                    // so the core's poll loop keeps retrying until its
+                    // deadline.
+                    Err(err) if is_not_yet_reachable(&err) => {
                         let diagnosis = xa11y_core::Diagnosis::new().last_observed(
-                            "the application was invalidated between the AX attach probe and \
+                            "the application stopped answering between the AX attach probe and \
                              its snapshot",
                         );
                         return Err(
@@ -4974,6 +5001,29 @@ mod tests {
         assert!(!is_gone_ax_element(&platform(AX_ERROR_ACTION_UNSUPPORTED)));
         // Non-platform errors are never "element gone".
         assert!(!is_gone_ax_element(&Error::ElementStale {
+            selector: "handle:1".to_string(),
+        }));
+    }
+
+    #[test]
+    fn not_yet_reachable_covers_only_the_retryable_ax_codes() {
+        let platform = |code: i32| Error::Platform {
+            code: code as i64,
+            message: String::new(),
+        };
+        // A freshly launched process owns its window before its
+        // accessibility server answers; a busy process and one without a
+        // bridge answer the same way. Skipping these for a listing is what
+        // `App.find` polls against — the app was about to become discoverable.
+        assert!(is_not_yet_reachable(&platform(AX_ERROR_CANNOT_COMPLETE)));
+        assert!(is_not_yet_reachable(&platform(AX_ERROR_INVALID_UI_ELEMENT)));
+        assert!(is_not_yet_reachable(&platform(AX_ERROR_NOT_IMPLEMENTED)));
+        // A malformed answer or any other platform failure is a real error,
+        // not an absence to retry.
+        assert!(!is_not_yet_reachable(&platform(
+            AX_ERROR_ACTION_UNSUPPORTED
+        )));
+        assert!(!is_not_yet_reachable(&Error::ElementStale {
             selector: "handle:1".to_string(),
         }));
     }
