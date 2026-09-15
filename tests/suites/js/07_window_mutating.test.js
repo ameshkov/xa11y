@@ -164,16 +164,22 @@ test('a window that advertises minimize is minimized and restored', async () => 
   }
 });
 
-async function windowReadsMaximized(app) {
+async function windowReadsMaximized(app, verb) {
+  // `verb` is the capability the caller is waiting on: on macOS a restored
+  // window can advertise `restore` while `maximize` is absent (the two verbs
+  // are independent — `maximize` needs AXFullScreen settable, `restore` can
+  // be a minimize-only window), so the false-state waits select by `restore`
+  // and the true-state waits by `maximize`.
+  //
   // The state is platform-specific: Windows reports `maximized`, macOS
   // reports the native fullscreen state as `fullscreen` (its `maximized`
   // stays null). Both are checked so the assertion is portable.
   //
-  // null while the state is unknown: no window advertising `maximize` is
+  // null while the state is unknown: no window advertising `verb` is
   // enumerable (the transition transiently removes the real window), or
   // neither getter answered. Boolean(null) would read that as "restored" and
   // let the state waits below pass without observing anything.
-  const win = await windowAdvertising(app, 'maximize');
+  const win = await windowAdvertising(app, verb);
   if (!win) return null;
   if (win.maximized === true || win.fullscreen === true) return true;
   if (win.maximized === false || win.fullscreen === false) return false;
@@ -189,7 +195,7 @@ test('a window that advertises maximize is maximized and restored', async () => 
   try {
     await win.maximize();
     await waitUntil(
-      async () => (await windowReadsMaximized(app)) === true,
+      async () => (await windowReadsMaximized(app, 'maximize')) === true,
       5000,
       'window to report maximized'
     );
@@ -201,14 +207,14 @@ test('a window that advertises maximize is maximized and restored', async () => 
     await current.maximize();
     await sleep(2000);
     await waitUntil(
-      async () => (await windowReadsMaximized(app)) === true,
+      async () => (await windowReadsMaximized(app, 'maximize')) === true,
       5000,
       'the window to remain maximized after a second maximize'
     );
     current = await waitForWindow(app, 'restore', 'a restorable window');
     await current.restore();
     await waitUntil(
-      async () => (await windowReadsMaximized(app)) === false,
+      async () => (await windowReadsMaximized(app, 'restore')) === false,
       5000,
       'window to report restored'
     );
@@ -216,7 +222,7 @@ test('a window that advertises maximize is maximized and restored', async () => 
     await current.restore();
     await sleep(2000);
     await waitUntil(
-      async () => (await windowReadsMaximized(app)) === false,
+      async () => (await windowReadsMaximized(app, 'restore')) === false,
       5000,
       'the window to remain restored after a second restore'
     );
@@ -243,7 +249,7 @@ test('a window that advertises maximize is maximized and restored', async () => 
         await current.restore();
       }
       await waitUntil(
-        async () => (await windowReadsMaximized(app)) === expected,
+        async () => (await windowReadsMaximized(app, expected ? 'maximize' : 'restore')) === expected,
         5000,
         `the window to read maximized=${expected} during the alternating sequence`
       );

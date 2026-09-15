@@ -318,16 +318,21 @@ mod tests {
                 .find(|w| w.actions.iter().any(|a| a == verb)))
         }
 
-        /// The main window's maximized/fullscreen state, or `None` while it is
+        /// The state of the window advertising `verb`, or `None` while it is
         /// unknown (the real window is transiently absent mid-transition, or
         /// neither getter answered).
+        ///
+        /// `verb` is the capability the caller is waiting on: on macOS a
+        /// restored window can advertise `restore` while `maximize` is absent
+        /// (the two verbs are independent), so the restored waits select by
+        /// `restore`.
         ///
         /// Unknown is not `false`: collapsing it to restored would let a
         /// restored wait pass without observing anything. macOS reports the
         /// state as `fullscreen` (AXFullScreen) and leaves `maximized` `None`;
         /// Windows is the reverse.
-        fn fullscreen(app: &App) -> Option<bool> {
-            let w = main_window(app, "maximize")?;
+        fn fullscreen(app: &App, verb: &str) -> Option<bool> {
+            let w = main_window(app, verb)?;
             if w.states.maximized == Some(true) || w.states.fullscreen == Some(true) {
                 return Some(true);
             }
@@ -346,12 +351,13 @@ mod tests {
         // maximize commits.
         win.maximize().expect("maximize must succeed");
         // `wait_until` returns on any `Some`, so filter for the promised
-        // state: a bare `fullscreen(&app)` would also accept `Some(false)`.
+        // state: a bare `fullscreen(&app, "maximize")` would also accept
+        // `Some(false)`.
         wait_until(
             Duration::from_secs(5),
             "window to report fullscreen",
             || {
-                fullscreen(&app)
+                fullscreen(&app, "maximize")
                     .filter(|fullscreen| *fullscreen)
                     .map(|_| ())
             },
@@ -368,7 +374,7 @@ mod tests {
         .expect("repeated maximize must succeed");
         std::thread::sleep(Duration::from_secs(2));
         assert!(
-            fullscreen(&app).unwrap_or(false),
+            fullscreen(&app, "maximize").unwrap_or(false),
             "a second maximize must be a no-op, but the window left fullscreen"
         );
 
@@ -380,7 +386,7 @@ mod tests {
         .restore()
         .expect("restore must succeed");
         wait_until(Duration::from_secs(5), "window to report restored", || {
-            fullscreen(&app)
+            fullscreen(&app, "restore")
                 .filter(|fullscreen| !*fullscreen)
                 .map(|_| ())
         });
@@ -391,7 +397,7 @@ mod tests {
         .expect("repeated restore must succeed");
         std::thread::sleep(Duration::from_secs(2));
         assert!(
-            !fullscreen(&app).unwrap_or(true),
+            !fullscreen(&app, "restore").unwrap_or(true),
             "a second restore must be a no-op, but the window re-entered fullscreen"
         );
 
@@ -419,7 +425,7 @@ mod tests {
                 w.restore().expect("restore must succeed");
             }
             wait_until(Duration::from_secs(5), "sequence step to settle", || {
-                fullscreen(&app)
+                fullscreen(&app, verb)
                     .filter(|fullscreen| *fullscreen == expected_fullscreen)
                     .map(|_| ())
             });

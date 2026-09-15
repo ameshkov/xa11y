@@ -246,20 +246,26 @@ def test_minimize_and_restore(app: xa11y.App) -> None:
         raise
 
 
-def _window_reads_maximized(app: xa11y.App) -> bool | None:
-    """Whether a maximizable window reads back as maximized/fullscreen.
+def _window_reads_maximized(app: xa11y.App, verb: str) -> bool | None:
+    """Whether a window advertising ``verb`` reads back as maximized/fullscreen.
+
+    ``verb`` is the capability the caller is waiting on: on macOS a restored
+    window can advertise ``restore`` while ``maximize`` is absent (the two
+    verbs are independent — ``maximize`` needs ``AXFullScreen`` settable,
+    ``restore`` can be a minimize-only window), so the false-state waits
+    select by ``restore`` and the true-state waits by ``maximize``.
 
     The state is platform-specific: Windows reports ``maximized``, macOS
     reports the native fullscreen state as ``fullscreen`` (its ``maximized``
     stays ``None``). Both are polled so the assertion is portable across the
     cells that advertise the verb.
 
-    ``None`` while the state is unknown: no window advertising ``maximize``
+    ``None`` while the state is unknown: no window advertising ``verb``
     is enumerable (the transition transiently removes the real window), or
     neither getter answered. ``bool(None)`` would read that as "restored" and
     let the state waits below pass without observing anything.
     """
-    win = _window_advertising(app, "maximize")
+    win = _window_advertising(app, verb)
     if win is None:
         return None
     if win.maximized is True or win.fullscreen is True:
@@ -284,7 +290,7 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
     try:
         win.maximize()
         _wait_until(
-            lambda: _window_reads_maximized(app) is True,
+            lambda: _window_reads_maximized(app, "maximize") is True,
             5.0,
             "window to report maximized",
         )
@@ -294,14 +300,14 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         current.maximize()
         time.sleep(2.0)
         _wait_until(
-            lambda: _window_reads_maximized(app) is True,
+            lambda: _window_reads_maximized(app, "maximize") is True,
             5.0,
             "the window to remain maximized after a second maximize",
         )
         current = _wait_for_window(app, "restore", "a restorable window")
         current.restore()
         _wait_until(
-            lambda: _window_reads_maximized(app) is False,
+            lambda: _window_reads_maximized(app, "restore") is False,
             5.0,
             "window to report restored",
         )
@@ -310,7 +316,7 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         current.restore()
         time.sleep(2.0)
         _wait_until(
-            lambda: _window_reads_maximized(app) is False,
+            lambda: _window_reads_maximized(app, "restore") is False,
             5.0,
             "the window to remain restored after a second restore",
         )
@@ -335,7 +341,10 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
             else:
                 current.restore()
             _wait_until(
-                lambda bound=expected: _window_reads_maximized(app) is bound,
+                lambda bound=expected: _window_reads_maximized(
+                    app, "maximize" if bound else "restore"
+                )
+                is bound,
                 5.0,
                 f"the window to read maximized={expected} during the alternating sequence",
             )
