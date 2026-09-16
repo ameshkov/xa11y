@@ -140,7 +140,9 @@ features:
       cannot move or resize a top-level window at all. The suites adapt via
       the app config: python test_window.py + test_window_mutating.py, JS
       06_window.test.js + 07_window_mutating.test.js, and the Rust integ
-      suite's windows.rs cover rust_core.
+      suite's windows.rs cover rust_core. The WPF js-window cell subscribes
+      before opening a non-modal sibling and strictly verifies WindowOpened,
+      minimized true/false StateChanged, and WindowClosed delivery.
 
   input_sim:
     description: "input simulation: click, double-click, right-click, drag, key press, chord, type, scroll"
@@ -489,10 +491,139 @@ gaps:
       dispatch tests tolerate "unsupported" so the gap stayed invisible
       until the enforced test was added.
     severity: low
-    workaround: "move_to's bounds change is enforced on winforms; resize_to advertisement + dispatch are asserted, the bounds-update half is an honest skip. WPF / macOS AX cover real resize paths (the Rust integ suite's geometry test is macOS-only)."
+    workaround: "move_to's bounds change is enforced on winforms; resize_to advertisement + dispatch are asserted, the bounds-update half is an honest skip. The Qt macOS cell covers a real resize path (the Rust integ suite's geometry test is macOS-only)."
     affects:
       apps: [winforms]
       language: python
+      features: [windows]
+
+  - id: wpf_transform_resize_noop
+    description: >
+      WPF advertises UIA TransformPattern.Resize and accepts dispatch, but the
+      test window's reported outer bounds stay unchanged. CLI, MCP, and JS
+      dispatch the action and explicitly skip the bounds postcondition; the
+      same WPF cell enforces move_to plus duplicate-title, Locator-retargeting,
+      and lifecycle-event coverage.
+    severity: low
+    workaround: "Exact resize bounds are enforced by the Qt macOS cell."
+    affects:
+      apps: [wpf]
+      features: [windows]
+
+  - id: egui_transform_resize_noop
+    description: >
+      egui windows advertise the native resize action and accept its dispatch,
+      but their reported bounds remain unchanged on Windows and macOS. The CLI,
+      MCP, and JS mutation suites dispatch the action and record an explicit
+      skip rather than passing a no-op as mutation coverage.
+    severity: low
+    workaround: "move_to is enforced on egui; resize_to is enforced by the Qt macOS cell."
+    affects:
+      apps: [egui]
+      features: [windows]
+
+  - id: tauri_wayland_resize_outer_bounds
+    description: >
+      Tauri on Wayland applies resize_to as a client-area request while xa11y
+      reports decorated outer bounds. The mutation is observable, but sending
+      the reported original outer size back grows the window by its decoration
+      delta instead of restoring it exactly. The CLI suite verifies the first
+      mutation and explicitly skips the exact round-trip assertion.
+    severity: low
+    workaround: "Real resize and exact restoration are enforced by the Qt macOS cell."
+    affects:
+      apps: [tauri]
+      features: [windows]
+
+  - id: macos_window_enumeration_boundaries
+    description: >
+      AX app-wide window enumeration omits a minimized window and windows left
+      on another Space. Retained Element handles can still drive the supported
+      minimize/restore path, but a fresh MCP request or Locator cannot rediscover
+      the minimized target. The Cocoa fullscreen fixture observes its companion
+      before Space entry and asserts that the off-Space window then leaves the
+      listing.
+    severity: low
+    workaround: "Use a retained Element to restore a minimized macOS window; switch Spaces before locating an off-Space window."
+    affects:
+      features: [windows]
+
+  - id: tauri_desktop_resize_noop
+    description: >
+      Tauri on macOS and Windows advertises resize_to and accepts the native
+      action, but the reported bounds remain unchanged. MCP, CLI, and JS
+      dispatch the action and explicitly skip the bounds mutation assertion.
+    severity: low
+    workaround: "Resize mutation is enforced by the Qt macOS fixture."
+    affects:
+      apps: [tauri]
+      features: [windows]
+
+  - id: cocoa_maximize_state_unobservable
+    description: >
+      AppKit zoom is exposed as maximize, but AXFullScreen remains false and
+      macOS has no separate maximized state attribute. JS dispatches maximize
+      and restores the retained Element, then explicitly skips the unavailable
+      state postcondition.
+    severity: low
+    workaround: "Fullscreen state is enforced through the Cocoa fixture's native Toggle Fullscreen action."
+    affects:
+      apps: [cocoa]
+      features: [windows]
+
+  - id: cocoa_resize_noop
+    description: >
+      The native Cocoa fixture advertises AX resize and accepts dispatch, but
+      fresh app-wide enumeration continues to report unchanged bounds in the
+      CLI, MCP, and JS suites. Those surfaces dispatch then explicitly skip;
+      move_to remains an enforced observable geometry mutation.
+    severity: low
+    workaround: "Exact resize bounds are enforced by the Qt macOS fixture."
+    affects:
+      apps: [cocoa]
+      features: [windows]
+
+  - id: macos_locator_maximize_state_unobservable
+    description: >
+      The Qt and egui macOS windows' retained Elements report an observable
+      maximize transition, but maximize dispatched through a freshly resolved
+      JS Locator leaves the reported state unchanged. The Locator action is
+      dispatched and explicitly skipped; retained-Element tests enforce the
+      state transition and restoration in the same integration cells.
+    severity: low
+    workaround: "Retain the discovered Element when maximizing these windows on macOS."
+    affects:
+      apps: [egui, qt]
+      language: javascript
+      features: [windows]
+
+  - id: tauri_macos_locator_maximize_restore_failure
+    description: >
+      A maximize dispatched through a freshly resolved Locator enters
+      fullscreen in the Tauri macOS fixture, but Locator restore cannot settle
+      back to a non-fullscreen state and leaves the shared integration app
+      poisoned for later tests. Python and JS explicitly skip this unsafe
+      Locator round trip; both bindings enforce maximize and restoration via
+      the retained Element path in the same cell.
+    severity: low
+    workaround: "Retain the discovered Element when maximizing a Tauri window on macOS."
+    affects:
+      apps: [tauri]
+      language: [python, javascript]
+      features: [windows]
+
+  - id: qt_windows_geometry_offsets
+    description: >
+      Qt's Windows UIA TransformPattern applies move and resize requests in
+      client geometry while xa11y reports decorated outer bounds. The actions
+      produce observable changes, but the resulting coordinates and dimensions
+      differ from the requested outer values and do not round-trip exactly.
+      CLI, MCP, and JS assert that mutation occurred before explicitly skipping
+      the exact-value postcondition.
+    severity: low
+    workaround: "Exact Windows move postconditions are enforced by WPF; exact resize is enforced by the Qt macOS cell."
+    affects:
+      apps: [qt]
       features: [windows]
 
 # Resolved gaps (kept here briefly for provenance):

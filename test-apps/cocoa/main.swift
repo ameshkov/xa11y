@@ -29,6 +29,7 @@ if let path = pidFile {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    var spaceCompanion: NSWindow?
     var statusItem: NSStatusItem!
     var statusMenu: NSMenu!
 
@@ -405,13 +406,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
         }
+        // Keep a second app window on the original Space. App.windows() must
+        // continue to discover it while the primary window occupies the
+        // fullscreen Space; filtering by the active Space would lose it.
+        if spaceCompanion == nil {
+            let companion = NSWindow(
+                contentRect: NSRect(x: window.frame.minX + 40, y: window.frame.minY + 40,
+                                    width: 280, height: 140),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            companion.title = "Space Companion"
+            spaceCompanion = companion
+        }
+        spaceCompanion?.orderFront(nil)
         // AppKit documents that `toggleFullScreen:` "may simply do nothing"
         // without FullScreenPrimary/FullScreenAuxiliary in collectionBehavior.
         // The harness window servers complete the ENTRY transition but never
         // the EXIT one (the test asserts entry only), so the insert is here
         // for correctness on real sessions and for manual debugging.
         window.collectionBehavior.insert(.fullScreenPrimary)
-        window.toggleFullScreen(nil)
+        // Give the provider poll one deterministic chance to observe both
+        // windows before the asynchronous Space transition begins.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.window.toggleFullScreen(nil)
+        }
     }
 
     // References to controls that need state changes

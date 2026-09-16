@@ -16,6 +16,8 @@ line-format check both accept.
 from __future__ import annotations
 
 import re
+import sys
+import time
 
 import pytest
 
@@ -63,6 +65,17 @@ def _window_bounds(run_cli, app_pid) -> tuple[int, int, int, int]:
                 )
             return (x, y, w, h)
     pytest.skip("window line carries no bounds; cannot dispatch non-mutating")
+
+
+def _wait_for_bounds(run_cli, app_pid, predicate, what: str) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + 5.0
+    last = None
+    while time.monotonic() < deadline:
+        last = _window_bounds(run_cli, app_pid)
+        if predicate(last):
+            return last
+        time.sleep(0.1)
+    pytest.fail(f"timed out waiting for {what}; last bounds: {last}")
 
 
 def _assert_windows_listing(rc: int, stdout: str, stderr: str) -> None:
@@ -162,17 +175,17 @@ def test_action_move_to_rejects_a_malformed_point_as_a_usage_error(run_cli, app_
     assert "--at" in stderr or "--at" in stdout, f"the flag must be named:\n{stderr}"
 
 
-def test_action_move_to_dispatch_matches_the_round_trip(run_cli, app_pid):
-    """A valid ``--at`` reaches the window verb.
+def test_action_move_to_dispatch_matches_the_round_trip(run_cli, app_pid, app_name):
+    """A valid ``--at`` moves the window and restores its original bounds.
 
     The selector is the ``window, dialog`` alternation because window-like
     elements surface as either role depending on the app. The dispatch uses
-    the window's *current* position rather than a fixed point: the harness
+    a small delta from the window's current position: the harness
     runs the ``cli`` suite against the shared app instance before
     ``python-window`` / ``js-window``, and a real move churns the UIA/AX
     cache exactly like the final-position suites were introduced to isolate
-    (see ``tests/harness/launch.py``). Moving to the current coordinates
-    keeps the call real while leaving the app's geometry untouched. Where
+    (see ``tests/harness/launch.py``). The changed bounds are read back before
+    the original position is restored, so success cannot be a no-op. Where
     the platform has no window-geometry API (Linux AT-SPI), the operation
     fails surfaceably with exit 1 — tolerated exactly like the other
     advisory actions in ``test_actions.py``; the semantics guard is the Rust
@@ -180,27 +193,85 @@ def test_action_move_to_dispatch_matches_the_round_trip(run_cli, app_pid):
     """
     _require_windows(run_cli, app_pid)
     x, y, _, _ = _window_bounds(run_cli, app_pid)
-    rc, stdout, stderr = run_cli(
-        "action", "move-to", "--at", f"{x},{y}", "window, dialog", "--pid", str(app_pid)
-    )
-    if rc != 0:
-        lower = stderr.lower()
-        assert "unsupported" in lower or "not supported" in lower, (
-            f"unexpected failure:\nstderr: {stderr}"
+    moved = False
+    try:
+        rc, stdout, stderr = run_cli(
+            "action",
+            "move-to",
+            "--at",
+            f"{x + 10},{y + 10}",
+            "window, dialog",
+            "--pid",
+            str(app_pid),
         )
-    else:
-        assert "ok" in stdout, f"expected 'ok' in stdout, got: {stdout!r}"
+        if rc != 0:
+            lower = stderr.lower()
+            assert "unsupported" in lower or "not supported" in lower, (
+                f"unexpected failure:\nstderr: {stderr}"
+            )
+        else:
+            moved = True
+            assert "ok" in stdout, f"expected 'ok' in stdout, got: {stdout!r}"
+            if app_name == "qt" and sys.platform == "win32":
+                _wait_for_bounds(
+                    run_cli,
+                    app_pid,
+                    lambda b: abs(b[0] - x) > 2 or abs(b[1] - y) > 2,
+                    "Qt/UIA move-to to produce an observable bounds change",
+                )
+                pytest.skip(
+                    "Qt/UIA applies client coordinates to decorated outer bounds; "
+                    "tracked as qt_windows_geometry_offsets"
+                )
+            _wait_for_bounds(
+                run_cli,
+                app_pid,
+                lambda b: abs(b[0] - (x + 10)) <= 2 and abs(b[1] - (y + 10)) <= 2,
+                "move-to to change the reported position",
+            )
+            rc, _, stderr = run_cli(
+                "action",
+                "move-to",
+                "--at",
+                f"{x},{y}",
+                "window, dialog",
+                "--pid",
+                str(app_pid),
+            )
+            assert rc == 0, f"failed to restore window position: {stderr}"
+            moved = False
+            _wait_for_bounds(
+                run_cli,
+                app_pid,
+                lambda b: abs(b[0] - x) <= 2 and abs(b[1] - y) <= 2,
+                "move-to to restore the original position",
+            )
+    except BaseException:
+        if moved:
+            # Best-effort cleanup; the original assertion/error wins.
+            run_cli(
+                "action",
+                "move-to",
+                "--at",
+                f"{x},{y}",
+                "window, dialog",
+                "--pid",
+                str(app_pid),
+            )
+        raise
 
 
-def test_action_resize_to_requires_a_size_and_dispatches_it(run_cli, app_pid):
+def test_action_resize_to_requires_a_size_and_dispatches_it(
+    run_cli, app_pid, app_name
+):
     """``resize-to`` without ``--size`` is a usage error; with it, dispatch.
 
     Splitting requirement and dispatch keeps the malformed case deterministic
     on every platform: parsing a missing argument fails before any OS call.
-    Like the move-to dispatch test, the valid call resizes to the window's
-    *current* size so the shared app's geometry is never left altered for the
-    following window suites (see the move-to docstring and
-    ``tests/harness/launch.py``).
+    Like the move-to test, the valid call changes the requested geometry,
+    verifies the read-back, and restores it. WinForms and egui are explicit
+    skips after dispatch because their providers accept Resize but leave the
+    bounds unchanged (recorded transform-resize gaps).
     """
     rc, stdout, stderr = run_cli(
         "action", "resize-to", "window, dialog", "--pid", str(app_pid)
@@ -214,22 +285,100 @@ def test_action_resize_to_requires_a_size_and_dispatches_it(run_cli, app_pid):
 
     _require_windows(run_cli, app_pid)
     _, _, width, height = _window_bounds(run_cli, app_pid)
-    rc, stdout, stderr = run_cli(
-        "action",
-        "resize-to",
-        "--size",
-        f"{width},{height}",
-        "window, dialog",
-        "--pid",
-        str(app_pid),
-    )
-    if rc != 0:
-        lower = stderr.lower()
-        assert "unsupported" in lower or "not supported" in lower, (
-            f"unexpected failure:\nstderr: {stderr}"
+    resized = False
+    try:
+        rc, stdout, stderr = run_cli(
+            "action",
+            "resize-to",
+            "--size",
+            f"{width + 50},{height + 50}",
+            "window, dialog",
+            "--pid",
+            str(app_pid),
         )
-    else:
-        assert "ok" in stdout, f"expected 'ok' in stdout, got: {stdout!r}"
+        if rc != 0:
+            lower = stderr.lower()
+            assert "unsupported" in lower or "not supported" in lower, (
+                f"unexpected failure:\nstderr: {stderr}"
+            )
+        else:
+            resized = True
+            assert "ok" in stdout, f"expected 'ok' in stdout, got: {stdout!r}"
+            if app_name == "qt" and sys.platform == "win32":
+                _wait_for_bounds(
+                    run_cli,
+                    app_pid,
+                    lambda b: abs(b[2] - width) > 2 or abs(b[3] - height) > 2,
+                    "Qt/UIA resize-to to produce an observable bounds change",
+                )
+                pytest.skip(
+                    "Qt/UIA applies client size to decorated outer bounds; "
+                    "tracked as qt_windows_geometry_offsets"
+                )
+            resize_noop = app_name in {"cocoa", "egui", "winforms", "wpf"} or (
+                app_name == "tauri" and not sys.platform.startswith("linux")
+            )
+            if resize_noop:
+                gap = (
+                    "cocoa_resize_noop"
+                    if app_name == "cocoa"
+                    else (
+                        "egui_transform_resize_noop"
+                        if app_name == "egui"
+                        else (
+                            f"{app_name}_transform_resize_noop"
+                            if app_name in {"winforms", "wpf"}
+                            else "tauri_desktop_resize_noop"
+                        )
+                    )
+                )
+                pytest.skip(
+                    f"{app_name} accepts Resize without changing bounds; "
+                    f"tracked as {gap}"
+                )
+            _wait_for_bounds(
+                run_cli,
+                app_pid,
+                lambda b: abs(b[2] - (width + 50)) <= 2
+                and abs(b[3] - (height + 50)) <= 2,
+                "resize-to to change the reported size",
+            )
+            rc, _, stderr = run_cli(
+                "action",
+                "resize-to",
+                "--size",
+                f"{width},{height}",
+                "window, dialog",
+                "--pid",
+                str(app_pid),
+            )
+            assert rc == 0, f"failed to restore window size: {stderr}"
+            if app_name == "tauri" and sys.platform.startswith("linux"):
+                pytest.skip(
+                    "Tauri/Wayland maps requested client size to decorated outer "
+                    "bounds and cannot exactly round-trip the original size; "
+                    "tracked as tauri_wayland_resize_outer_bounds"
+                )
+            resized = False
+            _wait_for_bounds(
+                run_cli,
+                app_pid,
+                lambda b: abs(b[2] - width) <= 2 and abs(b[3] - height) <= 2,
+                "resize-to to restore the original size",
+            )
+    except BaseException:
+        if resized:
+            # Best-effort cleanup; the original assertion/error wins.
+            run_cli(
+                "action",
+                "resize-to",
+                "--size",
+                f"{width},{height}",
+                "window, dialog",
+                "--pid",
+                str(app_pid),
+            )
+        raise
 
 
 def _dispatch_window_verb(

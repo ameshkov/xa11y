@@ -81,7 +81,17 @@ def _window_named(app: xa11y.App, dialog_name: str) -> xa11y.Element | None:
     """The first element from App.windows() whose name contains `dialog_name`."""
     if not dialog_name:
         return None
-    for w in app.windows():
+    try:
+        windows = app.windows()
+    except xa11y.PlatformError as exc:
+        # A newly opened AppKit window can briefly reject AXChildren while
+        # its native title-bar controls are still being installed. Treat that
+        # one transient discovery result as "not visible yet" so callers such
+        # as _open_dialog keep polling; surface every other provider failure.
+        if sys.platform == "darwin" and "AXError -25202" in str(exc):
+            return None
+        raise
+    for w in windows:
         if w.name and dialog_name in w.name:
             return w
     return None
@@ -660,6 +670,11 @@ def test_locator_maximize_and_restore(app: xa11y.App) -> None:
         pytest.skip("no window advertises maximize")
     if "restore" not in win.actions:
         pytest.skip("no window advertises both maximize and restore")
+    if APP == "tauri" and sys.platform == "darwin":
+        pytest.skip(
+            "Tauri/macOS Locator restore cannot clear fullscreen "
+            "(tauri_macos_locator_maximize_restore_failure)"
+        )
     locator = _locator_for_window(app, win)
     try:
         locator.maximize()
@@ -830,20 +845,32 @@ def test_fullscreen_state_enters_and_reads_true(app: xa11y.App) -> None:
     the exit half is asserted nowhere. This test is ordered last in the file
     so nothing after it depends on the window's frame; the harness tears the
     app down at cell end, which returns the Space. The transition is
-    animated (Spaces), so the state is polled rather than read once.
+    animated (Spaces), so the state is polled rather than read once. The app
+    also opens ``Space Companion`` immediately before entry. The companion is
+    observed during the transition, then must leave the app-wide listing once
+    it remains behind on the original Space. This characterizes the provider's
+    active-Space boundary instead of assuming off-Space AX windows enumerate.
     """
     button = app.locator('button[name="Toggle Fullscreen"]')
     try:
         button.press()
         deadline = time.monotonic() + 15.0
+        companion_seen = False
         while time.monotonic() < deadline:
             windows = app.windows()
-            if windows and windows[0].fullscreen is True:
+            names = {w.name for w in windows}
+            companion_seen = companion_seen or "Space Companion" in names
+            if any(w.fullscreen is True for w in windows):
+                assert companion_seen, "the companion was never discoverable before Space entry"
+                assert "Space Companion" not in names, (
+                    "the original-Space companion unexpectedly remained in the "
+                    "active-Space window listing"
+                )
                 return
             time.sleep(0.2)
         raise AssertionError(
-            "fullscreen state did not become True; "
-            f"last read: {windows[0].fullscreen if windows else None!r}"
+            "fullscreen state did not become true; "
+            f"last read: {[(w.name, w.fullscreen) for w in windows]!r}"
         )
     except Exception:
         # Best-effort: the entry raised, so nothing is left to clean up on
