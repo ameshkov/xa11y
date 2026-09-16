@@ -42,6 +42,7 @@ eframe
 egui
 evdev
 flyouts?
+fullscreen
 libei
 libevdev
 taskbars?

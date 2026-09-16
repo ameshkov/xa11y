@@ -561,10 +561,13 @@ gaps:
 
   - id: cocoa_maximize_state_unobservable
     description: >
-      AppKit zoom is exposed as maximize, but AXFullScreen remains false and
-      macOS has no separate maximized state attribute. JS dispatches maximize
-      and restores the retained Element, then explicitly skips the unavailable
-      state postcondition.
+      The Cocoa fixture's window does not support AppKit fullscreen until its
+      own Toggle Fullscreen action inserts FullScreenPrimary into the window's
+      collection behavior, so the provider refuses Maximize with
+      ActionNotSupported and the window never advertises the verb in the
+      mutation suites. JS and Python skip the maximize state postcondition
+      there; the fullscreen path is still enforced through the fixture's native
+      Toggle Fullscreen action.
     severity: low
     workaround: "Fullscreen state is enforced through the Cocoa fixture's native Toggle Fullscreen action."
     affects:

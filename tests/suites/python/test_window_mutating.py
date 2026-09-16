@@ -42,6 +42,10 @@ pytestmark = pytest.mark.window_mutating
 # derives the same way.
 APP = os.environ.get("XA11Y_TEST_APP", "tauri")
 QT = APP == "qt"
+# The platform, not the app identity: the transition drill in
+# ``test_maximize_and_restore`` is about the macOS fullscreen animation, and
+# runs for every macOS test app (cocoa, egui, qt, tauri), not just one.
+MACOS = sys.platform == "darwin"
 
 # `close` is only exercised against a *secondary* dialog window (opened via
 # the app's "Open Dialog" button, see `_open_dialog`): closing the shared
@@ -63,18 +67,89 @@ def _window_advertising(app: xa11y.App, verb: str) -> xa11y.Element | None:
     return None
 
 
-def _wait_until(predicate, timeout: float, what: str) -> None:
-    """Poll `predicate` until it returns true, or `timeout` (seconds) elapses.
+def _wait_for_window(app: xa11y.App, verb: str, what: str) -> xa11y.Element:
+    """The first window advertising `verb`, polling out the transition churn.
 
-    Raises with a description on timeout — a dead poll is a fixture
-    regression, not a skip (mirrors ``wait_until`` in the Rust integ suite).
+    A fullscreen transition transiently removes the real window from
+    ``App.windows()`` (a shell window appears in its place), and the provider's
+    settle loop promises the *state*, not that the window is enumerable the
+    instant the verb returns. A one-shot lookup right after a verb reads that
+    absence as "the window is gone", so every repeated call waits for the real
+    window first.
+    """
+    return _wait_until(lambda: _window_advertising(app, verb), 5.0, what)
+
+
+def _wait_until(predicate, timeout: float, what: str):
+    """Poll `predicate` until it returns truthy, or `timeout` (seconds) elapses.
+
+    Returns the truthy value, so a caller that needs the polled object (e.g.
+    ``_wait_for_window``) reuses the same loop. Raises with a description on
+    timeout — a dead poll is a fixture regression, not a skip (mirrors
+    ``wait_until`` in the Rust integ suite).
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if predicate():
-            return
+        result = predicate()
+        if result:
+            return result
         time.sleep(0.1)
     raise AssertionError(f"timed out waiting for {what}")
+
+
+def _restore_window_best_effort(app: xa11y.App) -> None:
+    """Best-effort restore of the real window, for cleanup rails.
+
+    ``_wait_for_window`` with `restore`, not a one-shot lookup and not a
+    `maximize` lookup: the transition can have the real window out of
+    ``App.windows()``, and a window that advertises `maximize` does not
+    necessarily advertise the `restore` this cleanup needs. Never raises:
+    cleanup must not replace the original failure.
+    """
+    try:
+        current = _wait_for_window(app, "restore", "a restorable window")
+        current.restore()
+    except Exception:  # best-effort cleanup; the original error wins
+        pass
+
+
+def _assert_stays(
+    app: xa11y.App, verb: str, want: bool, hold: float, what: str
+) -> None:
+    """Fail on the first sample definitely away from ``want``; pass if it holds for ``hold``.
+
+    A bounded stand-in for ``sleep(hold)`` followed by an assertion: the same
+    wall clock, but a state that flips mid-window fails immediately, with the
+    message naming the condition rather than passing on the final value.
+
+    ``None`` — the window is transiently unenumerable, or neither state
+    getter answered — is skipped, not read as a flip: the same rule
+    ``_wait_for_state`` applies, and the one the Rust drill's ``assert_stays``
+    spells out. A transiently unknown state is not a verdict.
+    """
+    deadline = time.monotonic() + hold
+    while time.monotonic() < deadline:
+        state = _window_reads_maximized(app, verb)
+        if state is not None and state is not want:
+            raise AssertionError(f"{what} did not hold")
+        time.sleep(0.1)
+
+
+def _wait_for_shell_clear(app: xa11y.App, what: str) -> None:
+    """Wait until no action-less transition shell is left in ``App.windows()``.
+
+    Driving a new fullscreen change into an animation still in flight makes
+    the window server leave the transient shell window behind, which changes
+    the enumeration every later test reads. The shell advertises no actions,
+    which is what separates it from the real window; waiting for that to
+    clear is the condition the fixed sleep it replaces was standing in for.
+    """
+
+    def shell_gone() -> bool:
+        windows = app.windows()
+        return bool(windows) and all(w.actions for w in windows)
+
+    _wait_until(shell_gone, 5.0, what)
 
 
 def _window_named(app: xa11y.App, dialog_name: str) -> xa11y.Element | None:
@@ -251,21 +326,76 @@ def test_minimize_and_restore(app: xa11y.App) -> None:
         # promise that could not be kept, not a skip.
         win.restore()
     except Exception:
-        # Never leave the shared app minimized for the suite after this one:
-        # restore from the element path, then report the original failure.
-        # Same best-effort pattern as the Locator test below — if the cleanup
-        # restore also fails, the original failure wins.
-        try:
-            current = _window_advertising(app, "minimize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        # Never leave the shared app minimized for the suite after this one;
+        # the original failure wins over any cleanup failure.
+        _restore_window_best_effort(app)
         raise
 
 
+def _window_reads_maximized(app: xa11y.App, verb: str) -> bool | None:
+    """Whether a window advertising ``verb`` reads back as maximized/fullscreen.
+
+    ``verb`` is the capability the caller is waiting on: on macOS a restored
+    window can advertise ``restore`` while ``maximize`` is absent (the two
+    verbs are independent — ``maximize`` needs ``AXFullScreen`` settable,
+    ``restore`` can be a minimize-only window), so the false-state waits
+    select by ``restore`` and the true-state waits by ``maximize``.
+
+    The state is platform-specific: Windows reports ``maximized``, macOS
+    reports the native fullscreen state as ``fullscreen`` (its ``maximized``
+    stays ``None``). Both are polled so the assertion is portable across the
+    cells that advertise the verb.
+
+    ``None`` while the state is unknown: no window advertising ``verb``
+    is enumerable (the transition transiently removes the real window), or
+    neither getter answered. ``bool(None)`` would read that as "restored" and
+    let the state waits below pass without observing anything.
+    """
+    win = _window_advertising(app, verb)
+    if win is None:
+        return None
+    if win.maximized is True or win.fullscreen is True:
+        return True
+    if win.maximized is False or win.fullscreen is False:
+        return False
+    return None
+
+
+def _wait_for_state(app: xa11y.App, verb: str, want: bool, what: str) -> None:
+    """Wait until the window advertising ``verb`` reads back as ``want``.
+
+    ``_window_reads_maximized`` answers ``None`` while the state is unknown
+    (the real window is transiently absent mid-transition, or neither getter
+    answered); the predicate filters ``want`` explicitly so that unknown is
+    never read as the opposite verdict. Taking ``verb`` / ``want`` as
+    parameters also keeps the predicate off the caller's loop variables.
+    """
+    _wait_until(lambda: _window_reads_maximized(app, verb) is want, 5.0, what)
+
+
+def _restore_and_wait(app: xa11y.App) -> None:
+    """Restore the real window and wait for it to read back as restored.
+
+    The lookup selects by `restore` for the same reason
+    ``_restore_window_best_effort`` does: a window that advertises `maximize`
+    does not necessarily advertise `restore`.
+    """
+    current = _wait_for_window(app, "restore", "a restorable window")
+    current.restore()
+    _wait_for_state(app, "restore", False, "window to report restored")
+
+
 def test_maximize_and_restore(app: xa11y.App) -> None:
-    """``Element.maximize`` + ``Element.restore`` reach the platform."""
+    """``Element.maximize`` + ``Element.restore`` reach the platform.
+
+    Everywhere: both verbs dispatch and the state reads back. On macOS only,
+    the repeated-call and alternating-sequence drill below runs too: the
+    fullscreen transition is asynchronous there, so repeated calls must be
+    idempotent, not toggles — the old provider pressed the zoom button, so a
+    second ``maximize`` exited fullscreen (issue #399). Windows and Linux set
+    the state synchronously, where the repeated calls assert a platform
+    invariant and only cost wall clock.
+    """
     win = _window_advertising(app, "maximize")
     if win is None:
         pytest.skip("this app's windows advertise no maximize action")
@@ -273,16 +403,67 @@ def test_maximize_and_restore(app: xa11y.App) -> None:
         pytest.skip("no window advertises both maximize and restore")
     try:
         win.maximize()
-        win.restore()
+        _wait_for_state(app, "maximize", True, "window to report maximized")
+        if not MACOS:
+            _restore_and_wait(app)
+            return
+
+        # A repeated maximize must be a no-op. Re-read the window first: the
+        # transition can recreate the window object.
+        current = _wait_for_window(app, "maximize", "a maximizable window")
+        current.maximize()
+        # Stay maximized for the time the old toggle's exit transition would
+        # have taken to land; a flip fails the hold immediately.
+        _assert_stays(
+            app,
+            "maximize",
+            True,
+            2.0,
+            "the window to remain maximized after a second maximize",
+        )
+        _restore_and_wait(app)
+        # A repeated restore must not re-enter the fullscreen state.
+        current = _wait_for_window(app, "restore", "a restorable window")
+        current.restore()
+        _assert_stays(
+            app,
+            "restore",
+            False,
+            2.0,
+            "the window to remain restored after a second restore",
+        )
+        # maximize -> restore -> maximize -> restore ends where every call
+        # promises; no call may toggle the state the next one sets. Each step
+        # waits for the previous transition's shell to clear before the next
+        # call: driving a new fullscreen change into an animation still in
+        # flight makes the window server leave the shell behind.
+        for expected in (True, False, True, False):
+            # Wait for the verb about to run: `maximize` and `restore` are
+            # advertised independently (a committed fullscreen window can keep
+            # `maximize` while its AXFullScreen is no longer settable, and
+            # `restore` is refused in exactly that state), so a lookup pinned
+            # to `maximize` cannot stand in for a restore call.
+            verb = "maximize" if expected else "restore"
+            current = _wait_for_window(
+                app,
+                verb,
+                "a maximizable window" if expected else "a restorable window",
+            )
+            if expected:
+                current.maximize()
+            else:
+                current.restore()
+            _wait_for_state(
+                app,
+                verb,
+                expected,
+                f"the window to read maximized={expected} during the alternating sequence",
+            )
+            _wait_for_shell_clear(app, "the transition shell to clear")
     except Exception:
         # Same failure-preserving cleanup as minimize: the shared app must
         # not be left maximized for the suites after this one.
-        try:
-            current = _window_advertising(app, "maximize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        _restore_window_best_effort(app)
         raise
 
 
@@ -494,15 +675,9 @@ def test_state_changed_minimized_on_minimize_restore(app: xa11y.App) -> None:
             )
             assert event.state_value is False
     except Exception:
-        # Never leave the shared app minimized for the suite after this one.
-        # Same best-effort pattern as test_locator_minimize_and_restore: if
-        # the cleanup restore also fails, the original failure wins.
-        try:
-            current = _window_advertising(app, "minimize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        # Never leave the shared app minimized for the suite after this one;
+        # the original failure wins over any cleanup failure.
+        _restore_window_best_effort(app)
         raise
 
 
@@ -643,18 +818,9 @@ def test_locator_minimize_and_restore(app: xa11y.App) -> None:
         locator.minimize()
         locator.restore()
     except Exception:
-        # Never leave the shared app minimized for the suite after this one:
-        # restore from the element path, then report the original failure.
-        # The cleanup lookup sits inside the same best-effort block: if
-        # re-enumeration fails while recovering, that must not replace the
-        # original restore() error — the original failure wins, however the
-        # cleanup itself goes.
-        try:
-            current = _window_advertising(app, "minimize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        # Never leave the shared app minimized for the suite after this one;
+        # the original failure wins over any cleanup failure.
+        _restore_window_best_effort(app)
         raise
 
 
@@ -680,12 +846,8 @@ def test_locator_maximize_and_restore(app: xa11y.App) -> None:
         locator.maximize()
         locator.restore()
     except Exception:
-        try:
-            current = _window_advertising(app, "maximize")
-            if current is not None and "restore" in current.actions:
-                current.restore()
-        except Exception:  # best-effort cleanup; the original error wins
-            pass
+        # Same failure-preserving cleanup as the element path.
+        _restore_window_best_effort(app)
         raise
 
 

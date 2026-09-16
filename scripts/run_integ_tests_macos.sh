@@ -29,7 +29,8 @@ cargo build --workspace --features xa11y/strict-roles 2>&1
 #    because cargo run changes the process owner name in CGWindowListCopyWindowInfo)
 echo "Launching xa11y-test-app..."
 ./target/debug/xa11y-test-app --headless &
-CLEANUP_PIDS+=($!)
+TEST_APP_PID=$!
+CLEANUP_PIDS+=($TEST_APP_PID)
 
 # Wait for accessibility registration
 echo "Waiting for test app to register..."
@@ -41,7 +42,19 @@ set +e
 cargo test -p xa11y --features strict-roles --test integ_test -- --ignored --test-threads=1 2>&1
 TEST_EXIT=$?
 
-# 4. Run macOS provider AX call count regression tests
+# 4. Restart the test application for the AX call count regression tests.
+#    The integ phase above drives fullscreen and minimize transitions, whose
+#    transient shell windows change the app's tree; the counts below are a
+#    regression guard for a known tree, so measure a freshly launched app.
+echo "Restarting xa11y-test-app for the AX call count tests..."
+kill "$TEST_APP_PID" 2>/dev/null || true
+wait "$TEST_APP_PID" 2>/dev/null || true
+./target/debug/xa11y-test-app --headless &
+TEST_APP_PID=$!
+CLEANUP_PIDS+=($TEST_APP_PID)
+sleep 2
+
+# 5. Run macOS provider AX call count regression tests
 echo "Running AX call count regression tests..."
 cargo test -p xa11y-macos -- --ignored --test-threads=1 2>&1
 MACOS_EXIT=$?
