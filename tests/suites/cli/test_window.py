@@ -445,6 +445,50 @@ def test_action_enter_fullscreen_restore_round_trip_dispatches(run_cli, app_pid)
         _dispatch_window_verb(run_cli, app_pid, "restore")
 
 
+def _wait_for_dialog_gone(run_cli, app_pid, timeout: float) -> bool:
+    """Poll until the opened dialog leaves the tree; True when it did.
+
+    The fixture hides (not destroys) its dialog, so the cleanup press
+    returning only means the click was delivered: the python-window /
+    js-window suites that follow enumerate windows and must not race the
+    hide.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rc, _, _ = run_cli("find", DIALOG_SELECTOR, "--pid", str(app_pid))
+        if rc != 0:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _close_opened_dialog(run_cli, app_pid, *, strict: bool) -> None:
+    """Press the fixture's "Close Dialog" until the dialog leaves the tree.
+
+    A cleanup press that did not take effect (a swallowed dispatch failure)
+    is retried, because a leftover dialog corrupts the *next* suite's
+    enumeration rather than this one's. ``strict`` decides what a dialog that
+    never leaves means: a failure when the test itself passed, silence when
+    it did not (the original failure wins).
+    """
+    attempts = 3
+    for _ in range(attempts):
+        rc, _, _ = run_cli("find", DIALOG_SELECTOR, "--pid", str(app_pid))
+        if rc != 0:
+            return
+        run_cli(
+            "action", "press", "button[name='Close Dialog']", "--pid", str(app_pid)
+        )
+        if _wait_for_dialog_gone(run_cli, app_pid, 2.0):
+            return
+    if strict:
+        pytest.fail(
+            f"the dialog matching {DIALOG_SELECTOR!r} is still present after "
+            f"{attempts} cleanup presses; the python-window / js-window suites "
+            "that follow enumerate windows and would see it"
+        )
+
+
 def test_action_close_dispatches_on_an_opened_dialog(run_cli, app_pid):
     """``action close`` is dispatched against a dialog the test opens.
 
@@ -507,6 +551,8 @@ def test_action_close_dispatches_on_an_opened_dialog(run_cli, app_pid):
         # decided the outcome. A timeout means no dialog ever appeared, so
         # there is nothing to close and nothing to wait for.
         if rc != 0 and "timeout" not in lower:
-            run_cli(
-                "action", "press", "button[name='Close Dialog']", "--pid", str(app_pid)
-            )
+            # The press only delivers the click; wait for the dialog to leave
+            # the enumeration before the following suites read it. A dialog
+            # that never leaves is a clean-up failure only when the dispatch
+            # claim above held — the original failure wins otherwise.
+            _close_opened_dialog(run_cli, app_pid, strict=sys.exc_info()[0] is None)
