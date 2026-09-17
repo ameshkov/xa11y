@@ -126,6 +126,25 @@ def _field(line: str, key: str) -> str:
     return ""
 
 
+def _command_chord_seen(log: str) -> bool:
+    """Whether the command-key chord's own events are in `log`.
+
+    `sim.type_text` synthesises keycode 0, which WKWebView reports as
+    `keyup key=a code=KeyA mods=-`: a line that looks like the chord's `a`
+    tap but carries no modifier. It is still in flight when the test clears
+    the log before chording, so a predicate that accepts any `key=a` line
+    can match it and return before the chord has been delivered. Requiring
+    the chord's command modifier — `mods=meta` where the platform routes it
+    into `metaKey`, the `Super` key name where WebKit-GTK does not — is what
+    makes the wait observe the chord itself.
+    """
+    lines = log.split("\n")
+    return any("key=a" in line for line in lines) and (
+        any("mods=meta" in line for line in lines)
+        or any("key=Super" in line for line in lines)
+    )
+
+
 def _focus_settled(app: xa11y.App, selector: str) -> None:
     """Focus `selector` and wait until the platform agrees it is focused.
 
@@ -409,7 +428,7 @@ def test_platform_meta_chord(tauri_input_app, sim):
     sim.type_text("hello")
     _clear_log(tauri_input_app)
     sim.chord("a", ["Meta"])
-    log = _wait_for_log(tauri_input_app, lambda t: "keyup" in t and "key=a" in t)
+    log = _wait_for_log(tauri_input_app, _command_chord_seen)
     assert "meta" in log or "Super" in log or "Meta" in log, (
         f"expected platform command modifier in log, got:\n{log}"
     )
