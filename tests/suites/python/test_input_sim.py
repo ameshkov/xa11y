@@ -446,21 +446,26 @@ def test_platform_meta_chord(tauri_input_app, sim):
 
 
 def test_type_text_writes_to_focused_input(tauri_input_app, sim):
-    _clear_log(tauri_input_app)
-    # `_focus_typed_field` ends with a real pointer click, so the DOM-focused
-    # field is what receives the Unicode characters type_text injects — a UIA
-    # SetFocus alone does not move DOM focus under WebView2.
-    _focus_typed_field(tauri_input_app)
-    sim.type_text("hello xa11y")
-    # Poll the typed-text input's value (not the event log) — type_text uses
-    # Unicode / scancode paths that don't always generate synthetic key events
-    # at the DOM level.
-    deadline = time.monotonic() + LOG_SETTLE_TIMEOUT
-    while time.monotonic() < deadline:
-        val = tauri_input_app.locator(TYPED_FIELD).element().value or ""
-        if val == "hello xa11y":
-            return
-        time.sleep(0.05)
+    # `_focus_typed_field` ends with a real pointer click, but the click moves
+    # DOM focus asynchronously: on Linux the first character can be delivered
+    # to the window while the field is still transitioning and not inserted,
+    # leaving the value missing exactly its first character. Retry the whole
+    # focus-and-type with focus already settled rather than asserting on a
+    # half-delivered string. The Clear press resets the typed field too.
+    val = ""
+    for _ in range(3):
+        _clear_log(tauri_input_app)
+        _focus_typed_field(tauri_input_app)
+        sim.type_text("hello xa11y")
+        # Poll the typed-text input's value (not the event log) — type_text
+        # uses Unicode / scancode paths that don't always generate synthetic
+        # key events at the DOM level.
+        deadline = time.monotonic() + LOG_SETTLE_TIMEOUT
+        while time.monotonic() < deadline:
+            val = tauri_input_app.locator(TYPED_FIELD).element().value or ""
+            if val == "hello xa11y":
+                return
+            time.sleep(0.05)
     pytest.fail(f"typed-text field did not receive expected text, got: {val!r}")
 
 
