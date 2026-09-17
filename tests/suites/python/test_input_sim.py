@@ -146,22 +146,28 @@ def _command_chord_seen(log: str) -> bool:
 
 
 def _focus_settled(app: xa11y.App, selector: str) -> None:
-    """Focus `selector` and wait until the platform agrees it is focused.
+    """Give `selector` keyboard focus and wait until the platform agrees.
 
     `focus()` auto-waits for the target to be visible and enabled and then
-    issues the focus action; it does not wait for focus to *land*. Synthesised
-    keystrokes go to whatever holds keyboard focus at the moment they are
-    posted, so a test that types immediately after `focus()` can have its first
-    keystroke delivered to the previous holder and dropped.
+    issues the focus action; it does not wait for focus to *land*, and under
+    WebView2 a UIA SetFocus does not reliably move the webview's keyboard
+    focus at all. Synthesised keystrokes go to whatever holds keyboard focus
+    at the moment they are posted, so a test that types immediately after
+    `focus()` can have its keystrokes delivered to the previous holder and
+    dropped — the symptom is an empty event log.
 
-    That is a race the suite loses only occasionally, and only on the first
-    keyboard test after the mouse ones — the rest inherit settled focus, which
-    is why `test_key_press_reports_keydown_keyup` failed alone on Windows with
-    an empty event log while every later keyboard test passed.
+    A real pointer click is what claims keyboard focus: it is delivered to
+    the element rather than to a stale holder, and it settles the webview's
+    focus transition before the first synthetic key. `wait_focused` stays
+    because it verifies the platform saw the focus move; the click follows
+    it so the two cannot race each other.
     """
     locator = app.locator(selector)
     locator.focus()
     locator.wait_focused(timeout=FOCUS_SETTLE_TIMEOUT)
+    rect = locator.element().bounds
+    assert rect is not None, f"{selector} has no bounds to click for keyboard focus"
+    xa11y.input_sim().click((rect.x + rect.width // 2, rect.y + rect.height // 2))
 
 
 def _focus_hit_target(app: xa11y.App) -> None:
