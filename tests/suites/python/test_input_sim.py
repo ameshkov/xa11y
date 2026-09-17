@@ -129,17 +129,15 @@ def _field(line: str, key: str) -> str:
 def _command_chord_seen(log: str) -> bool:
     """Whether the command-key chord's own events are in `log`.
 
-    `sim.type_text` synthesises keycode 0, which WKWebView reports as
-    `keyup key=a code=KeyA mods=-`: a line that looks like the chord's `a`
-    tap but carries no modifier. It is still in flight when the test clears
-    the log before chording, so a predicate that accepts any `key=a` line
-    can match it and return before the chord has been delivered. Requiring
-    the chord's command modifier — `mods=meta` where the platform routes it
-    into `metaKey`, the `Super` key name where WebKit-GTK does not — is what
-    makes the wait observe the chord itself.
+    Require the chord's tapped key plus the command modifier. A predicate
+    that accepts any key line can be satisfied by the stale
+    `keyup key=a ... mods=-` line that `type_text` leaves in flight, which
+    returned the wait before the chord had been delivered. The modifier is
+    `mods=meta` where the platform routes it into `metaKey`, and the
+    `Super` key name where WebKit-GTK does not.
     """
     lines = log.split("\n")
-    return any("key=a" in line for line in lines) and (
+    return any("key=;" in line for line in lines) and (
         any("mods=meta" in line for line in lines)
         or any("key=Super" in line for line in lines)
     )
@@ -420,7 +418,7 @@ def test_chord_reports_modifier(tauri_input_app, sim):
 
 
 def test_platform_meta_chord(tauri_input_app, sim):
-    """Cmd/Win/Super+A should fire the platform's 'command' key held.
+    """Cmd/Win/Super held across a tap should fire the platform's 'command' key.
 
     The browser surfaces this differently per platform:
       - macOS: Cmd → KeyboardEvent.metaKey (`mods=meta`)
@@ -428,12 +426,19 @@ def test_platform_meta_chord(tauri_input_app, sim):
       - Linux: Super → KeyboardEvent.key == 'Super' (WebKit-GTK doesn't
         route Super into the metaKey flag, so we check for the key name
         on the keydown/keyup events instead).
+
+    The tap is `;`, not a letter: Windows reserves Win+<letter> (Win+A is
+    Quick Settings, Win+E Explorer, and so on) and the shell consumes the
+    letter, so the page never sees the tap. Semicolon is unbound and still
+    proves the modifier is held.
     """
     _clear_log(tauri_input_app)
     _focus_typed_field(tauri_input_app)
     sim.type_text("hello")
-    _clear_log(tauri_input_app)
-    sim.chord("a", ["Meta"])
+    # No second clear: the predicate requires the chord's own `;` events, so
+    # the type_text lines still in flight cannot satisfy the wait, and the
+    # Clear press would move focus off the field right before the chord.
+    sim.chord(";", ["Meta"])
     log = _wait_for_log(tauri_input_app, _command_chord_seen)
     assert "meta" in log or "Super" in log or "Meta" in log, (
         f"expected platform command modifier in log, got:\n{log}"
