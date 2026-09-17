@@ -198,9 +198,15 @@ Window verbs are only meaningful on window-like elements: `window`, or
 `dialog`, which every platform surfaces as a top-level window. `move-to` and
 `resize-to` take **logical** screen coordinates (the same space as the
 `bounds=()` in `xa11y find` output). Where a platform has no accessibility
-API for a verb — Linux cannot minimize, maximize, restore, or close a
-window — the command exits non-zero with `Unsupported`; it never falls back
-to input simulation.
+API for a verb — Linux cannot minimize, maximize, enter-fullscreen, restore,
+or close a window; macOS cannot maximize and Windows cannot enter fullscreen
+— the command exits non-zero with `Unsupported`; it never falls back to input
+simulation.
+
+`restore` is the inverse of all three entry verbs (`minimize`, `maximize`,
+`enter-fullscreen`): it leaves whichever special state is set. There is no
+separate exit-fullscreen action — on macOS the only absolute exit is the same
+`AXFullScreen=false` write, so a second verb would be a second name for it.
 
 #### Available actions
 
@@ -222,9 +228,10 @@ to input simulation.
 | `type-text` | Type text as keystrokes (requires `--value`) |
 | `select-text` | Select a text range (requires `--value START,END`) |
 | `activate` | Bring the window to the foreground and focus it |
-| `minimize` | Minimize the window |
-| `maximize` | Maximize the window |
-| `restore` | Restore the window from minimized/maximized |
+| `minimize` | Minimize the window (leaves fullscreen first on macOS) |
+| `maximize` | Maximize the window (Windows `WindowVisualState_Maximized`; unsupported on macOS) |
+| `enter-fullscreen` | Put the window in native fullscreen (macOS `AXFullScreen`; unsupported on Windows) |
+| `restore` | Restore the window from minimized/maximized/fullscreen |
 | `close` | Close the window |
 | `move-to` | Move the window (requires `--at X,Y`) |
 | `resize-to` | Resize the window (requires `--size W,H`) |
@@ -458,11 +465,12 @@ the first of several. Narrow the selector or pick one with `:nth(n)`.
 Both surfaces auto-wait: the element has to exist, be visible, and be enabled
 before the action runs, within the default timeout (5 seconds, or
 `XA11Y_DEFAULT_TIMEOUT` seconds when that is set in the server's environment).
-The window verbs (`activate`, `minimize`, `maximize`, `restore`, `close`,
-`move-to`, `resize-to`) and `scroll-into-view` are the one exception: they wait
-only for `enabled`, because a minimized window is legitimately not visible and
-must still be reachable by the very verbs that restore or activate it. A call that
-is going to fail therefore takes that long, and no MCP argument shortens it.
+The window verbs (`activate`, `minimize`, `maximize`, `enter-fullscreen`,
+`restore`, `close`, `move-to`, `resize-to`) and `scroll-into-view` are the one
+exception: they wait only for `enabled`, because a minimized window is
+legitimately not visible and must still be reachable by the very verbs that
+restore or activate it. A call that is going to fail therefore takes that
+long, and no MCP argument shortens it.
 `ok: true` reports that the application accepted the call, not that anything
 changed; read the tree again to confirm an effect.
 

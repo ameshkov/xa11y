@@ -564,11 +564,27 @@ impl Element {
         py.detach(move || element.minimize()).map_err(to_py_err)
     }
     /// Maximize this window.
+    ///
+    /// Distinct from ``enter_fullscreen``: this drives the platform's
+    /// maximized state, not native fullscreen. Raises
+    /// ``ActionNotSupportedError`` on a platform without an accessible
+    /// maximize (macOS exposes no readable or writable zoom state).
     fn maximize(&self, py: Python<'_>) -> PyResult<()> {
         let element = xa11y::Element::new(self.inner_data.clone(), self.provider.clone());
         py.detach(move || element.maximize()).map_err(to_py_err)
     }
-    /// Restore this window to its normal state (from minimized/maximized).
+    /// Put this window in native fullscreen (macOS ``AXFullScreen``).
+    ///
+    /// Distinct from ``maximize``; ``restore`` leaves fullscreen. Raises
+    /// ``ActionNotSupportedError`` on platforms with no fullscreen
+    /// accessibility API (Windows/Linux).
+    fn enter_fullscreen(&self, py: Python<'_>) -> PyResult<()> {
+        let element = xa11y::Element::new(self.inner_data.clone(), self.provider.clone());
+        py.detach(move || element.enter_fullscreen())
+            .map_err(to_py_err)
+    }
+    /// Restore this window to its normal state (from
+    /// minimized/maximized/fullscreen).
     fn restore(&self, py: Python<'_>) -> PyResult<()> {
         let element = xa11y::Element::new(self.inner_data.clone(), self.provider.clone());
         py.detach(move || element.restore()).map_err(to_py_err)
@@ -810,11 +826,28 @@ impl Locator {
         py.detach(move || inner.minimize()).map_err(to_py_err)
     }
     /// Maximize the matched window.
+    ///
+    /// Distinct from ``enter_fullscreen``: this drives the platform's
+    /// maximized state, not native fullscreen.
     fn maximize(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
         py.detach(move || inner.maximize()).map_err(to_py_err)
     }
-    /// Restore the matched window to its normal state.
+    /// Put the matched window in native fullscreen.
+    ///
+    /// Distinct from ``maximize``; ``restore`` leaves fullscreen.
+    fn enter_fullscreen(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(move || inner.enter_fullscreen())
+            .map_err(to_py_err)
+    }
+    /// Restore the matched window to its normal state (from minimized,
+    /// maximized, or fullscreen).
+    ///
+    /// This is the inverse of ``minimize``, ``maximize``, and
+    /// ``enter_fullscreen``: it clears every special state the platform can
+    /// clear. There is deliberately no separate "exit fullscreen" method —
+    /// leaving fullscreen is the same absolute state write this performs.
     fn restore(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
         py.detach(move || inner.restore()).map_err(to_py_err)

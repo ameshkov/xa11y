@@ -148,8 +148,8 @@ pub enum StateFlag {
     /// Accessibility API has no fullscreen notification, UIA's
     /// `WindowVisualState` has no fullscreen value, and AT-SPI has no
     /// fullscreen state bit. macOS exposes fullscreen as the `fullscreen`
-    /// window state (`AXFullScreen`), driven by `maximize` and `restore`,
-    /// without a notification.
+    /// window state (`AXFullScreen`), driven by `enter_fullscreen` and
+    /// `restore`, without a notification.
     Fullscreen,
 }
 

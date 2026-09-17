@@ -612,8 +612,8 @@ def test_windows_tool_reports_limit_truncation_honestly(mcp, app_pid):
         assert payload["truncated"] is False, payload
 
 
-def _mcp_window_target(mcp, app_pid: int, *required_actions: str) -> tuple[dict, str]:
-    """Return a uniquely nameable window advertising every requested action."""
+def _mcp_window_target_or_none(mcp, app_pid: int, *required_actions: str):
+    """A uniquely nameable window advertising every requested action, or None."""
     result = mcp.call_tool("windows", {"pid": app_pid})["result"]
     assert result["isError"] is False, result["content"]
     windows = result["structuredContent"]["windows"]
@@ -629,6 +629,14 @@ def _mcp_window_target(mcp, app_pid: int, *required_actions: str) -> tuple[dict,
         ):
             selector = f'{window["role"]}[name="{name}"]'
             return window, selector
+    return None
+
+
+def _mcp_window_target(mcp, app_pid: int, *required_actions: str) -> tuple[dict, str]:
+    """Return a uniquely nameable window advertising every requested action."""
+    target = _mcp_window_target_or_none(mcp, app_pid, *required_actions)
+    if target is not None:
+        return target
     pytest.skip(
         "no uniquely named window advertises " + ", ".join(required_actions)
     )
@@ -708,6 +716,73 @@ def test_mcp_minimize_restore_mutates_and_reports_window_state(
         needs_restore = False
     finally:
         # A failed assertion must not leave the shared fixture minimized.
+        if needs_restore:
+            _best_effort_mcp_action(
+                mcp,
+                {"pid": app_pid, "action": "restore", "selector": selector},
+            )
+
+
+def test_mcp_screen_fill_restore_mutates_and_reports_window_state(
+    mcp, app_pid, app_name
+):
+    """MCP screen-fill actions must change observable state, not merely return ok.
+
+    macOS exposes ``enter-fullscreen`` (``AXFullScreen``); Windows exposes
+    ``maximize`` (UIA ``WindowVisualState``). Each is asserted against its own
+    state, and the other state must stay unknown — the two operations are
+    deliberately not the same bit.
+    """
+    candidate = None
+    for action, state, other in (
+        ("enter-fullscreen", "fullscreen", "maximized"),
+        ("maximize", "maximized", "fullscreen"),
+    ):
+        target = _mcp_window_target_or_none(mcp, app_pid, action, "restore")
+        if target is not None:
+            candidate = (action, state, other, target)
+            break
+    if candidate is None:
+        pytest.skip(
+            "no uniquely named window advertises a screen-filling verb with restore"
+        )
+    action, state, other, (window, selector) = candidate
+    assert action in window["actions"] and "restore" in window["actions"]
+    needs_restore = False
+    try:
+        filled = mcp.call_tool(
+            "action",
+            {"pid": app_pid, "action": action, "selector": selector},
+        )["result"]
+        assert filled["isError"] is False, filled["content"]
+        assert filled["structuredContent"]["ok"] is True
+        needs_restore = True
+        observed = _wait_for_mcp_window(
+            mcp,
+            app_pid,
+            selector,
+            lambda w: w["states"].get(state) is True,
+            f"MCP {action} to report {state}=true",
+        )
+        assert observed["states"].get(other) is None, (
+            f"{other} must stay unknown after {action}"
+        )
+
+        restored = mcp.call_tool(
+            "action",
+            {"pid": app_pid, "action": "restore", "selector": selector},
+        )["result"]
+        assert restored["isError"] is False, restored["content"]
+        needs_restore = False
+        _wait_for_mcp_window(
+            mcp,
+            app_pid,
+            selector,
+            lambda w: w["states"].get(state) is False,
+            f"MCP restore to report {state}=false",
+        )
+    finally:
+        # A failed assertion must not leave the shared fixture fullscreen.
         if needs_restore:
             _best_effort_mcp_action(
                 mcp,

@@ -395,9 +395,23 @@ pub trait Provider: Send + Sync {
     fn minimize(&self, element: &ElementData) -> Result<()>;
 
     /// Maximize the window.
+    ///
+    /// Distinct from [`Self::enter_fullscreen`]: maximizing leaves the window
+    /// in its platform's maximized state (the macOS zoom equivalent, Windows
+    /// `WindowVisualState_Maximized`) while fullscreen is the native
+    /// fullscreen state. A platform without the operation fails surfaceably
+    /// rather than substituting the other.
     fn maximize(&self, element: &ElementData) -> Result<()>;
 
-    /// Restore the window to its normal state (from minimized/maximized).
+    /// Put the window in native fullscreen.
+    ///
+    /// Distinct from [`Self::maximize`]: fullscreen is the platform's native
+    /// fullscreen state (macOS `AXFullScreen`), not a maximized window.
+    /// [`Self::restore`] clears it. A platform without an accessibility API
+    /// for fullscreen fails surfaceably.
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()>;
+
+    /// Restore the window to its normal state (from minimized/maximized/fullscreen).
     fn restore(&self, element: &ElementData) -> Result<()>;
 
     /// Close the window.
@@ -539,6 +553,9 @@ impl<T: Provider + ?Sized> Provider for &T {
     }
     fn maximize(&self, element: &ElementData) -> Result<()> {
         (**self).maximize(element)
+    }
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()> {
+        (**self).enter_fullscreen(element)
     }
     fn restore(&self, element: &ElementData) -> Result<()> {
         (**self).restore(element)

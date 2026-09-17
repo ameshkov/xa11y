@@ -422,9 +422,26 @@ def test_action_minimize_restore_round_trip_dispatches(run_cli, app_pid):
 
 
 def test_action_maximize_restore_round_trip_dispatches(run_cli, app_pid):
-    """maximize then restore, both dispatched through the CLI."""
+    """maximize then restore, both dispatched through the CLI.
+
+    Windows: ``maximize`` is the UIA maximized state; macOS has no accessible
+    maximize and reports it unsupported (covered by the
+    ``enter-fullscreen`` test below).
+    """
     _require_windows(run_cli, app_pid)
     if _dispatch_window_verb(run_cli, app_pid, "maximize"):
+        _dispatch_window_verb(run_cli, app_pid, "restore")
+
+
+def test_action_enter_fullscreen_restore_round_trip_dispatches(run_cli, app_pid):
+    """enter-fullscreen then restore, both dispatched through the CLI.
+
+    macOS: ``enter-fullscreen`` drives ``AXFullScreen``. Windows has no
+    fullscreen accessibility API and reports it unsupported, so the restore
+    only runs after a successful dispatch.
+    """
+    _require_windows(run_cli, app_pid)
+    if _dispatch_window_verb(run_cli, app_pid, "enter-fullscreen"):
         _dispatch_window_verb(run_cli, app_pid, "restore")
 
 

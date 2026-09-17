@@ -1521,8 +1521,9 @@ fn activate_owning_app(el_ptr: AXUIElementRef, action: &str, role: Role) -> Resu
 
 /// Clear a boolean attribute when it currently reads `true`.
 ///
-/// The deminiaturize half of `activate` / `maximize`: neither `AXRaise` nor
-/// setting `AXFullScreen` clears `AXMinimized`, so a minimized window must
+/// The deminiaturize half of `activate` / `enter_fullscreen`: neither
+/// `AXRaise` nor setting `AXFullScreen` clears `AXMinimized`, so a minimized
+/// window must
 /// have its minimized flag cleared first or the verb returns success while
 /// the window stays in the Dock. Error-preserving through [`read_bool_attr`]:
 /// only a definitive unsupported / no-value answer means "not set"; a failed
@@ -1540,8 +1541,9 @@ fn clear_bool_attr_if_true(
     Ok(())
 }
 
-/// How long `maximize` / `restore` wait for the fullscreen transition to
-/// commit, and the poll cadence during the wait.
+/// How long `enter_fullscreen` / `restore` (and the fullscreen exit half of
+/// `minimize`) wait for the fullscreen transition to commit, and the poll
+/// cadence during the wait.
 ///
 /// Native fullscreen (`AXFullScreen`) is the state these verbs drive, and it
 /// is readable *and* writable. `AXMinimized` is equally readable and
@@ -1583,12 +1585,25 @@ const WINDOW_FULLSCREEN_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 /// state change restarts the run (see [`SettleRun`]).
 const WINDOW_FULLSCREEN_SETTLE_GRACE: Duration = Duration::from_millis(700);
 
+/// How long `minimize` / `restore` wait for the `AXMinimized` state to commit,
+/// and the poll cadence during the wait.
+///
+/// AppKit applies a minimized set asynchronously on native windows: the call
+/// returns while the Dock animation still runs, so a caller reading the state
+/// right after `minimize` / `restore` observes the previous value. Measured on
+/// macOS 26.4, deminiaturizing a native AppKit window takes ~0.7 s before
+/// `AXMinimized` reads `false` again. Unlike the fullscreen transition the set
+/// is not discarded, but re-issuing an absolute set is a no-op and recovers
+/// one that was.
+const WINDOW_MINIMIZED_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+const WINDOW_MINIMIZED_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Read a boolean AX attribute with the tenet-1 distinction: a failed read is
 /// an error (the state is unknown, not false), an absent / unsupported
 /// attribute is `Ok(None)`.
 ///
 /// The one strict reader behind [`read_fullscreen_state`], the
-/// maximize/restore probes, [`clear_bool_attr_if_true`] and the `actions`
+/// enter_fullscreen/restore probes, [`clear_bool_attr_if_true`] and the `actions`
 /// advertisement, so a malformed answer cannot be accepted by one surface and
 /// rejected by another (tenet 3). `action` names the operation for the error
 /// text.
@@ -1636,8 +1651,9 @@ fn read_fullscreen_state(el_ptr: AXUIElementRef, action: &str, role: Role) -> Re
     read_bool_attr(el_ptr, "AXFullScreen", action, role)
 }
 
-/// The four window-state readings `maximize` / `restore` and the `actions`
-/// advertisement decide from: the two state booleans and their settability.
+/// The four window-state readings `minimize` / `enter_fullscreen` / `restore`
+/// and the `actions` advertisement decide from: the two state booleans and
+/// their settability.
 ///
 /// The settability flags answer "would a write be honored?", not "what is the
 /// state" (see [`is_attr_settable`]). [`WindowState::probe`] is the one
@@ -1664,15 +1680,27 @@ impl WindowState {
     }
 }
 
-/// Whether `maximize` can act on a window: it can set the native fullscreen
-/// state (`true` is already committed, or the attribute is writable) and it
-/// can clear `AXMinimized` when that flag is set — an unsupported
-/// `AXMinimized` set no-ops silently (see [`is_attr_settable`]), and the
-/// fullscreen settle only checks `AXFullScreen`, so the verb would report
-/// success while the window stays in the Dock. Shared by the verb
+/// Whether `minimize` can act on a window: `AXMinimized` is writable, and a
+/// window that is currently fullscreen can be taken out of fullscreen first —
+/// AppKit silently ignores an `AXMinimized` set while the window is
+/// fullscreen, so the verb would otherwise report success while the window
+/// stayed fullscreen (the `max, min, max, min` sequence would never
+/// minimize). Shared by the verb implementation and the `actions`
+/// advertisement, so a window that would honor the call never disappears
+/// from `actions` (tenet 3).
+fn minimize_supported(state: &WindowState) -> bool {
+    state.minimized_settable && (state.fullscreen != Some(true) || state.fullscreen_settable)
+}
+
+/// Whether `enter_fullscreen` can act on a window: it can set the native
+/// fullscreen state (`true` is already committed, or the attribute is
+/// writable) and it can clear `AXMinimized` when that flag is set — an
+/// unsupported `AXMinimized` set no-ops silently (see [`is_attr_settable`]),
+/// and the fullscreen settle only checks `AXFullScreen`, so the verb would
+/// report success while the window stays in the Dock. Shared by the verb
 /// implementation and the `actions` advertisement, so a window that would
 /// honor the call never disappears from `actions` (tenet 3).
-fn maximize_supported(state: &WindowState) -> bool {
+fn enter_fullscreen_supported(state: &WindowState) -> bool {
     (state.fullscreen == Some(true) || state.fullscreen_settable)
         && (state.minimized != Some(true) || state.minimized_settable)
 }
@@ -1798,6 +1826,25 @@ impl TargetSample {
     }
 }
 
+/// The live AX object for `target` in the app's enumerated window set, when a
+/// fullscreen transition recreated it: [`safe_cf_equal`] matches the fresh
+/// object to the cached reference.
+///
+/// `Ok(None)` when the target is not currently enumerable; an invalidated
+/// object under us is churn and answers `Ok(None)` too, while every other
+/// failure propagates like every other window-list read (tenet 1). Shared by
+/// [`poll_target`] and the `minimize` hand-off after leaving fullscreen, so
+/// the two resolve the recreated window the same way.
+fn fresh_target_in_app(app: AXUIElementRef, target: AXUIElementRef) -> Result<Option<AXElement>> {
+    let Some(windows) = tolerate_churn(ax_windows(app))? else {
+        return Ok(None);
+    };
+    Ok(windows.into_iter().find(|window| {
+        !target.is_null()
+            && unsafe { safe_cf_equal(window.as_ptr() as CFTypeRef, target as CFTypeRef) }
+    }))
+}
+
 /// Poll the target window once: its fresh sample when it is in the app's
 /// enumerated window set, otherwise its cached handle.
 ///
@@ -1813,13 +1860,7 @@ fn poll_target(
     action: &str,
     role: Role,
 ) -> Result<Option<TargetSample>> {
-    let Some(windows) = tolerate_churn(ax_windows(app))? else {
-        return Ok(None);
-    };
-    let window = windows.iter().find(|window| {
-        !target.is_null()
-            && unsafe { safe_cf_equal(window.as_ptr() as CFTypeRef, target as CFTypeRef) }
-    });
+    let window = fresh_target_in_app(app, target)?;
     let Some(window) = window else {
         return Ok(Some(TargetSample::Cached {
             fullscreen: probe_bool(read_fullscreen_state(target, action, role))?,
@@ -1924,8 +1965,9 @@ fn describe_cached_target(fullscreen: &AttrProbe, settable: &AttrProbe) -> Strin
 /// Wait for the fullscreen transition to commit or clear, re-issuing the
 /// absolute set while the promise is unconfirmed.
 ///
-/// `want` is the state the verb promises: `true` after `maximize`, `false`
-/// after `restore`. The wait succeeds once the *target* window's own state
+/// `want` is the state the verb promises: `true` after `enter_fullscreen`,
+/// `false` after `restore` (and after the fullscreen exit `minimize` performs
+/// before it iconifies). The wait succeeds once the *target* window's own state
 /// holds the promise for [`WINDOW_FULLSCREEN_SETTLE_GRACE`] without
 /// interruption. The target is followed across the transition's window
 /// recreation through the app's enumerated window set ([`safe_cf_equal`]),
@@ -1937,8 +1979,8 @@ fn describe_cached_target(fullscreen: &AttrProbe, settable: &AttrProbe) -> Strin
 /// and absolute sets make the repetition safe — with one exception. A desired
 /// state the window refuses to write (`AXFullScreen=true` with
 /// `IsAttributeSettable=false`) has nothing a set could change, and issuing
-/// it anyway can be rejected, turning an advertised no-op `maximize` into a
-/// failure. For `want=false` the promise is `AXFullScreen=false` *and*
+/// it anyway can be rejected, turning an advertised no-op `enter_fullscreen`
+/// into a failure. For `want=false` the promise is `AXFullScreen=false` *and*
 /// `IsAttributeSettable=true`; the hold must outlast the transition because
 /// the entry transient reports exactly that pair (see
 /// [`WINDOW_FULLSCREEN_SETTLE_GRACE`]).
@@ -1982,7 +2024,8 @@ fn settle_window_fullscreen(
         // already-desired state on an attribute the window refuses to write
         // (`AXFullScreen=true` with `IsAttributeSettable=false`) has nothing
         // to set: issuing the write can be rejected and turn an advertised
-        // no-op `maximize` into a failure, while the confirmation above still
+        // no-op `enter_fullscreen` into a failure, while the confirmation above
+        // still
         // validates the read. The one expected failure is the invalidated
         // object (`kAXErrorInvalidUIElement`): the set is retried on the next
         // tick and recorded for the deadline diagnosis, superseded by a later
@@ -2026,6 +2069,81 @@ fn settle_window_fullscreen(
             ));
         }
         std::thread::sleep(WINDOW_FULLSCREEN_SETTLE_INTERVAL);
+    }
+}
+
+/// Wait until a boolean AX attribute reads `want`, re-issuing the absolute set
+/// while it does not.
+///
+/// The minimized state is applied asynchronously by AppKit on native windows
+/// (see [`WINDOW_MINIMIZED_SETTLE_BUDGET`]): the set returns while the Dock
+/// animation still runs, so a caller reading the state right after `minimize`
+/// / `restore` would observe the previous value. This is the same promise the
+/// fullscreen settle makes, for the state whose transition is the miniaturize
+/// animation. Re-issuing the absolute set each unconfirmed iteration is a
+/// no-op when the set is already queued, and recovers one that was lost. An
+/// invalidated object is retried against the app's enumerated window set; a
+/// wedged process or a malformed answer propagates instead of being retried
+/// into a generic timeout, and an unmet promise fails at the deadline with the
+/// last observed reading (tenet 1, tenet 6).
+fn settle_bool_attr(
+    el_ptr: AXUIElementRef,
+    attr_name: &str,
+    want: bool,
+    action: &str,
+    role: Role,
+) -> Result<()> {
+    let app = owning_app_element(el_ptr, action, role)?;
+    let deadline = Instant::now() + WINDOW_MINIMIZED_SETTLE_BUDGET;
+    let mut last_observed = format!("{attr_name} never answered a boolean");
+    // The object can be recreated while the transition runs; when that happens
+    // the freshly enumerated window takes over (see `fresh_target_in_app`).
+    let mut fresh: Option<AXElement> = None;
+    loop {
+        let target = fresh.as_ref().map_or(el_ptr, |el| el.as_ptr());
+        // The read and the set it may trigger can both hit the invalidated
+        // object, so both outcomes are collected and classified once below:
+        // the set races the same recreation the read does, and a `Gone` set
+        // must be retried against the freshly enumerated window rather than
+        // surfaced as a platform error (tenet 1, tenet 6).
+        let failure = match read_bool_attr(target, attr_name, action, role) {
+            Ok(Some(value)) => {
+                last_observed = format!("{attr_name} reads {value}");
+                if value == want {
+                    return Ok(());
+                }
+                set_bool_attr(target, attr_name, want, action, role).err()
+            }
+            Ok(None) => {
+                last_observed = format!("the window has no {attr_name} attribute");
+                None
+            }
+            Err(err) => Some(err),
+        };
+        if let Some(err) = failure {
+            match classify_element_churn(&err) {
+                ElementChurn::Gone => {
+                    last_observed = err.to_string();
+                    if let Some(found) = fresh_target_in_app(app.as_ptr(), el_ptr)? {
+                        fresh = Some(found);
+                    }
+                }
+                ElementChurn::Unreachable | ElementChurn::Fatal => return Err(err),
+            }
+        }
+        if Instant::now() >= deadline {
+            let condition = if want {
+                "window enters minimized state (AXMinimized=true)"
+            } else {
+                "window leaves minimized state (AXMinimized=false)"
+            };
+            return Err(Error::timeout(WINDOW_MINIMIZED_SETTLE_BUDGET).diagnose(
+                xa11y_core::Diagnosis::new()
+                    .condition(condition)
+                    .last_observed(last_observed),
+            ));
+        }
+        std::thread::sleep(WINDOW_MINIMIZED_SETTLE_INTERVAL);
     }
 }
 
@@ -2787,9 +2905,9 @@ fn build_snapshot_data(
             } else {
                 None
             },
-            // Native fullscreen is the state behind `maximize`, and macOS has
-            // no readable "zoomed" attribute (`AXZoomed` is not in the SDK
-            // headers and live windows answer unsupported for it), so
+            // Native fullscreen is the state behind `enter_fullscreen`, and
+            // macOS has no readable "zoomed" attribute (`AXZoomed` is not in
+            // the SDK headers and live windows answer unsupported for it), so
             // `maximized` stays `None` and the state surfaces as `fullscreen`
             // (AXFullScreen, see [`WINDOW_FULLSCREEN_SETTLE_BUDGET`]).
             maximized: None,
@@ -2900,26 +3018,32 @@ fn build_snapshot_data(
             // values: a malformed boolean is a platform error in both, so
             // `actions` cannot promise a call that rejects on the same read.
             //
-            // `maximize` is the native fullscreen state, which is readable
-            // *and* writable, and what the green button does on a
+            // `enter_fullscreen` is the native fullscreen state, which is
+            // readable *and* writable, and what the green button does on a
             // fullscreen-capable window. It is deliberately not advertised
             // from the presence of a zoom button — the button's `AXPress` /
             // `AXZoomWindow` actions are toggles with no readable state, and
             // on a window that cannot fullscreen (System Settings, for
             // example) the button only classic-zooms, which is not what
-            // `maximize` promises (tenet 3).
+            // `enter_fullscreen` promises (tenet 3). `maximize` is never
+            // advertised on macOS: there is no readable or writable zoom
+            // state to back it (see the dispatch in `maximize()`).
             let state = WindowState::probe(element, "the window actions", role)?;
-            if state.minimized_settable {
+            // `minimize` also needs a way out of fullscreen: AppKit ignores a
+            // minimized set while the window is fullscreen, so the verb exits
+            // fullscreen first and is advertised only when it can (see
+            // `minimize_supported`).
+            if minimize_supported(&state) {
                 push(&mut actions, "minimize");
             }
-            // An already-committed fullscreen window satisfies `maximize`
-            // whatever the settability probe answers (see `maximize()`), and
-            // a minimized flag that cannot be cleared makes the verb a silent
-            // no-op, so both states are part of the shared predicate: a
-            // repeated `maximize`, and a maximize that brings the window back
-            // on-screen, stay advertised.
-            if maximize_supported(&state) {
-                push(&mut actions, "maximize");
+            // An already-committed fullscreen window satisfies
+            // `enter_fullscreen` whatever the settability probe answers (see
+            // `enter_fullscreen()`), and a minimized flag that cannot be
+            // cleared makes the verb a silent no-op, so both states are part
+            // of the shared predicate: a repeated call, and one that brings
+            // the window back on-screen, stay advertised.
+            if enter_fullscreen_supported(&state) {
+                push(&mut actions, "enter_fullscreen");
             }
             // `restore()` accepts a window only when every state that reads
             // `true` can be cleared (a true state with a non-settable
@@ -4171,45 +4295,103 @@ impl Provider for MacOSProvider {
 
     fn minimize(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
-        // See expand(): unsettable AXMinimized sets would silently no-op in
-        // every bridge — surface unsupported as ActionNotSupported instead.
-        if !is_attr_settable(ax.as_ptr(), "AXMinimized")? {
+        // Resolve the capability before any mutation, so a refused verb makes
+        // no partial change (tenet 1). `minimize_supported` refuses a
+        // fullscreen window whose fullscreen state cannot be cleared: AppKit
+        // silently ignores an AXMinimized set while the window is fullscreen,
+        // so the verb would report success while the window stayed
+        // fullscreen. The settability probe also stands in for the old
+        // "unsettable AXMinimized sets would silently no-op in every bridge"
+        // check.
+        let state = WindowState::probe(ax.as_ptr(), "minimize", element.role)?;
+        if !minimize_supported(&state) {
             return Err(Error::ActionNotSupported {
                 action: "minimize".to_string(),
                 role: element.role,
             });
         }
-        set_bool_attr(ax.as_ptr(), "AXMinimized", true, "minimize", element.role)
+        let mut target = ax;
+        if state.fullscreen == Some(true) {
+            // Leave fullscreen first: the window server suppresses minimize
+            // while the window is fullscreen, so a minimize issued now would
+            // no-op. Settle the exit like `restore` does — the minimized set
+            // is issued only once the state has really committed.
+            let app = owning_app_element(target.as_ptr(), "minimize", element.role)?;
+            settle_window_fullscreen(target.as_ptr(), false, "minimize", element.role)?;
+            // The exit transition can recreate the window object; the cached
+            // handle would then answer kAXErrorInvalidUIElement to the
+            // minimize set. Prefer the fresh object from the app's enumerated
+            // window set — the same lookup the settle follows the target
+            // with — and fall back to the cached handle when it is not
+            // listed.
+            if let Some(fresh) = fresh_target_in_app(app.as_ptr(), target.as_ptr())? {
+                target = fresh;
+            }
+        }
+        set_bool_attr(
+            target.as_ptr(),
+            "AXMinimized",
+            true,
+            "minimize",
+            element.role,
+        )?;
+        // The iconify is applied asynchronously on native windows (see
+        // [`WINDOW_MINIMIZED_SETTLE_BUDGET`]); settle the read-back so the
+        // caller never has to discover the Dock animation.
+        settle_bool_attr(
+            target.as_ptr(),
+            "AXMinimized",
+            true,
+            "minimize",
+            element.role,
+        )
     }
 
     fn maximize(&self, element: &ElementData) -> Result<()> {
+        // macOS has no accessible maximize. The classic zoom state has no
+        // readable or writable accessibility surface (`AXZoomed` is not
+        // declared in the SDK and live windows answer unsupported for it),
+        // and the green button's `AXPress` / `AXZoomWindow` are toggles that
+        // enter fullscreen on a fullscreen-capable window — so there is no
+        // absolute set to make repeated calls idempotent, and substituting
+        // fullscreen would blur two distinct operations (see
+        // `enter_fullscreen`). Refuse surfaceably instead (tenet 1, tenet 3);
+        // the `actions` advertisement never lists `maximize` here.
+        Err(Error::ActionNotSupported {
+            action: "maximize".to_string(),
+            role: element.role,
+        })
+    }
+
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()> {
         let ax = self.get_cached(element.handle)?;
         // Resolve the capability before any mutation, so a refused verb makes
-        // no partial change (tenet 1). `maximize_supported` accepts a
+        // no partial change (tenet 1). `enter_fullscreen_supported` accepts a
         // committed fullscreen state whatever the settability probe answers,
         // and refuses a minimized flag that cannot be cleared. The settle
-        // loop still confirms the state, so a maximize racing an exit cannot
+        // loop still confirms the state, so a call racing an exit cannot
         // no-op on a stale `true` read.
-        let state = WindowState::probe(ax.as_ptr(), "maximize", element.role)?;
-        if !maximize_supported(&state) {
+        let state = WindowState::probe(ax.as_ptr(), "enter_fullscreen", element.role)?;
+        if !enter_fullscreen_supported(&state) {
             return Err(Error::ActionNotSupported {
-                action: "maximize".to_string(),
+                action: "enter_fullscreen".to_string(),
                 role: element.role,
             });
         }
         // AXMinimized and fullscreen are independent states: setting
         // fullscreen on a minimized window returns success while the window
         // stays in the Dock. The window-state contract (see the shared mock)
-        // has maximize clear `minimized` and bring the window back on-screen,
+        // has the verb clear `minimized` and bring the window back on-screen,
         // so clear it first — error-preserving, the same `activate()`
         // handling (tenet 1).
-        clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "maximize", element.role)?;
+        clear_bool_attr_if_true(ax.as_ptr(), "AXMinimized", "enter_fullscreen", element.role)?;
         // Set the absolute state, never a toggle: setting `true` on an
         // already-fullscreen window is a no-op, and skipping the set on a
-        // `true` read would let a maximize that races an exit transition
-        // return success on a window that ends up restored. The settle loop
-        // issues the set and re-issues it until the state commits.
-        settle_window_fullscreen(ax.as_ptr(), true, "maximize", element.role)
+        // `true` read would let an enter-fullscreen that races an exit
+        // transition return success on a window that ends up restored. The
+        // settle loop issues the set and re-issues it until the state
+        // commits.
+        settle_window_fullscreen(ax.as_ptr(), true, "enter_fullscreen", element.role)
     }
 
     fn restore(&self, element: &ElementData) -> Result<()> {
@@ -4234,6 +4416,11 @@ impl Provider for MacOSProvider {
         }
         if state.minimized_settable {
             set_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
+            // Deminiaturizing is applied asynchronously too (see
+            // [`WINDOW_MINIMIZED_SETTLE_BUDGET`]); settle before the caller
+            // can read the state back. A window that was not minimized reads
+            // `false` on the first poll, so this costs one AX read.
+            settle_bool_attr(ax.as_ptr(), "AXMinimized", false, "restore", element.role)?;
         }
         // Never press the green button here: the press toggles, so a window
         // that is not fullscreen would be *entered* fullscreen by its own
@@ -4426,6 +4613,7 @@ impl Provider for MacOSProvider {
             "activate" => self.activate(element),
             "minimize" => self.minimize(element),
             "maximize" => self.maximize(element),
+            "enter_fullscreen" => self.enter_fullscreen(element),
             "restore" => self.restore(element),
             "close" => self.close(element),
             // Payload verbs have no arguments on the generic escape hatch;
@@ -4913,8 +5101,24 @@ mod tests {
         // A null element cannot resolve its owning application, so the settle
         // must not report a committed state: the verb's promise is
         // unverifiable, and a silent success would be exactly the bug
-        // maximize/restore idempotency is about (tenet 1).
-        let result = settle_window_fullscreen(std::ptr::null(), true, "maximize", Role::Window);
+        // enter-fullscreen/restore idempotency is about (tenet 1).
+        let result =
+            settle_window_fullscreen(std::ptr::null(), true, "enter_fullscreen", Role::Window);
+        assert!(matches!(result, Err(Error::Platform { .. })));
+    }
+
+    #[test]
+    fn settle_bool_attr_propagates_unreadable_element() {
+        // The minimized settle has the same contract: a null element cannot
+        // resolve its owning application, so the promise is unverifiable and
+        // must not report a committed state (tenet 1).
+        let result = settle_bool_attr(
+            std::ptr::null(),
+            "AXMinimized",
+            true,
+            "minimize",
+            Role::Window,
+        );
         assert!(matches!(result, Err(Error::Platform { .. })));
     }
 
@@ -5044,10 +5248,10 @@ mod tests {
         };
         let churn = || AttrProbe::Churn("invalidated".to_string());
 
-        // Maximize: the promise is `fullscreen=true`. An absent attribute on
-        // an enumerated window reads as false (it has no fullscreen surface),
-        // and a cached `true` whose settability churned is unknown, not
-        // reached.
+        // Enter fullscreen: the promise is `fullscreen=true`. An absent
+        // attribute on an enumerated window reads as false (it has no
+        // fullscreen surface), and a cached `true` whose settability churned
+        // is unknown, not reached.
         assert!(enumerated(true, false).evaluate(true).0);
         assert!(!enumerated(false, true).evaluate(true).0);
         assert!(
@@ -5228,13 +5432,13 @@ mod tests {
             fullscreen_settable,
         };
 
-        // `maximize`: a committed fullscreen window is accepted whatever the
-        // settability probe answers — the repeated-maximize case the
+        // `enter_fullscreen`: a committed fullscreen window is accepted
+        // whatever the settability probe answers — the repeated-call case the
         // advertisement must not drop. A minimized window whose flag cannot
         // be cleared stays in the Dock while the settle only checks
         // fullscreen, so the verb is refused before mutating; not fullscreen
         // and not writable is `ActionNotSupported`.
-        let maximize_cases: &[Case] = &[
+        let enter_fullscreen_cases: &[Case] = &[
             (None, false, Some(true), false, true),
             (Some(false), false, Some(true), true, true),
             (Some(false), false, Some(false), true, true),
@@ -5246,7 +5450,7 @@ mod tests {
             (None, false, None, false, false),
         ];
         for &(minimized, minimized_settable, fullscreen, fullscreen_settable, expected) in
-            maximize_cases
+            enter_fullscreen_cases
         {
             let state = window_state(
                 minimized,
@@ -5254,7 +5458,36 @@ mod tests {
                 fullscreen,
                 fullscreen_settable,
             );
-            assert_eq!(maximize_supported(&state), expected, "maximize: {state:?}");
+            assert_eq!(
+                enter_fullscreen_supported(&state),
+                expected,
+                "enter_fullscreen: {state:?}"
+            );
+        }
+
+        // `minimize`: `AXMinimized` must be writable, and a fullscreen window
+        // must be leavable first — AppKit ignores the minimized set until the
+        // window is out of fullscreen, so the verb would otherwise report
+        // success without minimizing.
+        let minimize_cases: &[Case] = &[
+            (None, true, None, false, true),
+            (Some(false), true, Some(false), false, true),
+            (Some(true), true, None, true, true),
+            (Some(true), true, Some(true), true, true),
+            (None, false, None, false, false),
+            (Some(true), true, Some(true), false, false),
+            (Some(false), true, Some(true), false, false),
+        ];
+        for &(minimized, minimized_settable, fullscreen, fullscreen_settable, expected) in
+            minimize_cases
+        {
+            let state = window_state(
+                minimized,
+                minimized_settable,
+                fullscreen,
+                fullscreen_settable,
+            );
+            assert_eq!(minimize_supported(&state), expected, "minimize: {state:?}");
         }
 
         // `restore`: at least one state must be reachable, and every state

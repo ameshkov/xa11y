@@ -480,6 +480,7 @@ impl Element {
             "activate" => self.activate(),
             "minimize" => self.minimize(),
             "maximize" => self.maximize(),
+            "enter_fullscreen" => self.enter_fullscreen(),
             "restore" => self.restore(),
             "close" => self.close(),
             // "move_to"/"resize_to" need payloads the generic path cannot
@@ -501,7 +502,10 @@ impl Element {
     //
     // Multiple windows can be managed from any window element, not just the
     // app root. The platform semantics are:
-    // - `minimize`/`maximize`/`restore`/`close`: window state operations.
+    // - `minimize`/`maximize`/`enter_fullscreen`/`restore`/`close`: window
+    //   state operations (`maximize` and `enter_fullscreen` are distinct: the
+    //   first targets the platform's maximized state, the second native
+    //   fullscreen).
     // - `activate`: bring the window to the foreground (activation).
     // - `move_to`/`resize_to`: geometry operations in logical coordinates.
 
@@ -520,6 +524,7 @@ impl Element {
                 "activate"
                     | "minimize"
                     | "maximize"
+                    | "enter_fullscreen"
                     | "restore"
                     | "close"
                     | "move_to"
@@ -553,12 +558,31 @@ impl Element {
     }
 
     /// Maximize this window.
+    ///
+    /// Distinct from [`Self::enter_fullscreen`], which targets native
+    /// fullscreen: `maximize` drives the platform's maximized state, and a
+    /// platform without an accessible maximize (macOS exposes no readable or
+    /// writable zoom state) reports it as unsupported instead of substituting
+    /// fullscreen.
     pub fn maximize(&self) -> crate::error::Result<()> {
         self.require_window_like("maximize")?;
         self.provider.maximize(&self.data)
     }
 
-    /// Restore this window to its normal state (from minimized/maximized).
+    /// Put this window in native fullscreen.
+    ///
+    /// Distinct from [`Self::maximize`]: fullscreen is the platform's native
+    /// fullscreen state (macOS `AXFullScreen`), and [`Self::restore`] leaves
+    /// it. Callers should consult the element's `actions` list before calling:
+    /// the platforms that cannot enter fullscreen through an accessibility API
+    /// (Windows/Linux) report it as unsupported.
+    pub fn enter_fullscreen(&self) -> crate::error::Result<()> {
+        self.require_window_like("enter_fullscreen")?;
+        self.provider.enter_fullscreen(&self.data)
+    }
+
+    /// Restore this window to its normal state (from minimized/maximized/
+    /// fullscreen).
     pub fn restore(&self) -> crate::error::Result<()> {
         self.require_window_like("restore")?;
         self.provider.restore(&self.data)
@@ -1151,6 +1175,7 @@ mod tests {
             ("window", "activate" as &str),
             ("window", "minimize"),
             ("window", "maximize"),
+            ("window", "enter_fullscreen"),
             ("window", "restore"),
             ("window", "close"),
         ];
@@ -1161,6 +1186,7 @@ mod tests {
                 "activate" => el.activate().unwrap(),
                 "minimize" => el.minimize().unwrap(),
                 "maximize" => el.maximize().unwrap(),
+                "enter_fullscreen" => el.enter_fullscreen().unwrap(),
                 "restore" => el.restore().unwrap(),
                 "close" => el.close().unwrap(),
                 _ => unreachable!(),
@@ -1204,6 +1230,7 @@ mod tests {
             button.activate(),
             button.minimize(),
             button.maximize(),
+            button.enter_fullscreen(),
             button.restore(),
             button.close(),
             button.move_to(0, 0),
@@ -1232,6 +1259,13 @@ mod tests {
             "perform_action(\"close\") on a button must fail like close() does"
         );
         assert!(
+            matches!(
+                button.perform_action("enter_fullscreen"),
+                Err(Error::ActionNotSupported { .. })
+            ),
+            "perform_action(\"enter_fullscreen\") on a button must fail like enter_fullscreen() does"
+        );
+        assert!(
             provider.actions().is_empty(),
             "rejected window verbs must not reach the provider"
         );
@@ -1246,6 +1280,7 @@ mod tests {
             dialog.activate(),
             dialog.minimize(),
             dialog.maximize(),
+            dialog.enter_fullscreen(),
             dialog.restore(),
             dialog.close(),
             dialog.move_to(0, 0),
@@ -1298,11 +1333,65 @@ mod tests {
         // tri-state (UIA WindowVisualState_Minimized → (true, false)) must be
         // reported; `None` would mean "unknown", which it is not.
         assert_eq!(after.states.maximized, Some(false));
+        assert_eq!(after.states.fullscreen, Some(false));
         assert!(!after.states.visible);
         el.restore().unwrap();
         let restored = find_element(&provider, "window");
         assert_eq!(restored.states.minimized, Some(false));
         assert_eq!(restored.states.maximized, Some(false));
+        assert_eq!(restored.states.fullscreen, Some(false));
+        assert!(restored.states.visible);
+    }
+
+    #[test]
+    fn enter_fullscreen_then_restore_roundtrip_updates_state() {
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        el.enter_fullscreen().unwrap();
+        let after = find_element(&provider, "window");
+        assert_eq!(after.states.fullscreen, Some(true));
+        // Fullscreen supersedes the other states, and the mock decided them:
+        // a window entering fullscreen is not minimized or maximized.
+        assert_eq!(after.states.minimized, Some(false));
+        assert_eq!(after.states.maximized, Some(false));
+        assert!(after.states.visible);
+        el.restore().unwrap();
+        let restored = find_element(&provider, "window");
+        assert_eq!(restored.states.fullscreen, Some(false));
+        assert!(restored.states.visible);
+    }
+
+    #[test]
+    fn fullscreen_minimize_sequence_keeps_every_step_honest() {
+        // The `max, min, max, min` shape the integration suites drive
+        // back-to-back: each verb must land the state the next one reads,
+        // with no transition left half-applied (macOS exits fullscreen before
+        // minimizing, and the mock models exactly that).
+        let provider = build_provider();
+        let el = find_element(&provider, "window");
+        el.enter_fullscreen().unwrap();
+        assert_eq!(
+            find_element(&provider, "window").states.fullscreen,
+            Some(true)
+        );
+        el.minimize().unwrap();
+        let minimized = find_element(&provider, "window");
+        assert_eq!(minimized.states.minimized, Some(true));
+        assert_eq!(minimized.states.fullscreen, Some(false));
+        el.enter_fullscreen().unwrap();
+        assert_eq!(
+            find_element(&provider, "window").states.fullscreen,
+            Some(true)
+        );
+        el.minimize().unwrap();
+        assert_eq!(
+            find_element(&provider, "window").states.minimized,
+            Some(true)
+        );
+        el.restore().unwrap();
+        let restored = find_element(&provider, "window");
+        assert_eq!(restored.states.minimized, Some(false));
+        assert_eq!(restored.states.fullscreen, Some(false));
         assert!(restored.states.visible);
     }
 

@@ -147,6 +147,10 @@ impl Provider for MockProvider {
         *self.last_action.lock().unwrap() = Some((element.handle, "maximize".to_string()));
         Ok(())
     }
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()> {
+        *self.last_action.lock().unwrap() = Some((element.handle, "enter_fullscreen".to_string()));
+        Ok(())
+    }
     fn restore(&self, element: &ElementData) -> Result<()> {
         *self.last_action.lock().unwrap() = Some((element.handle, "restore".to_string()));
         Ok(())
@@ -1127,6 +1131,9 @@ impl Provider for MultiAppMockProvider {
     fn maximize(&self, _: &ElementData) -> Result<()> {
         Ok(())
     }
+    fn enter_fullscreen(&self, _: &ElementData) -> Result<()> {
+        Ok(())
+    }
     fn restore(&self, _: &ElementData) -> Result<()> {
         Ok(())
     }
@@ -1425,6 +1432,9 @@ impl Provider for DelayedProvider {
     fn maximize(&self, e: &ElementData) -> Result<()> {
         self.inner.maximize(e)
     }
+    fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+        self.inner.enter_fullscreen(e)
+    }
     fn restore(&self, e: &ElementData) -> Result<()> {
         self.inner.restore(e)
     }
@@ -1605,6 +1615,9 @@ impl Provider for AppByPidOverrideProvider {
     fn maximize(&self, e: &ElementData) -> Result<()> {
         self.inner.maximize(e)
     }
+    fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+        self.inner.enter_fullscreen(e)
+    }
     fn restore(&self, e: &ElementData) -> Result<()> {
         self.inner.restore(e)
     }
@@ -1770,6 +1783,9 @@ impl Provider for GhostAppProvider {
     }
     fn maximize(&self, e: &ElementData) -> Result<()> {
         self.inner.maximize(e)
+    }
+    fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+        self.inner.enter_fullscreen(e)
     }
     fn restore(&self, e: &ElementData) -> Result<()> {
         self.inner.restore(e)

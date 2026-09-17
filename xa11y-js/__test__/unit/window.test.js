@@ -38,10 +38,11 @@ function lastAction(probe) {
 
 test('window verbs record their action names', async () => {
   const { probe, el } = await probeWindow((e) => e.role === 'window');
-  for (const verb of ['activate', 'minimize', 'maximize', 'restore', 'close']) {
+  for (const verb of ['activate', 'minimize', 'maximize', 'enterFullscreen', 'restore', 'close']) {
     probe.clear();
     await el[verb]();
-    assert.equal(lastAction(probe)[1], verb);
+    const recorded = verb === 'enterFullscreen' ? 'enter_fullscreen' : verb;
+    assert.equal(lastAction(probe)[1], recorded);
   }
 });
 
@@ -109,12 +110,47 @@ test('window state getters default to null and round-trip minimize/restore', asy
   // (UIA WindowVisualState_Minimized → minimized=Some(true), maximized=Some(false))
   // reports decided-false, not unknown-null.
   assert.equal(minimized.el.maximized, false);
+  // Minimizing leaves fullscreen (the macOS provider exits it first), and
+  // the mock models that decision as false, not unknown.
+  assert.equal(minimized.el.fullscreen, false);
   assert.equal(minimized.el.visible, false);
 
   await minimized.el.restore();
   const restored = await probeWindow((e) => e.role === 'window', probe);
   assert.equal(restored.el.minimized, false);
   assert.equal(restored.el.visible, true);
+});
+
+test('enterFullscreen/minimize sequence keeps every step honest', async () => {
+  // The back-to-back sequence the integration suites drive: each verb must
+  // land the state the next one reads.
+  const probe = _makeTestActionProbe();
+  const window = (e) => e.role === 'window';
+  const { el } = await probeWindow(window, probe);
+
+  await el.enterFullscreen();
+  let win = (await probeWindow(window, probe)).el;
+  assert.equal(win.fullscreen, true);
+  assert.equal(win.minimized, false);
+
+  await win.minimize();
+  win = (await probeWindow(window, probe)).el;
+  assert.equal(win.minimized, true);
+  assert.equal(win.fullscreen, false);
+
+  await win.enterFullscreen();
+  win = (await probeWindow(window, probe)).el;
+  assert.equal(win.fullscreen, true);
+
+  await win.minimize();
+  win = (await probeWindow(window, probe)).el;
+  assert.equal(win.minimized, true);
+
+  await win.restore();
+  win = (await probeWindow(window, probe)).el;
+  assert.equal(win.minimized, false);
+  assert.equal(win.fullscreen, false);
+  assert.equal(win.visible, true);
 });
 
 // ── Locator window verbs (enabled-only auto-wait gate) ──────────────────

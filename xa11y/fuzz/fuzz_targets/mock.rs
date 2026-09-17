@@ -209,6 +209,7 @@ impl Provider for FuzzProvider {
     fn activate(&self, _: &ElementData) -> Result<()> { Ok(()) }
     fn minimize(&self, _: &ElementData) -> Result<()> { Ok(()) }
     fn maximize(&self, _: &ElementData) -> Result<()> { Ok(()) }
+    fn enter_fullscreen(&self, _: &ElementData) -> Result<()> { Ok(()) }
     fn restore(&self, _: &ElementData) -> Result<()> { Ok(()) }
     fn close(&self, _: &ElementData) -> Result<()> { Ok(()) }
     fn move_to(&self, _: &ElementData, _: i32, _: i32) -> Result<()> { Ok(()) }
