@@ -1037,6 +1037,9 @@ mod annotated_tests {
         fn maximize(&self, _: &ElementData) -> Result<()> {
             Err(unsupported_in_fixture())
         }
+        fn enter_fullscreen(&self, _: &ElementData) -> Result<()> {
+            Err(unsupported_in_fixture())
+        }
         fn restore(&self, _: &ElementData) -> Result<()> {
             Err(unsupported_in_fixture())
         }

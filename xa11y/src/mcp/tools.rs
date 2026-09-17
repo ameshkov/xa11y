@@ -470,7 +470,8 @@ fn tool_definition(name: &str) -> Value {
                 "List the top-level windows of one application (give `app` or \
                  `pid`) or of every running application when neither is given. \
                  Each window reports its `name`, `bounds`, `states` (including \
-                 `minimized` / `maximized` when the platform can report them) \
+                 `minimized` / `maximized` / `fullscreen` when the platform can \
+                 report them) \
                  and the actions it advertises — the same shape `find` returns \
                  for elements. Results are capped at the `limit`, and \
                  `truncated` in the result says whether anything was dropped. \
@@ -483,8 +484,14 @@ fn tool_definition(name: &str) -> Value {
                  Windows whose state is unknown to the platform simply omit \
                  those states rather than reporting a guessed value.\n\n\
                  The verbs `action` accepts (a window selector) cover this \
-                 surface: `activate`, `minimize`, `maximize`, `restore`, `close`, \
-                 `move-to` (with `at`) and `resize-to` (with `size`).",
+                 surface: `activate`, `minimize`, `maximize`, `enter-fullscreen`, \
+                 `restore`, `close`, `move-to` (with `at`) and `resize-to` (with \
+                 `size`). `maximize` and `enter-fullscreen` are distinct: the \
+                 former is the platform's maximized state (Windows), the latter \
+                 native fullscreen (macOS); a platform without one does not \
+                 advertise it. `restore` is the inverse of all three entry \
+                 verbs — it leaves minimized, maximized, or fullscreen; there \
+                 is no separate exit-fullscreen action.",
                 object_schema(props, &[]),
             )
         }
@@ -621,11 +628,14 @@ fn tool_definition(name: &str) -> Value {
                      what it matched, rather than applied to the first of them.\n\n\
                      Auto-waits for the selector to match an element that is visible and \
                      enabled, re-resolving as it polls, and only then acts. The window verbs \
-                     (`activate`, `minimize`, `maximize`, `restore`, `close`, `move-to`, \
-                     `resize-to`) and `scroll-into-view` are the one exception: they wait \
+                     (`activate`, `minimize`, `maximize`, `enter-fullscreen`, `restore`, \
+                     `close`, `move-to`, `resize-to`) and `scroll-into-view` are the one \
+                     exception: they wait \
                      only for `enabled`, because a minimized window is legitimately not \
                      visible and must still be reachable by the very verbs that restore or \
-                     activate it. The wait runs \
+                     activate it. `restore` is the inverse of `minimize`/`maximize`/ \
+                     `enter-fullscreen`: it leaves minimized, maximized, or fullscreen. \
+                     The wait runs \
                      up to the default timeout, currently {timeout}. Set {timeout_env} \
                      (in seconds) in the environment the server is launched with to \
                      change it; no tool argument does. A call that is going to fail \

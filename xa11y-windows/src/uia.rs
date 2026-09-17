@@ -2780,6 +2780,27 @@ impl Provider for WindowsProvider {
         Ok(())
     }
 
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()> {
+        let uia = self.get_cached(element.handle)?;
+        // Same target contract as the sibling verbs: a non-window target is
+        // rejected as an unsupported action on that element, before the
+        // platform-level answer.
+        ensure_top_level_window_target(&uia, "enter_fullscreen", element.role)?;
+        // UIA has no fullscreen surface at all: `WindowVisualState` has no
+        // fullscreen value and no other pattern exposes one. Substituting
+        // `Maximized` would be a different operation (see `maximize`), and
+        // sizing the HWND by hand is not an accessibility call (tenet 2), so
+        // the verb is platform-unsupported on a real window — the same split
+        // the Linux backend makes (tenet 1: no silent fallback).
+        Err(Error::Unsupported {
+            feature: format!(
+                "enter_fullscreen on {}: UIA has no API to enter fullscreen \
+                 (WindowVisualState has no fullscreen value)",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
     fn restore(&self, element: &ElementData) -> Result<()> {
         let uia = self.get_cached(element.handle)?;
         ensure_top_level_window_target(&uia, "restore", element.role)?;
@@ -3040,6 +3061,7 @@ impl Provider for WindowsProvider {
             "activate" => self.activate(element),
             "minimize" => self.minimize(element),
             "maximize" => self.maximize(element),
+            "enter_fullscreen" => self.enter_fullscreen(element),
             "restore" => self.restore(element),
             "close" => self.close(element),
             // Payload verbs have no arguments on the generic escape hatch;

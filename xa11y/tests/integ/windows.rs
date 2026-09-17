@@ -1,17 +1,28 @@
 //! Window-management integration tests.
 //!
 //! Runs against the AccessKit test app on macOS, Windows, and Linux. Where a
-//! verb has no platform API (Linux cannot minimize / maximize / restore /
-//! close a window) the test asserts the surfaceable
-//! `Unsupported` error instead of the effect — these verbs must never fall
-//! back to input simulation (tenet 2).
+//! verb has no platform API (Linux cannot minimize / maximize /
+//! enter_fullscreen / restore / close a window) the test asserts the
+//! surfaceable `Unsupported` error instead of the effect — these verbs must
+//! never fall back to input simulation (tenet 2).
 //!
 //! Success-path coverage per platform: minimize/restore round-trip and close
 //! run on macOS and Windows; activate runs everywhere; geometry (`move_to` /
-//! `resize_to`) and maximize success are macOS-only for the AccessKit app —
-//! its Linux adapter omits the AT-SPI Component geometry setters. Windows
-//! TransformPattern move/resize is not exercised by this suite, and that gap
-//! is tracked in `tests/matrix.yaml` as coverage to add on the Windows side.
+//! `resize_to`) and enter-fullscreen success are macOS-only for the AccessKit
+//! app — its Linux adapter omits the AT-SPI Component geometry setters.
+//! Windows TransformPattern move/resize is not exercised by this suite, and
+//! that gap is tracked in `tests/matrix.yaml` as coverage to add on the
+//! Windows side.
+//!
+//! Window-state verbs are asserted with a single read wherever the provider
+//! commits the state before the call returns: macOS settles
+//! `enter_fullscreen` / `restore` (and the minimize that follows a fullscreen
+//! exit) by polling the platform state, so a poll in the test would mask a
+//! provider that stopped settling. Windows drives `WindowVisualState`
+//! directly and promises only that the set call succeeded, so its
+//! minimize/restore assertions keep a short poll. Waits are otherwise
+//! reserved for observations outside the verbs' promises (a dialog appearing,
+//! foreground activation, geometry read-back).
 //!
 //! Hygiene follows `multi_window.rs`: the suite shares one app instance, so
 //! any test that opens the dialog closes it again before returning, and the
@@ -40,6 +51,32 @@ mod tests {
                 panic!("timed out after {timeout:?} waiting for {what}");
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Assert the minimized flag after a state verb.
+    ///
+    /// macOS settles the iconify before `minimize` returns, so one fresh read
+    /// proves the promise and a poll would mask a provider that stopped
+    /// settling — the regression issue #399 is about. Windows drives
+    /// `WindowVisualState` directly and promises only that the set call
+    /// succeeded, so it keeps the short poll the suite used before the macOS
+    /// settle made it unnecessary.
+    #[cfg(not(target_os = "linux"))]
+    fn assert_minimized(app: &App, want: bool, what: &str) {
+        let matches = |win: &Element| win.states.minimized == Some(want);
+        if cfg!(target_os = "macos") {
+            let win = h::one(app, "window");
+            assert!(
+                matches(&win),
+                "{what}: minimized is {:?}, expected {want:?}",
+                win.states.minimized
+            );
+        } else {
+            wait_until(Duration::from_secs(5), what, || {
+                let win = h::one(app, "window");
+                matches(&win).then_some(())
+            });
         }
     }
 
@@ -119,11 +156,11 @@ mod tests {
         }
     }
 
-    /// RAII guard for [`minimize_restore_roundtrip`]: on unwind (a polling
-    /// timeout, a failed `minimize`) it best-effort `restore()`s the main
-    /// window, so a failure here cannot leave the shared app instance
-    /// minimized for every subsequent test. Same convention as
-    /// `WindowBoundsGuard` in [`move_and_resize_window`].
+    /// RAII guard for [`minimize_restore_roundtrip`]: on unwind (a failed
+    /// `minimize`/`restore`, or a state assertion) it best-effort
+    /// `restore()`s the main window, so a failure here cannot leave the
+    /// shared app instance minimized for every subsequent test. Same
+    /// convention as `WindowBoundsGuard` in [`move_and_resize_window`].
     #[cfg(not(target_os = "linux"))]
     struct RestoreGuard {
         win: Element,
@@ -184,23 +221,15 @@ mod tests {
         {
             let app = h::app_root();
             let win = h::one(&app, "window");
-            // The guard restores on unwind: a failed minimize or a polling
-            // timeout must not leave the shared app instance minimized.
+            // The guard restores on unwind: a failed minimize must not leave
+            // the shared app instance minimized.
             let _restore_guard = RestoreGuard { win: win.clone() };
             win.minimize().expect("minimize must succeed");
-            // The state read must reflect the minimized window; poll, since
-            // the notification can lag the call.
-            wait_until(Duration::from_secs(5), "window to report minimized", || {
-                let w = h::one(&app, "window");
-                (w.states.minimized == Some(true)).then_some(())
-            });
+            assert_minimized(&app, true, "the window to report minimized after minimize");
             h::one(&app, "window")
                 .restore()
                 .expect("restore must succeed");
-            wait_until(Duration::from_secs(5), "window to report restored", || {
-                let w = h::one(&app, "window");
-                (w.states.minimized == Some(false)).then_some(())
-            });
+            assert_minimized(&app, false, "the window to report restored after restore");
         }
     }
 
@@ -217,6 +246,7 @@ mod tests {
         for (label, result) in [
             ("minimize", win.minimize()),
             ("maximize", win.maximize()),
+            ("enter_fullscreen", win.enter_fullscreen()),
             ("restore", win.restore()),
             ("close", win.close()),
         ] {
@@ -273,42 +303,157 @@ mod tests {
     #[test]
     #[ignore]
     #[cfg(target_os = "macos")]
-    fn maximize_restore_roundtrip() {
-        // macOS: maximize presses the window's zoom button (there is no
-        // zoom-state AX attribute; see `WindowZoom` in xa11y-macos), and the
-        // state the press leaves behind is AXFullScreen. restore() undoes it.
-        // The read-back is polled because the bridge can round-trip
-        // asynchronously. Windows maximize is not asserted here — the winit
-        // window's TransformPattern coverage is tracked as a gap in
-        // tests/matrix.yaml.
-        struct MaximizeGuard {
-            win: Element,
+    fn enter_fullscreen_minimize_roundtrip() {
+        // macOS has no accessible maximize: the classic zoom state has no
+        // readable or writable attribute (`AXZoomed` is unsupported and the
+        // green button's `AXPress` / `AXZoomWindow` are toggles), so the
+        // provider refuses `maximize` instead of substituting another
+        // operation. The native fullscreen state (`AXFullScreen`) is the only
+        // window state that can be both read and written, and it is exposed
+        // as its own verb, `enter_fullscreen`.
+        //
+        // Every verb settles before it returns: `enter_fullscreen`/`restore`
+        // hold the state through the asynchronous transition, and `minimize`
+        // leaves fullscreen first because AppKit ignores a minimized set on a
+        // fullscreen window. The test therefore never polls — each step
+        // re-enumerates once and asserts the state it just asked for — and the
+        // sequence runs back-to-back (enter_fullscreen, minimize,
+        // enter_fullscreen, minimize, restore), so a verb that left a
+        // transition half-applied fails the next step's immediate read.
+        struct RestoreOnDrop<'a> {
+            app: &'a App,
         }
-        impl Drop for MaximizeGuard {
+        impl Drop for RestoreOnDrop<'_> {
             fn drop(&mut self) {
-                // Best-effort cleanup; `Drop` must not unwind, and a failed
-                // restore only means the app died, which the next test
-                // surfaces.
-                let _ = self.win.restore();
+                // Best-effort and non-panicking (`Drop` must not unwind), and
+                // re-resolved rather than restoring the element the test
+                // captured: a transition can have recreated the window. Poll
+                // briefly rather than enumerating once — a failure
+                // mid-transition can leave the real window out of
+                // `App::windows()` for a moment (the fullscreen settle measures
+                // an absence of 450-650 ms), and the cleanup must still find
+                // something to restore, the same retry the binding suites'
+                // cleanup rails make.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Ok(windows) = self.app.windows() {
+                        if let Some(win) = windows
+                            .into_iter()
+                            .find(|w| w.actions.iter().any(|a| a == "restore"))
+                        {
+                            let _ = win.restore();
+                            return;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
 
+        /// The real test-app window, from one enumeration. It advertises
+        /// `enter_fullscreen` in every state this test visits (fullscreen,
+        /// minimized, restored), because `AXFullScreen` stays settable.
+        fn fullscreen_window(app: &App) -> Element {
+            app.windows()
+                .expect("App::windows() enumeration must succeed")
+                .into_iter()
+                .find(|w| w.actions.iter().any(|a| a == "enter_fullscreen"))
+                .expect("the test app window must advertise enter_fullscreen")
+        }
+
+        /// Assert the settled state with one read. `maximized` must stay
+        /// `None` on macOS — there is no readable zoom state — which is what
+        /// keeps the two operations distinct (see the module docs).
+        fn assert_states(app: &App, fullscreen: Option<bool>, minimized: Option<bool>, what: &str) {
+            let w = fullscreen_window(app);
+            assert_eq!(w.states.fullscreen, fullscreen, "{what}: fullscreen");
+            assert_eq!(w.states.minimized, minimized, "{what}: minimized");
+            assert_eq!(
+                w.states.maximized, None,
+                "{what}: maximized stays unknown on macOS"
+            );
+        }
+
         let app = h::app_root();
-        let win = h::one(&app, "window");
-        let _guard = MaximizeGuard { win: win.clone() };
-        win.maximize().expect("maximize must succeed");
-        wait_until(Duration::from_secs(5), "window to report maximized", || {
-            let w = h::one(&app, "window");
-            // macOS reports the zoomed state as `fullscreen` (AXFullScreen).
-            (w.states.maximized == Some(true) || w.states.fullscreen == Some(true)).then_some(())
-        });
-        win.restore().expect("restore must succeed");
-        wait_until(Duration::from_secs(5), "window to report restored", || {
-            let w = h::one(&app, "window");
-            let still_zoomed =
-                w.states.maximized == Some(true) || w.states.fullscreen == Some(true);
-            (!still_zoomed).then_some(())
-        });
+        let _guard = RestoreOnDrop { app: &app };
+
+        // Baseline: the shared app must start restored; if an earlier test
+        // left it fullscreen or minimized, restore first.
+        let state = fullscreen_window(&app);
+        if state.states.fullscreen == Some(true) || state.states.minimized == Some(true) {
+            state.restore().expect("baseline restore must succeed");
+        }
+
+        // `maximize` is not a macOS operation: the verb must not be
+        // advertised, and calling it must fail surfaceably rather than
+        // substituting fullscreen (tenet 3).
+        assert!(
+            app.windows()
+                .expect("App::windows() enumeration must succeed")
+                .iter()
+                .all(|w| !w.actions.iter().any(|a| a == "maximize")),
+            "macOS windows must not advertise maximize"
+        );
+        let err = fullscreen_window(&app)
+            .maximize()
+            .expect_err("maximize must be unsupported on macOS");
+        assert!(
+            matches!(err, Error::ActionNotSupported { .. }),
+            "got {err:?}"
+        );
+
+        // enter_fullscreen commits.
+        fullscreen_window(&app)
+            .enter_fullscreen()
+            .expect("enter_fullscreen must succeed");
+        assert_states(&app, Some(true), Some(false), "after enter_fullscreen");
+
+        // A repeated call is a no-op, not a toggle.
+        fullscreen_window(&app)
+            .enter_fullscreen()
+            .expect("repeated enter_fullscreen must succeed");
+        assert_states(
+            &app,
+            Some(true),
+            Some(false),
+            "after repeated enter_fullscreen",
+        );
+
+        // minimize leaves fullscreen first, then iconifies.
+        fullscreen_window(&app)
+            .minimize()
+            .expect("minimize must succeed on a fullscreen window");
+        assert_states(
+            &app,
+            Some(false),
+            Some(true),
+            "after minimize from fullscreen",
+        );
+
+        // A minimized window is still reachable by the next back-to-back call.
+        fullscreen_window(&app)
+            .enter_fullscreen()
+            .expect("enter_fullscreen must succeed on a minimized window");
+        assert_states(
+            &app,
+            Some(true),
+            Some(false),
+            "after re-entering fullscreen",
+        );
+
+        fullscreen_window(&app)
+            .minimize()
+            .expect("minimize must succeed again");
+        assert_states(&app, Some(false), Some(true), "after the second minimize");
+
+        // restore clears both states and is the last step.
+        fullscreen_window(&app)
+            .restore()
+            .expect("restore must succeed");
+        assert_states(&app, Some(false), Some(false), "after restore");
     }
 
     #[test]
@@ -381,7 +526,11 @@ mod tests {
         let win = h::one(&app, "window");
 
         // Move by the window's own bounds origin delta so the test is
-        // deterministic regardless of where the app was placed.
+        // deterministic regardless of where the app was placed — but move
+        // horizontally. macOS clamps a window's y to keep its title bar below
+        // the menu bar, so a window that opens near the top (the test app does
+        // under a VM's placement) cannot reach an up-and-left target and the
+        // read-back would never match; x has no such clamp.
         let (from_x, from_y, w, hgt) = win
             .bounds
             .map(|b| (b.x, b.y, b.width, b.height))
@@ -393,7 +542,7 @@ mod tests {
             w,
             h: hgt,
         };
-        win.move_to(from_x - 40, from_y - 40)
+        win.move_to(from_x + 40, from_y)
             .expect("move_to must succeed");
         wait_until(Duration::from_secs(5), "the window to move", || {
             let w = h::one(&app, "window");
@@ -402,18 +551,21 @@ mod tests {
             // by a few points. Off-by-40 is still off-by-40, so the delta
             // cannot be masked by the tolerance.
             w.bounds
-                .map(|b| (b.x - (from_x - 40)).abs() <= 2 && (b.y - (from_y - 40)).abs() <= 2)
+                .map(|b| (b.x - (from_x + 40)).abs() <= 2 && (b.y - from_y).abs() <= 2)
                 .and_then(|moved| moved.then_some(()))
         });
 
-        win.resize_to(w + 10, hgt + 10)
+        // Grow the width and shrink the height: growing the height can be
+        // clamped by the visible frame (the dock) when the window sits low on
+        // a small screen, and shrinking never is.
+        win.resize_to(w + 10, hgt - 10)
             .expect("resize_to must succeed");
         wait_until(Duration::from_secs(5), "the window to resize", || {
             let w2 = h::one(&app, "window");
             w2.bounds
                 .map(|b| {
                     (i64::from(b.width) - i64::from(w + 10)).abs() <= 2
-                        && (i64::from(b.height) - i64::from(hgt + 10)).abs() <= 2
+                        && (i64::from(b.height) - i64::from(hgt - 10)).abs() <= 2
                 })
                 .and_then(|resized| resized.then_some(()))
         });

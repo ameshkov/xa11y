@@ -333,6 +333,9 @@ impl Locator {
     }
 
     /// Maximize the matched window.
+    ///
+    /// Distinct from `enterFullscreen`: this drives the platform's maximized
+    /// state, not native fullscreen.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn maximize(&self) -> AsyncTask<ActionTask> {
         AsyncTask::new(ActionTask::nullary(
@@ -341,7 +344,24 @@ impl Locator {
         ))
     }
 
-    /// Restore the matched window to its normal state.
+    /// Put the matched window in native fullscreen.
+    ///
+    /// Distinct from `maximize`; `restore` leaves fullscreen.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn enter_fullscreen(&self) -> AsyncTask<ActionTask> {
+        AsyncTask::new(ActionTask::nullary(
+            self.inner.clone(),
+            ActionKind::EnterFullscreen,
+        ))
+    }
+
+    /// Restore the matched window to its normal state (from minimized,
+    /// maximized, or fullscreen).
+    ///
+    /// This is the inverse of `minimize`, `maximize`, and `enterFullscreen`:
+    /// it clears every special state the platform can clear. There is
+    /// deliberately no separate `exitFullscreen` method — leaving fullscreen
+    /// is the same absolute state write this performs.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn restore(&self) -> AsyncTask<ActionTask> {
         AsyncTask::new(ActionTask::nullary(self.inner.clone(), ActionKind::Restore))
@@ -627,6 +647,7 @@ pub enum ActionKind {
     Activate,
     Minimize,
     Maximize,
+    EnterFullscreen,
     Restore,
     Close,
     MoveTo,
@@ -742,6 +763,7 @@ impl Task for ActionTask {
             ActionKind::Activate => self.inner.activate(),
             ActionKind::Minimize => self.inner.minimize(),
             ActionKind::Maximize => self.inner.maximize(),
+            ActionKind::EnterFullscreen => self.inner.enter_fullscreen(),
             ActionKind::Restore => self.inner.restore(),
             ActionKind::Close => self.inner.close(),
             ActionKind::MoveTo => {

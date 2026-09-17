@@ -31,6 +31,7 @@ def test_element_window_verbs_record_names():
         ("activate", "activate"),
         ("minimize", "minimize"),
         ("maximize", "maximize"),
+        ("enter_fullscreen", "enter_fullscreen"),
         ("restore", "restore"),
         ("close", "close"),
     ):
@@ -77,11 +78,49 @@ def test_minimize_restore_roundtrip_updates_state():
     # tri-state (UIA WindowVisualState_Minimized → minimized=Some(true),
     # maximized=Some(false)) reports decided-false, not unknown-None.
     assert minimized.maximized is False
+    # Minimizing leaves fullscreen (the macOS provider exits it first), and
+    # the mock models that decision as False, not unknown.
+    assert minimized.fullscreen is False
     assert minimized.visible is False
     minimized.restore()
     restored = _window(probe)
     assert restored.minimized is False
     assert restored.visible is True
+
+
+def test_enter_fullscreen_minimize_sequence_keeps_every_step_honest():
+    """The back-to-back sequence the integration suites drive.
+
+    Each verb must land the state the next one reads: enter_fullscreen,
+    minimize (which leaves fullscreen first), enter_fullscreen again, minimize
+    again, then restore.
+    """
+    probe = _make_test_action_probe()
+    win = _window(probe)
+
+    win.enter_fullscreen()
+    win = _window(probe)
+    assert win.fullscreen is True
+    assert win.minimized is False
+
+    win.minimize()
+    win = _window(probe)
+    assert win.minimized is True
+    assert win.fullscreen is False
+
+    win.enter_fullscreen()
+    win = _window(probe)
+    assert win.fullscreen is True
+
+    win.minimize()
+    win = _window(probe)
+    assert win.minimized is True
+
+    win.restore()
+    win = _window(probe)
+    assert win.minimized is False
+    assert win.fullscreen is False
+    assert win.visible is True
 
 
 def test_window_state_getters_default_to_none():

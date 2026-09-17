@@ -147,8 +147,9 @@ pub enum StateFlag {
     /// Never raised: no platform reports a fullscreen state change. The
     /// Accessibility API has no fullscreen notification, UIA's
     /// `WindowVisualState` has no fullscreen value, and AT-SPI has no
-    /// fullscreen state bit. macOS exposes fullscreen as the read-only
-    /// `fullscreen` window state (`AXFullScreen`) instead.
+    /// fullscreen state bit. macOS exposes fullscreen as the `fullscreen`
+    /// window state (`AXFullScreen`), driven by `enter_fullscreen` and
+    /// `restore`, without a notification.
     Fullscreen,
 }
 

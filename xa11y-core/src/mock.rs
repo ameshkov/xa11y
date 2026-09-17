@@ -306,6 +306,7 @@ impl Provider for MockProvider {
             "activate" => self.activate(el),
             "minimize" => self.minimize(el),
             "maximize" => self.maximize(el),
+            "enter_fullscreen" => self.enter_fullscreen(el),
             "restore" => self.restore(el),
             "close" => self.close(el),
             "move_to" => Err(Error::InvalidActionData {
@@ -343,6 +344,10 @@ impl Provider for MockProvider {
                 // `restore` below does the same. `None` means unknown, which
                 // would be a lie about a decision the mock just made.
                 node.data.states.maximized = Some(false);
+                // Minimizing leaves fullscreen, as the macOS provider does
+                // (it must exit the fullscreen state before the iconify can
+                // take effect). The mock decided it, so `Some(false)`.
+                node.data.states.fullscreen = Some(false);
                 // Model an iconified window as off-screen. That is what makes
                 // the Locator window verbs' enabled-only gate (no `visible`)
                 // testable: a minimized window must still be actionable.
@@ -371,6 +376,23 @@ impl Provider for MockProvider {
         self.record(el, "maximize", None)
     }
 
+    fn enter_fullscreen(&self, el: &ElementData) -> Result<()> {
+        self.live_window(el)?;
+        {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = nodes.get_mut(el.handle as usize) {
+                node.data.states.fullscreen = Some(true);
+                // Fullscreen and the other states are exclusive: entering it
+                // clears the minimized flag it would otherwise leave the
+                // window in the Dock, and the maximized state it supersedes.
+                node.data.states.minimized = Some(false);
+                node.data.states.maximized = Some(false);
+                node.data.states.visible = true;
+            }
+        }
+        self.record(el, "enter_fullscreen", None)
+    }
+
     fn restore(&self, el: &ElementData) -> Result<()> {
         self.live_window(el)?;
         {
@@ -378,6 +400,7 @@ impl Provider for MockProvider {
             if let Some(node) = nodes.get_mut(el.handle as usize) {
                 node.data.states.minimized = Some(false);
                 node.data.states.maximized = Some(false);
+                node.data.states.fullscreen = Some(false);
                 node.data.states.visible = true;
             }
         }
@@ -500,6 +523,7 @@ pub fn build_provider() -> Arc<MockProvider> {
                 "activate",
                 "minimize",
                 "maximize",
+                "enter_fullscreen",
                 "restore",
                 "close",
                 "move_to",

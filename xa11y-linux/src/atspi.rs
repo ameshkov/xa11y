@@ -2309,6 +2309,16 @@ impl Provider for LinuxProvider {
         })
     }
 
+    fn enter_fullscreen(&self, element: &ElementData) -> Result<()> {
+        self.ensure_top_level_window_target(element, "enter_fullscreen")?;
+        Err(Error::Unsupported {
+            feature: format!(
+                "enter_fullscreen on {}: AT-SPI has no API to alter window state",
+                element.role.to_snake_case()
+            ),
+        })
+    }
+
     fn restore(&self, element: &ElementData) -> Result<()> {
         self.ensure_top_level_window_target(element, "restore")?;
         Err(Error::Unsupported {
@@ -2520,6 +2530,7 @@ impl Provider for LinuxProvider {
             "activate" => self.activate(element),
             "minimize" => self.minimize(element),
             "maximize" => self.maximize(element),
+            "enter_fullscreen" => self.enter_fullscreen(element),
             "restore" => self.restore(element),
             "close" => self.close(element),
             // Payload verbs have no arguments on the generic escape hatch;

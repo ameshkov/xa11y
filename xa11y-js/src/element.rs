@@ -510,6 +510,10 @@ impl Element {
     }
 
     /// Maximize this window.
+    ///
+    /// Distinct from `enterFullscreen`: this drives the platform's maximized
+    /// state, not native fullscreen. Rejects with `ActionNotSupportedError`
+    /// where no accessible maximize exists (macOS).
     #[napi(ts_return_type = "Promise<void>")]
     pub fn maximize(&self) -> AsyncTask<ElementActionTask> {
         AsyncTask::new(ElementActionTask::nullary(
@@ -519,7 +523,22 @@ impl Element {
         ))
     }
 
-    /// Restore this window to its normal state (from minimized/maximized).
+    /// Put this window in native fullscreen (macOS `AXFullScreen`).
+    ///
+    /// Distinct from `maximize`; `restore` leaves fullscreen. Rejects with
+    /// `ActionNotSupportedError` where the platform has no fullscreen
+    /// accessibility API (Windows/Linux).
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn enter_fullscreen(&self) -> AsyncTask<ElementActionTask> {
+        AsyncTask::new(ElementActionTask::nullary(
+            self.data.clone(),
+            self.provider.clone(),
+            ElementActionKind::EnterFullscreen,
+        ))
+    }
+
+    /// Restore this window to its normal state (from
+    /// minimized/maximized/fullscreen).
     #[napi(ts_return_type = "Promise<void>")]
     pub fn restore(&self) -> AsyncTask<ElementActionTask> {
         AsyncTask::new(ElementActionTask::nullary(
@@ -737,6 +756,7 @@ pub enum ElementActionKind {
     Activate,
     Minimize,
     Maximize,
+    EnterFullscreen,
     Restore,
     Close,
     MoveTo,
@@ -894,6 +914,7 @@ impl Task for ElementActionTask {
             ElementActionKind::Activate => element.activate(),
             ElementActionKind::Minimize => element.minimize(),
             ElementActionKind::Maximize => element.maximize(),
+            ElementActionKind::EnterFullscreen => element.enter_fullscreen(),
             ElementActionKind::Restore => element.restore(),
             ElementActionKind::Close => element.close(),
             ElementActionKind::MoveTo => {

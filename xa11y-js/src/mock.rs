@@ -197,6 +197,9 @@ impl xa11y::Provider for DuplicateShellProvider {
     fn maximize(&self, e: &xa11y::ElementData) -> xa11y::Result<()> {
         self.inner.maximize(e)
     }
+    fn enter_fullscreen(&self, e: &xa11y::ElementData) -> xa11y::Result<()> {
+        self.inner.enter_fullscreen(e)
+    }
     fn restore(&self, e: &xa11y::ElementData) -> xa11y::Result<()> {
         self.inner.restore(e)
     }

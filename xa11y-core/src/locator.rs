@@ -758,6 +758,7 @@ impl Locator {
             "activate" => return self.activate(),
             "minimize" => return self.minimize(),
             "maximize" => return self.maximize(),
+            "enter_fullscreen" => return self.enter_fullscreen(),
             "restore" => return self.restore(),
             "close" => return self.close(),
             _ => {}
@@ -790,12 +791,31 @@ impl Locator {
     }
 
     /// Maximize the matched window.
+    ///
+    /// Distinct from [`Self::enter_fullscreen`]: this drives the platform's
+    /// maximized state, not native fullscreen.
     pub fn maximize(&self) -> Result<()> {
         self.auto_wait("maximize", Actionability::ENABLED)?
             .maximize()
     }
 
-    /// Restore the matched window to its normal state.
+    /// Put the matched window in native fullscreen.
+    ///
+    /// Distinct from [`Self::maximize`]: fullscreen is the platform's native
+    /// fullscreen state (macOS `AXFullScreen`); [`Self::restore`] leaves it.
+    pub fn enter_fullscreen(&self) -> Result<()> {
+        self.auto_wait("enter_fullscreen", Actionability::ENABLED)?
+            .enter_fullscreen()
+    }
+
+    /// Restore the matched window to its normal state (from minimized,
+    /// maximized, or fullscreen).
+    ///
+    /// This is the inverse of [`Self::minimize`], [`Self::maximize`], and
+    /// [`Self::enter_fullscreen`]: it clears every special state the platform
+    /// can clear. There is deliberately no separate "exit fullscreen" verb —
+    /// leaving fullscreen is the same absolute state write this performs, not
+    /// a distinct operation.
     pub fn restore(&self) -> Result<()> {
         self.auto_wait("restore", Actionability::ENABLED)?.restore()
     }
@@ -1232,6 +1252,36 @@ mod tests {
     }
 
     #[test]
+    fn locator_fullscreen_minimize_sequence_uses_the_enabled_only_gate() {
+        // The `max, min, max, min` sequence the integration suites drive:
+        // every step must act directly on the window the previous step left
+        // behind (fullscreen is not visible-gated either), and the name-based
+        // path must route `enter_fullscreen` exactly like the typed method.
+        let provider = build_provider();
+        let handle = Arc::clone(&provider);
+        let provider_dyn: Arc<dyn Provider> = provider;
+        let loc = Locator::new(provider_dyn.clone(), None, "window").with_timeout(Duration::ZERO);
+        loc.perform_action("enter_fullscreen")
+            .expect("perform_action(\"enter_fullscreen\") must route to the typed method");
+        assert!(
+            handle
+                .actions()
+                .iter()
+                .any(|(_, action, _)| action == "enter_fullscreen"),
+            "enter_fullscreen must delegate to the provider"
+        );
+        // A fullscreen window is visible, but the next step must not depend on
+        // that: minimize acts via the enabled-only gate and exits fullscreen
+        // first (the mock mirrors the macOS hand-off).
+        let loc = Locator::new(provider_dyn.clone(), None, "window").with_timeout(Duration::ZERO);
+        loc.minimize()
+            .expect("minimize must act on a fullscreen window");
+        let loc = Locator::new(provider_dyn, None, "window").with_timeout(Duration::ZERO);
+        loc.restore()
+            .expect("restore must act on the minimized window it left");
+    }
+
+    #[test]
     fn perform_action_keeps_the_visible_gate_for_non_window_names() {
         // The routing above is scoped to the nullary window verbs: a name the
         // generic path still handles keeps its visible&&enabled gate, so an
@@ -1534,6 +1584,9 @@ mod tests {
         }
         fn maximize(&self, e: &crate::element::ElementData) -> Result<()> {
             self.inner.maximize(e)
+        }
+        fn enter_fullscreen(&self, e: &crate::element::ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
         }
         fn restore(&self, e: &crate::element::ElementData) -> Result<()> {
             self.inner.restore(e)
