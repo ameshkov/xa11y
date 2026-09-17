@@ -299,7 +299,7 @@ Actions: press, focus, blur, toggle, expand, collapse, select, show-menu,
   scroll-into-view, increment, decrement,
   set-value (requires --value), type-text (requires --value),
   set-numeric-value (requires --value), select-text (requires --value START,END),
-  minimize, maximize, restore, close, activate,
+  minimize, maximize, enter-fullscreen, restore, close, activate,
   move-to (requires --at X,Y), resize-to (requires --size W,H)
 
 Exit codes:
@@ -1468,6 +1468,7 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "select-text",
     "minimize",
     "maximize",
+    "enter-fullscreen",
     "restore",
     "close",
     "activate",
@@ -1605,6 +1606,7 @@ pub(crate) fn perform_action(
                 }
                 "minimize" => locator.minimize()?,
                 "maximize" => locator.maximize()?,
+                "enter-fullscreen" => locator.enter_fullscreen()?,
                 "restore" => locator.restore()?,
                 "close" => locator.close()?,
                 "activate" => locator.activate()?,
@@ -1653,15 +1655,18 @@ pub(crate) fn parse_numeric_value(raw: &str) -> CliResult<f64> {
     Ok(parsed)
 }
 
-/// Re-spell the action name in an `ActionNotSupported` as the verb the caller
-/// typed.
+/// Re-spell the action name in an `ActionNotSupported`, and the leading
+/// action name of an `Unsupported` feature, as the verb the caller typed.
 ///
 /// Providers report the failing action by its Rust method name
 /// (`show_menu`, `scroll_into_view`), so the error told the user to use a
 /// spelling `xa11y action` and the MCP `action` tool both reject. Only the
 /// name is rewritten, and only when it is the same verb modulo the separator
 /// — a provider naming some *other* action passes through untouched, because
-/// that difference is information, not noise.
+/// that difference is information, not noise. An `Unsupported` feature is a
+/// sentence, and the window verbs' features lead with that same method name
+/// (`enter_fullscreen on window: ...`), so the leading token is rewritten the
+/// same way; the rest, which is the provider's diagnosis, is kept verbatim.
 fn relabel_action_error(err: CliError, verb: &str) -> CliError {
     match err {
         CliError::Xa11y(Error::ActionNotSupported { action, role })
@@ -1671,6 +1676,26 @@ fn relabel_action_error(err: CliError, verb: &str) -> CliError {
                 action: verb.to_string(),
                 role,
             })
+        }
+        CliError::Xa11y(Error::Unsupported { feature }) => {
+            // The method name is the verb with the separator flipped, the
+            // same equivalence the `ActionNotSupported` arm uses.
+            let method = verb.replace('-', "_");
+            if let Some(rest) = feature.strip_prefix(method.as_str()) {
+                // Only a whole token: a feature that merely starts with the
+                // name (`closed ...` for `close`) is a different word and is
+                // left alone.
+                if rest
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                {
+                    return CliError::Xa11y(Error::Unsupported {
+                        feature: format!("{verb}{rest}"),
+                    });
+                }
+            }
+            CliError::Xa11y(Error::Unsupported { feature })
         }
         other => other,
     }
@@ -3503,6 +3528,46 @@ mod tests {
             "press",
         );
         assert!(err.to_string().contains("activate"), "{err}");
+    }
+
+    #[test]
+    fn an_unsupported_feature_leading_with_the_method_name_is_respelled() {
+        // The window verbs' `Unsupported` features lead with the provider's
+        // method name; the caller typed the kebab verb, so the leading token
+        // is respelled while the provider's diagnosis stays verbatim.
+        let err = relabel_action_error(
+            CliError::Xa11y(Error::Unsupported {
+                feature: "enter_fullscreen on window: AT-SPI has no API to alter window state"
+                    .into(),
+            }),
+            "enter-fullscreen",
+        );
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: enter-fullscreen on window: AT-SPI has no API to alter window state"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_feature_naming_another_operation_is_left_alone() {
+        for (feature, verb) in [
+            // A feature that merely starts with the name is a different word.
+            ("closed capture surface is unavailable", "close"),
+            // A feature naming another operation is information, not a
+            // spelling to normalize.
+            (
+                "handle 1 is a synthesized Application node",
+                "enter-fullscreen",
+            ),
+        ] {
+            let err = relabel_action_error(
+                CliError::Xa11y(Error::Unsupported {
+                    feature: feature.into(),
+                }),
+                verb,
+            );
+            assert!(err.to_string().contains(feature), "{err}");
+        }
     }
 
     #[test]

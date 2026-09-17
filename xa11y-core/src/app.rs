@@ -764,6 +764,9 @@ mod tests {
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
         }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
+        }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
         }
@@ -946,6 +949,9 @@ mod tests {
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
         }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
+        }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
         }
@@ -1085,6 +1091,9 @@ mod tests {
         }
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
+        }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
         }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
@@ -1282,6 +1291,9 @@ mod tests {
         }
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
+        }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
         }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
@@ -1801,6 +1813,7 @@ mod tests {
             "activate",
             "minimize",
             "maximize",
+            "enter_fullscreen",
             "restore",
             "close",
             "move_to",
@@ -1816,6 +1829,9 @@ mod tests {
                 "maximize" => window
                     .maximize()
                     .expect_err("maximize on a closed window must fail"),
+                "enter_fullscreen" => window
+                    .enter_fullscreen()
+                    .expect_err("enter_fullscreen on a closed window must fail"),
                 "restore" => window
                     .restore()
                     .expect_err("restore on a closed window must fail"),
@@ -1998,6 +2014,9 @@ mod tests {
             }
             fn maximize(&self, e: &ElementData) -> Result<()> {
                 self.inner.maximize(e)
+            }
+            fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+                self.inner.enter_fullscreen(e)
             }
             fn restore(&self, e: &ElementData) -> Result<()> {
                 self.inner.restore(e)

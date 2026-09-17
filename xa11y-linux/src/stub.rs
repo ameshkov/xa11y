@@ -180,6 +180,10 @@ impl Provider for LinuxProvider {
         Err(unavailable())
     }
 
+    fn enter_fullscreen(&self, _: &ElementData) -> Result<()> {
+        Err(unavailable())
+    }
+
     fn restore(&self, _: &ElementData) -> Result<()> {
         Err(unavailable())
     }

@@ -616,9 +616,22 @@ class Element:
     def minimize(self) -> None:
         """Minimize this window."""
     def maximize(self) -> None:
-        """Maximize this window."""
+        """Maximize this window.
+
+        Distinct from ``enter_fullscreen``: this drives the platform's
+        maximized state, not native fullscreen. Raises
+        ``ActionNotSupportedError`` on a platform without an accessible
+        maximize (macOS exposes no readable or writable zoom state).
+        """
+    def enter_fullscreen(self) -> None:
+        """Put this window in native fullscreen (macOS ``AXFullScreen``).
+
+        Distinct from ``maximize``; ``restore`` leaves fullscreen. Raises
+        ``ActionNotSupportedError`` on platforms with no fullscreen
+        accessibility API (Windows/Linux).
+        """
     def restore(self) -> None:
-        """Restore this window to its normal state (from minimized/maximized)."""
+        """Restore this window to its normal state (from minimized/maximized/fullscreen)."""
     def close(self) -> None:
         """Close this window."""
     def move_to(self, x: int, y: int) -> None:
@@ -719,9 +732,25 @@ class Locator:
     def minimize(self) -> None:
         """Minimize the matched window."""
     def maximize(self) -> None:
-        """Maximize the matched window."""
+        """Maximize the matched window.
+
+        Distinct from ``enter_fullscreen``: this drives the platform's
+        maximized state, not native fullscreen.
+        """
+    def enter_fullscreen(self) -> None:
+        """Put the matched window in native fullscreen.
+
+        Distinct from ``maximize``; ``restore`` leaves fullscreen.
+        """
     def restore(self) -> None:
-        """Restore the matched window to its normal state."""
+        """Restore the matched window to its normal state (from minimized,
+        maximized, or fullscreen).
+
+        This is the inverse of ``minimize``, ``maximize``, and
+        ``enter_fullscreen``: it clears every special state the platform can
+        clear. There is deliberately no separate "exit fullscreen" method —
+        leaving fullscreen is the same absolute state write this performs.
+        """
     def close(self) -> None:
         """Close the matched window."""
     def move_to(self, x: int, y: int) -> None:

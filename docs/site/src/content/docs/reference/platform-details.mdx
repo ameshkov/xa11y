@@ -80,21 +80,28 @@ API is separate from its element-action interface:
 | xa11y Action | macOS | Linux (AT-SPI) | Windows (UIA) |
 | --- | --- | --- | --- |
 | `Activate` | activate app *(set AXFrontmost)*, restore if minimized, then AXRaise | Component.GrabFocus *(same path as Focus)* | restore if minimized, then SetForegroundWindow and SetFocus |
-| `Minimize` | set AXMinimized=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Minimized) |
-| `Maximize` | press the window's AXZoomButton | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
-| `Restore` | clear AXMinimized; clear AXFullScreen *(the zoom press's state)* | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
+| `Minimize` | clear AXFullScreen when fullscreen, then set AXMinimized=true | *(unsupported)* | WindowPattern.SetWindowVisualState(Minimized) |
+| `Maximize` | *(unsupported)* | *(unsupported)* | WindowPattern.SetWindowVisualState(Maximized) |
+| `EnterFullscreen` | set AXFullScreen=true | *(unsupported)* | *(unsupported)* |
+| `Restore` | clear AXMinimized; set AXFullScreen=false | *(unsupported)* | WindowPattern.SetWindowVisualState(Normal) |
 | `Close` | press the AXCloseButton | *(unsupported)* | WindowPattern.Close |
 | `MoveTo` | set AXPosition | *(unsupported)* | TransformPattern.Move *(physical pixel conversion)* |
 | `ResizeTo` | set AXSize | *(unsupported)* | TransformPattern.Resize *(physical pixel conversion)* |
+
+`Maximize` and `EnterFullscreen` are distinct operations, not two names for
+one state: macOS has no accessible `maximize` (see below) and Windows has no
+fullscreen accessibility API, so each platform advertises only the operation
+it can actually perform.
 
 Window state reads follow the same split. `minimized`, `maximized`, and
 `fullscreen` are `Option<bool>`: `None` means *unknown*, either because the
 element is not a window or because the platform cannot report the state.
 macOS reads `minimized` and `fullscreen`
 (`AXMinimized` / `AXFullScreen`) on window-like elements; there is no AX
-attribute for the zoom state, so `maximized` is always `None` on macOS.
-After a `maximize`, `fullscreen` reports the state instead.
-Windows reads `minimized` and `maximized` from
+attribute for the zoom state (`AXZoomed` is not declared in the SDK, and live
+windows answer `kAXErrorAttributeUnsupported` for it), so `maximized` is
+always `None` on macOS. Entries into native fullscreen report through
+`fullscreen`. Windows reads `minimized` and `maximized` from
 `WindowPattern.CurrentWindowVisualState` but cannot report `fullscreen`;
 Linux reads `minimized` from the AT-SPI `ICONIFIED` bit and cannot report
 `maximized` or `fullscreen`. `modal` is `WindowPattern.CurrentIsModal` on
@@ -115,18 +122,53 @@ activation performed on a background app's window visibly does nothing.
 application element), then raises the window. A failure to activate is a
 surfaceable error, never a silent success.
 
-### `Maximize`: the zoom button is the zoom surface
+### `EnterFullscreen`: native fullscreen on macOS
 
-macOS exposes the window's zoom through its **zoom button** (`AXZoomButton`,
-the documented convenience attribute that every window with a zoom button
-exposes), not through a zoom-state attribute: `Maximize` presses it, and the
-state the press leaves behind is `AXFullScreen`, which `Restore` clears.
-Windows that expose no `AXZoomButton` report `maximize` and `restore` as
-`ActionNotSupported`, never a silent no-op. `maximized` cannot be read back
-on macOS. The state is reported as `fullscreen` instead. There is no
-zoom-state AX attribute: `AXZoomed` matches the AppKit *property*
-`NSWindow.isZoomed`, is not declared in the SDK headers, and live windows
-answer `kAXErrorAttributeUnsupported` for it.
+macOS exposes native fullscreen through the `AXFullScreen` attribute, the
+only window state the platform both reads and writes. `EnterFullscreen`
+sets that attribute to `true`, and `Restore` sets it back to `false`. Because
+an already-fullscreen window keeps advertising `enter_fullscreen` whether or
+not `AXFullScreen` is settable, a repeated call stays a no-op. When the
+window is not fullscreen and cannot be set fullscreen, the verb reports
+`ActionNotSupported` instead of succeeding silently.
+
+`Maximize` is a separate operation and is **not supported on macOS**. The
+classic zoom state has no readable or writable accessibility surface:
+`AXZoomed` is unsupported, and the green button's `AXPress` / `AXZoomWindow`
+actions are toggles with no readable state. The provider refuses the verb
+with `ActionNotSupported` and never advertises it. Substituting fullscreen
+for a `maximize` request would blur two distinct operations. Windows is the
+reverse: `Maximize` drives `WindowVisualState_Maximized`, while
+`EnterFullscreen` is unsupported because UIA has no fullscreen surface.
+
+The fullscreen transition is asynchronous, and macOS reports transient values
+while it runs: a window entering fullscreen can briefly read
+`AXFullScreen=false`, and a set issued mid-transition is discarded rather
+than queued. The provider polls the window's fullscreen state and re-issues
+the absolute set until the promised state holds. A transition that never
+commits fails with a timeout error rather than reporting success. A window
+that is not fullscreen and whose `AXFullScreen` is not settable has no
+fullscreen state to settle: `Restore` clears `AXMinimized` only and returns
+without polling. A window that reads fullscreen but cannot clear the state
+does not advertise `restore` at all.
+
+`Minimize` on a fullscreen window leaves fullscreen first. AppKit ignores a
+minimized set while the window is fullscreen, so issuing it directly would
+report success while the window stayed fullscreen. The provider settles the
+fullscreen exit first, then applies the minimized state. That is what makes a
+back-to-back `enter_fullscreen` → `minimize` → `enter_fullscreen` →
+`minimize` sequence land every step.
+
+Leaving fullscreen is `Restore`, not a verb of its own. macOS has a real
+"Exit Full Screen" command, but no distinct accessibility operation behind
+it. The green button's actions are toggles, and the only absolute exit is the
+same `AXFullScreen=false` write that is the inverse of `EnterFullscreen`.
+`Restore` performs that write, as well as `AXMinimized=false`, which makes it
+the inverse of every entry verb. A separate `exit_fullscreen` verb would be a
+second name for the same operation, advertised next to `restore` on the same
+window. Minimized, maximized, and fullscreen are mutually exclusive on macOS:
+a fullscreen window cannot be minimized, and entering fullscreen brings the
+window back from the Dock first. `Restore` has one effect from any state.
 
 ### SetValue: text vs numeric
 

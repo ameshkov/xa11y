@@ -42,9 +42,22 @@ const {
 
 const WINDOW_STATE_TIMEOUT_MS = appEnv === 'cocoa' ? 15_000 : 5_000;
 
+// The platform, not the app identity: the sequence drill in the screen-fill
+// test is about the macOS fullscreen animation and runs for every macOS test
+// app, not just one.
+const MACOS = process.platform === 'darwin';
+
 async function windowAdvertising(app, verb) {
   const windows = await app.windows();
   return windows.find((w) => w.actions.includes(verb)) || null;
+}
+
+async function waitForWindow(app, verb, what) {
+  // Cleanup-only: a failure mid-transition can leave the real window out of
+  // app.windows() for a moment, and the cleanup rails must still find
+  // something to restore rather than raising a second error. The happy-path
+  // assertions use `settledWindow` instead.
+  return waitUntil(() => windowAdvertising(app, verb), 5000, what);
 }
 
 async function currentWindow(app, original, verb) {
@@ -65,10 +78,47 @@ function boundsNear(actual, expected, fields, tolerance = 2) {
 async function waitUntil(predicate, timeoutMs, what) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await predicate()) return;
+    const result = await predicate();
+    if (result) return result;
     await sleep(100);
   }
   throw new Error(`Timed out waiting for ${what}`);
+}
+
+async function settledWindow(app, verb, predicate, what) {
+  // macOS settles a window-state transition before the verb returns (the
+  // provider polls the platform state), so one fresh read must already hold
+  // and a poll would mask a provider that stopped settling (#399). Windows
+  // drives WindowVisualState directly and promises only that the set call
+  // succeeded, so it keeps the poll. Linux never reaches either branch: the
+  // window verbs are unsupported there and the callers skip.
+  if (MACOS) {
+    const win = await windowAdvertising(app, verb);
+    assert.ok(win, `${what}: no window advertises ${verb}`);
+    assert.ok(
+      predicate(win),
+      `${what}: minimized=${win.minimized} fullscreen=${win.fullscreen} maximized=${win.maximized}`,
+    );
+    return win;
+  }
+  return waitUntil(async () => {
+    const win = await windowAdvertising(app, verb);
+    return win && predicate(win) ? win : null;
+  }, 5000, what);
+}
+
+async function restoreWindowBestEffort(app) {
+  // waitForWindow with `restore`, not a one-shot lookup and not a screen-fill
+  // lookup: a failure can leave the real window out of app.windows() mid-
+  // transition, and a window that advertises enterFullscreen/maximize does not
+  // necessarily advertise the `restore` this cleanup needs. Never throws:
+  // cleanup must not replace the original failure.
+  try {
+    const current = await waitForWindow(app, 'restore', 'a restorable window');
+    await current.restore();
+  } catch (_cleanup) {
+    // best-effort cleanup; the original error wins
+  }
 }
 
 async function dialogWindow(app) {
@@ -207,69 +257,108 @@ test('a window that advertises minimize is minimized and restored', async (t) =>
   }
   try {
     await win.minimize();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'minimize');
-      return current !== null && current.minimized === true;
-    }, 5000, 'the minimized state to become true');
+    const minimized = await settledWindow(
+      app, 'minimize', (w) => w.minimized === true, 'minimize must report minimized');
     // Advertised restore must succeed; a failure leaves the app minimized and
     // is a real provider failure, never swallowed.
-    const minimized = await currentWindow(app, win, 'minimize');
-    assert.ok(minimized, 'the minimized window stays discoverable');
     await minimized.restore();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'restore');
-      return current !== null && current.minimized === false;
-    }, 5000, 'the minimized state to become false after restore');
+    await settledWindow(
+      app, 'minimize', (w) => w.minimized === false, 'restore must report restored');
   } catch (err) {
-    // Never leave the shared app minimized for the suite after this one:
-    // restore from the element path, then re-throw the original failure.
-    // Same best-effort pattern as the Locator test below.
-    try {
-      const current = await windowAdvertising(app, 'minimize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    // Never leave the shared app minimized for the suite after this one; the
+    // original failure wins over any cleanup failure.
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
 
-test('a window that advertises maximize is maximized and restored', async (t) => {
+// The screen-filling operation each platform exposes. macOS has native
+// fullscreen (`enterFullscreen` / `AXFullScreen`) and refuses `maximize` —
+// there is no readable or writable zoom state — while Windows has `maximize`
+// (UIA WindowVisualState) and no fullscreen API at all. The tests assert the
+// platform's own verb and the platform's own state; they never treat the two
+// states as one bit.
+const SCREEN_FILL_OPERATIONS = [
+  { action: 'enter_fullscreen', method: 'enterFullscreen', state: 'fullscreen' },
+  { action: 'maximize', method: 'maximize', state: 'maximized' },
+];
+
+async function screenFillOperation(app) {
+  // Prefer enterFullscreen over maximize: no platform advertises both for the
+  // same window (macOS refuses maximize, Windows has no fullscreen verb).
+  for (const spec of SCREEN_FILL_OPERATIONS) {
+    const win = await windowAdvertising(app, spec.action);
+    if (win && win.actions.includes('restore')) return spec;
+  }
+  return null;
+}
+
+async function assertScreenFill(app, spec, want, what) {
+  // One settled read (see `settledWindow`): macOS reads once, Windows polls.
+  // The *other* state must stay unknown (null) — macOS cannot report
+  // `maximized` and Windows cannot report `fullscreen`, which is exactly the
+  // separation between the two operations.
+  const win = await settledWindow(
+    app, spec.action, (w) => w[spec.state] === want, `${what}: ${spec.state}`);
+  const other = spec.state === 'fullscreen' ? 'maximized' : 'fullscreen';
+  assert.strictEqual(
+    win[other],
+    null,
+    `${what}: ${other} must stay unknown — ${spec.method} is not that operation`
+  );
+}
+
+test('the screen-filling verb and minimize run back-to-back', async (t) => {
+  // macOS exposes native fullscreen as enterFullscreen() (AXFullScreen) and
+  // refuses maximize() — the classic zoom state has no accessibility surface,
+  // so substituting fullscreen would blur two distinct operations. Windows
+  // exposes maximize() (UIA WindowVisualState_Maximized) and has no fullscreen
+  // API. The test picks the platform's own verb and then runs the back-to-back
+  // max, min, max, min sequence the settling promise exists for: every step
+  // asserts the state after the call, so a verb that left a transition
+  // half-applied fails the next step (#399). macOS asserts with one read (the
+  // provider settles before returning); Windows polls briefly (see
+  // `settledWindow`).
   const app = await getApp();
-  const win = await windowAdvertising(app, 'maximize');
-  if (!win || !win.actions.includes('restore')) {
-    t.skip('no window advertises both maximize and restore');
+  const spec = await screenFillOperation(app);
+  if (!spec) {
+    t.skip('no window advertises a screen-filling verb with restore');
     return;
   }
   try {
-    await win.maximize();
-    if (appEnv === 'cocoa') {
-      await win.restore();
-      t.skip('AppKit zoom has no observable maximized/fullscreen state');
-      return;
-    }
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'maximize');
-      return current !== null && (current.maximized === true || current.fullscreen === true);
-    }, WINDOW_STATE_TIMEOUT_MS, 'the maximized/fullscreen state to become true');
-    const maximized = await currentWindow(app, win, 'maximize');
-    assert.ok(maximized, 'the maximized window stays discoverable');
-    await maximized.restore();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'restore');
-      return current !== null && current.maximized !== true && current.fullscreen !== true;
-    }, WINDOW_STATE_TIMEOUT_MS, 'the maximized/fullscreen state to clear after restore');
+    // Fill the screen.
+    await (await windowAdvertising(app, spec.action))[spec.method]();
+    await assertScreenFill(app, spec, true, `after ${spec.method}`);
+
+    // A repeated call is a no-op, not a toggle.
+    await (await windowAdvertising(app, spec.action))[spec.method]();
+    await assertScreenFill(app, spec, true, `after repeated ${spec.method}`);
+
+    // minimize: on macOS this leaves fullscreen first (AppKit ignores a
+    // minimized set while the window is fullscreen); on Windows it is the
+    // direct UIA transition from Maximized.
+    await (await windowAdvertising(app, spec.action)).minimize();
+    let win = await settledWindow(
+      app, spec.action, (w) => w.minimized === true, 'minimize must report minimized');
+    assert.strictEqual(win[spec.state], false, `minimize must clear ${spec.state}`);
+
+    // And back: the minimized window is still reachable by the next call.
+    await (await windowAdvertising(app, spec.action))[spec.method]();
+    await assertScreenFill(app, spec, true, `after re-${spec.method} from minimized`);
+
+    await (await windowAdvertising(app, spec.action)).minimize();
+    await settledWindow(
+      app, spec.action, (w) => w.minimized === true, 'the second minimize must report minimized');
+
+    // restore clears both states.
+    await (await windowAdvertising(app, 'restore')).restore();
+    win = await settledWindow(
+      app, 'restore', (w) => w.minimized === false, 'restore must report restored');
+    assert.strictEqual(win[spec.state], false, `restore must clear ${spec.state}`);
   } catch (err) {
-    try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    // Never leave the shared app fullscreen/minimized/maximized for the
+    // suites after this one; the original failure wins over cleanup.
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
@@ -478,86 +567,58 @@ test('Locator window verbs dispatch through the async binding', async (t) => {
     t.skip('the target window has no name for a unique Locator');
     return;
   }
-  if (process.platform === 'darwin') {
-    t.skip('macOS drops minimized windows from app-wide Locator discovery');
-    return;
-  }
   try {
     await locator.minimize();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'minimize');
-      return current !== null && current.minimized === true;
-    }, 5000, 'Locator.minimize() to report minimized=true');
+    await settledWindow(
+      app, 'minimize', (w) => w.minimized === true, 'Locator.minimize() must report minimized');
     await locator.restore();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'restore');
-      return current !== null && current.minimized === false;
-    }, 5000, 'Locator.restore() to report minimized=false');
+    await settledWindow(
+      app, 'minimize', (w) => w.minimized === false, 'Locator.restore() must report restored');
   } catch (err) {
-    // Never leave the shared app minimized: restore from the element path,
-    // then re-throw the original failure. The cleanup lookup sits inside the
-    // same best-effort block, so a re-enumeration rejection cannot replace
-    // the original restore() error — the original failure wins, however the
-    // cleanup itself goes.
-    try {
-      const current = await windowAdvertising(app, 'minimize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    // Never leave the shared app minimized; the original failure wins over
+    // any cleanup failure.
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });
 
-test('Locator maximize()/restore() dispatch through the async binding', async (t) => {
+test('Locator screen-fill dispatch through the async binding', async (t) => {
   const app = await getApp();
-  const win = await windowAdvertising(app, 'maximize');
-  if (!win || !win.actions.includes('restore')) {
-    t.skip('no window advertises both maximize and restore');
+  const spec = await screenFillOperation(app);
+  if (!spec) {
+    t.skip('no window advertises a screen-filling verb with restore');
     return;
   }
+  const win = await windowAdvertising(app, spec.action);
   const locator = locatorForWindow(app, win);
   if (!locator) {
     t.skip('the target window has no name for a unique Locator');
     return;
   }
   if (appEnv === 'tauri' && process.platform === 'darwin') {
-    t.skip('Tauri/macOS Locator restore cannot clear fullscreen (tauri_macos_locator_maximize_restore_failure)');
+    t.skip('Tauri/macOS Locator restore cannot clear fullscreen (tauri_macos_locator_screen_fill_restore_failure)');
     return;
   }
   try {
-    await locator.maximize();
+    await locator[spec.method]();
     if (appEnv === 'cocoa') {
       await locator.restore();
-      t.skip('AppKit zoom has no observable maximized/fullscreen state');
+      t.skip('this app\'s window has no observable screen-fill state (cocoa_screen_fill_state_unobservable)');
       return;
     }
     if (['egui', 'qt'].includes(appEnv) && process.platform === 'darwin') {
-      await win.restore();
-      t.skip(`${appEnv}/macOS Locator maximize has no observable state change ` +
-        '(macos_locator_maximize_state_unobservable)');
+      await locator.restore();
+      t.skip(`${appEnv}/macOS Locator screen-fill has no observable state change ` +
+        '(macos_locator_screen_fill_state_unobservable)');
       return;
     }
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'maximize');
-      return current !== null && (current.maximized === true || current.fullscreen === true);
-    }, WINDOW_STATE_TIMEOUT_MS, 'Locator.maximize() to change the reported state');
+    await assertScreenFill(app, spec, true, `Locator ${spec.method}`);
     await locator.restore();
-    await waitUntil(async () => {
-      const current = await currentWindow(app, win, 'restore');
-      return current !== null && current.maximized !== true && current.fullscreen !== true;
-    }, WINDOW_STATE_TIMEOUT_MS, 'Locator.restore() to clear the maximized/fullscreen state');
+    await settledWindow(
+      app, 'restore', (w) => w[spec.state] === false,
+      `Locator restore must clear ${spec.state}`);
   } catch (err) {
-    try {
-      const current = await windowAdvertising(app, 'maximize');
-      if (current && current.actions.includes('restore')) {
-        await current.restore();
-      }
-    } catch (_cleanup) {
-      // best-effort cleanup; the original error wins
-    }
+    await restoreWindowBestEffort(app);
     throw err;
   }
 });

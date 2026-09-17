@@ -460,6 +460,9 @@ mod tests {
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
         }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
+        }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
         }
@@ -558,6 +561,9 @@ mod tests {
         }
         fn maximize(&self, e: &ElementData) -> Result<()> {
             self.inner.maximize(e)
+        }
+        fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+            self.inner.enter_fullscreen(e)
         }
         fn restore(&self, e: &ElementData) -> Result<()> {
             self.inner.restore(e)
@@ -759,6 +765,9 @@ mod tests {
             }
             fn maximize(&self, e: &ElementData) -> Result<()> {
                 self.inner.maximize(e)
+            }
+            fn enter_fullscreen(&self, e: &ElementData) -> Result<()> {
+                self.inner.enter_fullscreen(e)
             }
             fn restore(&self, e: &ElementData) -> Result<()> {
                 self.inner.restore(e)

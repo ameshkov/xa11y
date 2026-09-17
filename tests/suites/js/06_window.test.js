@@ -10,7 +10,7 @@
 // minimized, so activate only changes focus/stacking (no state to restore),
 // and the mutating window verbs (minimize / restore / resize) churn the
 // UIA/AX cache in a way that made a following suite's action tests flaky.
-// minimize / restore / maximize and moveTo / resizeTo run in
+// minimize / restore / maximize / enterFullscreen and moveTo / resizeTo run in
 // 07_window_mutating.test.js, which the harness orders after the action
 // suites (see tests/harness/launch.py); the Rust integ suite is the ground
 // truth for per-platform support. `close` on a real secondary dialog is

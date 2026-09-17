@@ -164,6 +164,9 @@ mod stub {
         fn maximize(&self, _: &ElementData) -> Result<()> {
             unreachable!()
         }
+        fn enter_fullscreen(&self, _: &ElementData) -> Result<()> {
+            unreachable!()
+        }
         fn restore(&self, _: &ElementData) -> Result<()> {
             unreachable!()
         }
