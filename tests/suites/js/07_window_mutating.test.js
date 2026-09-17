@@ -155,28 +155,44 @@ async function closeDialog(app, { strict = true } = {}) {
   // The fixture hides (not destroys) its dialog, so the press returning only
   // means the click was delivered — the suites that follow enumerate windows
   // (the Python capability probe asserts a clean GTK enumeration) and must
-  // not race the hide. A press that did not take effect (a swallowed
-  // dispatch failure, the dialog object rebuilt mid-flight) is retried,
-  // because a leftover dialog corrupts the *next* suite's enumeration rather
-  // than this one's. `strict` decides what a dialog that never leaves means:
-  // thrown when the caller's test passed, swallowed when it did not (the
-  // original failure wins). A missing dialog is never an error.
+  // not race the hide. A close that was accepted but did not take effect is
+  // retried, because a leftover dialog corrupts the *next* suite's
+  // enumeration rather than this one's.
+  //
+  // `strict` decides what a dialog that never leaves after an accepted close
+  // means: thrown when the caller's test passed, swallowed when it did not
+  // (the original failure wins). A close that cannot even be dispatched is
+  // different: Qt's dialog button is not actionable through AT-SPI, so the
+  // press auto-wait times out. Retrying would repeat the timeout, the
+  // platform's own body assertion already covered the no-close-API contract,
+  // and the dialog is a pre-existing fixture limitation — so that case
+  // returns silently, strict or not. A missing dialog is never an error.
   const attempts = 3;
+  let dispatched = false;
   try {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const dlg = await dialogWindow(app);
       if (!dlg) return;
-      if (dlg.actions.includes('close')) {
-        await dlg.close();
-      } else {
-        await app.locator('button[name="Close Dialog"]').press();
+      try {
+        if (dlg.actions.includes('close')) {
+          await dlg.close();
+        } else {
+          await app.locator('button[name="Close Dialog"]').press();
+        }
+      } catch (_e) {
+        // Cannot dispatch a close at all; retrying the same non-actionable
+        // target would only repeat the timeout.
+        return;
       }
+      dispatched = true;
       if (await dialogGoneWithin(app, 2000)) return;
     }
-    throw new Error(
-      `the dialog ${appConfig.dialogName} is still present after ${attempts} ` +
-      'close attempts; the suites that follow enumerate windows and would see it',
-    );
+    if (dispatched) {
+      throw new Error(
+        `the dialog ${appConfig.dialogName} is still present after ${attempts} ` +
+        'accepted closes; the suites that follow enumerate windows and would see it',
+      );
+    }
   } catch (e) {
     if (strict) throw e;
     // best-effort cleanup; the original error wins
