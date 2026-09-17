@@ -772,15 +772,33 @@ def test_state_changed_minimized_on_sibling_window(
                     f"{sorted(sibling.actions)!r}; expected minimize/restore"
                 )
 
+            def wait_minimized(value: bool):
+                return sub.wait_for(
+                    lambda e: (
+                        e.event_type == xa11y.EventType.STATE_CHANGED
+                        and e.state_flag == "minimized"
+                        and e.state_value is value
+                    ),
+                    timeout=5.0,
+                )
+
             sibling.minimize()
-            event = sub.wait_for(
-                lambda e: (
-                    e.event_type == xa11y.EventType.STATE_CHANGED
-                    and e.state_flag == "minimized"
-                    and e.state_value is True
-                ),
-                timeout=5.0,
-            )
+            try:
+                event = wait_minimized(True)
+            except xa11y.TimeoutError:
+                # The open/close watch attaches a newly opened sibling's
+                # per-window handlers asynchronously, so the first minimize
+                # can outrun the attachment: the verb lands (or not) and its
+                # StateChanged is never delivered. Retry now that the
+                # handlers are attached — restore only if the first minimize
+                # actually landed, so the retry's minimize always raises a
+                # fresh true event. A persistent gap still fails below.
+                sibling = _window_named(app, sibling_name) or sibling
+                if sibling.minimized:
+                    sibling.restore()
+                    wait_minimized(False)
+                sibling.minimize()
+                event = wait_minimized(True)
             assert event.state_value is True
 
             # Re-resolve after minimize: the sibling is still in App.windows()
@@ -788,14 +806,7 @@ def test_state_changed_minimized_on_sibling_window(
             # snapshot keeps the restore half honest.
             sibling = _window_named(app, sibling_name) or sibling
             sibling.restore()
-            event = sub.wait_for(
-                lambda e: (
-                    e.event_type == xa11y.EventType.STATE_CHANGED
-                    and e.state_flag == "minimized"
-                    and e.state_value is False
-                ),
-                timeout=5.0,
-            )
+            event = wait_minimized(False)
             assert event.state_value is False
 
             # Close the sibling while the subscription is still live: the
