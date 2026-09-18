@@ -3781,56 +3781,47 @@ fn plan_window_registration_diff(
 /// 1): a half-registered window would deliver only some event kinds and read
 /// as a complete subscription. Seeding happens first so a
 /// `WindowVisualState` event arriving mid-registration has a prior value to
-/// delta against.
+/// delta against; a re-read after the handlers are attached then closes the
+/// seed→attach gap, where a transition's event would otherwise be raised to
+/// nobody and leave the baseline stale (see the reconciliation below).
 ///
 /// The handle is passed in rather than re-read here: the caller already read
 /// it (enumerating the window set), and a second read that fails after the
 /// first succeeded would abort a registration over a transient property read.
 #[allow(
     clippy::too_many_arguments,
-    reason = "The arguments are the exact per-window registration closure: one automation handle, the target window + its handle, the cache request, and the three UIA handler interfaces the registration wires. Grouping them behind a struct would move the coupling the caller already names explicitly."
+    reason = "The arguments are the exact per-window registration closure: one automation handle, the target window + its handle, the cache request, the event context a post-attach baseline reconciliation emits through, and the three UIA handler interfaces the registration wires. Grouping them behind a struct would move the coupling the caller already names explicitly."
 )]
 fn register_window_handlers(
     autom: &IUIAutomation,
     window: &IUIAutomationElement,
     hwnd: usize,
     cache: &IUIAutomationCacheRequest,
+    ctx: &EventContext,
     automation_handler: &IUIAutomationEventHandler,
     property: &IUIAutomationPropertyChangedEventHandler,
     structure: &IUIAutomationStructureChangedEventHandler,
     visual_states: &Mutex<HashMap<usize, i32>>,
 ) -> Result<RegisteredWindow> {
-    if hwnd != 0 {
-        // Seed the visual-state baseline so the first WindowVisualState
-        // notification after subscribe is already a true delta. The
-        // failures are classified: only an actually absent WindowPattern
-        // means "no baseline" (a window without the pattern never raises
-        // visual-state events, so there is nothing to seed). A transient or
-        // stale-provider failure propagates instead of being swallowed —
-        // the PropertyHandler drops a state event whose baseline is missing,
-        // so swallowing this read would silently consume the first real
-        // minimize/maximize transition and miss the event while the
-        // subscription reports success (tenet 1). Same classification the
-        // window verbs apply via `pattern_acquisition_error`.
+    // Acquire the window pattern once: the baseline seed below and the
+    // post-attach reconciliation both read `CurrentWindowVisualState` from
+    // it, and a second acquisition could fail transiently between two reads
+    // that must agree on the same window.
+    //
+    // Only an actually absent WindowPattern means "no baseline" (a window
+    // without the pattern never raises visual-state events, so there is
+    // nothing to seed). A transient or stale-provider failure propagates
+    // instead of being swallowed — the PropertyHandler drops a state event
+    // whose baseline is missing, so swallowing this read would silently
+    // consume the first real minimize/maximize transition and miss the event
+    // while the subscription reports success (tenet 1). Same classification
+    // the window verbs apply via `pattern_acquisition_error`.
+    let pattern = if hwnd != 0 {
         match unsafe {
             window.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId)
         } {
-            Ok(pattern) => match unsafe { pattern.CurrentWindowVisualState() } {
-                Ok(state) => {
-                    let mut states = visual_states.lock().unwrap_or_else(|e| e.into_inner());
-                    states.insert(hwnd, state.0);
-                }
-                Err(e) => {
-                    return Err(Error::Platform {
-                        code: e.code().0 as i64,
-                        message: format!(
-                            "CurrentWindowVisualState failed while seeding the baseline of \
-                             window {hwnd:#x}: {e}"
-                        ),
-                    });
-                }
-            },
-            Err(e) if is_pattern_absent(&e) => {}
+            Ok(pattern) => Some(pattern),
+            Err(e) if is_pattern_absent(&e) => None,
             Err(e) => {
                 return Err(Error::Platform {
                     code: e.code().0 as i64,
@@ -3841,7 +3832,30 @@ fn register_window_handlers(
                 });
             }
         }
-    }
+    } else {
+        None
+    };
+    // Seed the visual-state baseline so the first WindowVisualState
+    // notification after subscribe is already a true delta.
+    let seeded = match &pattern {
+        Some(pattern) => match unsafe { pattern.CurrentWindowVisualState() } {
+            Ok(state) => {
+                let mut states = visual_states.lock().unwrap_or_else(|e| e.into_inner());
+                states.insert(hwnd, state.0);
+                Some(state.0)
+            }
+            Err(e) => {
+                return Err(Error::Platform {
+                    code: e.code().0 as i64,
+                    message: format!(
+                        "CurrentWindowVisualState failed while seeding the baseline of \
+                         window {hwnd:#x}: {e}"
+                    ),
+                });
+            }
+        },
+        None => None,
+    };
 
     let mut automation_ids: Vec<UIA_EVENT_ID> = Vec::new();
     for eid in AUTOMATION_EVENT_IDS {
@@ -3915,6 +3929,64 @@ fn register_window_handlers(
         return Err(err);
     }
 
+    // Close the seed→attach gap. The baseline is seeded before the property
+    // handler is registered, so a visual-state transition that lands in
+    // between raises its `PropertyChanged` to nobody — and the stale seed then
+    // swallows the *next* transition's delta too (a restore after a missed
+    // minimize compares Normal against Normal and emits nothing). Re-read now
+    // that the handler is live: when no event has updated the baseline since
+    // the seed, this read is the first observation after attachment and its
+    // delta is emitted here. When an event did update it, the handler already
+    // emitted the delta and this read is older than that observation — leave
+    // the map alone. An in-flight duplicate of a transition this read already
+    // folded in is suppressed by the same map comparison in `PropertyHandler`.
+    if let (Some(pattern), Some(seeded)) = (&pattern, seeded) {
+        match unsafe { pattern.CurrentWindowVisualState() } {
+            Ok(current) => {
+                let kinds = {
+                    let mut states = visual_states.lock().unwrap_or_else(|e| e.into_inner());
+                    match states.get(&hwnd).copied() {
+                        Some(observed) if observed == seeded => {
+                            states.insert(hwnd, current.0);
+                            visual_state_delta_kinds(seeded, current.0)
+                        }
+                        // A handler observed (and emitted) a change after the
+                        // seed, or the entry was torn down: the re-read must
+                        // not overwrite a newer observation.
+                        _ => Vec::new(),
+                    }
+                };
+                if !kinds.is_empty() {
+                    let target = ctx.snapshot_or_log(window, cache);
+                    for kind in kinds {
+                        ctx.emit(kind, target.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                // The handlers are attached but the gap could not be closed:
+                // a half-reconciled window would silently drop transitions,
+                // so undo the registration and surface the failure (tenet 1).
+                remove_handlers_of(
+                    autom,
+                    window,
+                    &automation_ids,
+                    automation_handler,
+                    property,
+                    structure,
+                );
+                remove_visual_state(visual_states, hwnd);
+                return Err(Error::Platform {
+                    code: e.code().0 as i64,
+                    message: format!(
+                        "CurrentWindowVisualState failed while reconciling the baseline of \
+                         window {hwnd:#x} after attaching handlers: {e}"
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(RegisteredWindow {
         element: ComSend::new(window.clone()),
         hwnd,
@@ -3958,7 +4030,12 @@ fn remove_handlers_of(
 /// caller (the watch is fire-and-forget), so they are diagnosed on stderr
 /// (tenet 1: log what a background path cannot propagate — the next
 /// open/close event re-runs the sync).
-fn sync_registrations(state: &SubscriptionState, cache: &IUIAutomationCacheRequest, pid: u32) {
+fn sync_registrations(
+    state: &SubscriptionState,
+    cache: &IUIAutomationCacheRequest,
+    ctx: &EventContext,
+    pid: u32,
+) {
     // The whole diff/register/teardown sequence is serialized: UIA event
     // handlers may run concurrently, and two reconciles that both compute
     // the same `to_add` would attach the same window's handlers twice
@@ -4062,6 +4139,7 @@ fn sync_registrations(state: &SubscriptionState, cache: &IUIAutomationCacheReque
             window,
             hwnd,
             cache,
+            ctx,
             state.automation_handler.get(),
             state.property_handler.get(),
             state.structure_handler.get(),
@@ -4298,6 +4376,39 @@ fn window_visual_state_to_flags(v: i32) -> Option<(bool, bool)> {
     }
 }
 
+/// The `StateChanged` kinds for a `WindowVisualState` transition, given the
+/// full state on each side.
+///
+/// UIA reports the whole visual state on every notification rather than a
+/// delta, so the change-promise of `StateChanged` is enforced by deriving the
+/// flags whose values differ. Empty when nothing changed or either side is an
+/// unrecognized state — a state we cannot name is dropped rather than
+/// reported (tenet 1). Shared by `PropertyHandler` and the post-attach
+/// baseline reconciliation in [`register_window_handlers`], so both emit the
+/// identical delta for the identical pair.
+fn visual_state_delta_kinds(from: i32, to: i32) -> Vec<EventKind> {
+    let (Some((was_minimized, was_maximized)), Some((minimized, maximized))) = (
+        window_visual_state_to_flags(from),
+        window_visual_state_to_flags(to),
+    ) else {
+        return Vec::new();
+    };
+    let mut kinds = Vec::with_capacity(2);
+    if minimized != was_minimized {
+        kinds.push(EventKind::StateChanged {
+            flag: StateFlag::Minimized,
+            value: minimized,
+        });
+    }
+    if maximized != was_maximized {
+        kinds.push(EventKind::StateChanged {
+            flag: StateFlag::Maximized,
+            value: maximized,
+        });
+    }
+    kinds
+}
+
 // ── Handler implementations ──────────────────────────────────────────────────
 
 #[implement(IUIAutomationFocusChangedEventHandler)]
@@ -4437,9 +4548,12 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for PropertyHandler_Impl {
             // "restored" (tenet 1).
             UIA_WindowWindowVisualStatePropertyId => {
                 if let Some(v) = variant_i32(newvalue) {
-                    let Some((minimized, maximized)) = window_visual_state_to_flags(v) else {
+                    // An unrecognized value is dropped before the baseline is
+                    // touched: storing it would poison the next real
+                    // transition's delta (tenet 1).
+                    if window_visual_state_to_flags(v).is_none() {
                         return Ok(());
-                    };
+                    }
                     // Delta per window: the sender's HWND keys the baseline.
                     // WindowVisualState changes come only from top-level
                     // windows, which always carry an HWND; a sender without
@@ -4453,34 +4567,19 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for PropertyHandler_Impl {
                             .visual_state_by_hwnd
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        let prev = states
-                            .get(&hwnd)
-                            .copied()
-                            .and_then(window_visual_state_to_flags);
+                        let prev = states.get(&hwnd).copied();
                         states.insert(hwnd, v);
                         prev
                     };
-                    let (was_minimized, was_maximized) = match prev {
-                        Some(prev) => prev,
+                    let Some(prev) = prev else {
                         // A window not seeded at subscription time (opened
                         // after subscribe): the prior state is unknown, and
                         // inventing one would be exactly the false delta
                         // `StateChanged` promises not to send. Drop the event
                         // — the current state is re-queryable.
-                        None => return Ok(()),
+                        return Ok(());
                     };
-                    if minimized != was_minimized {
-                        kinds.push(EventKind::StateChanged {
-                            flag: StateFlag::Minimized,
-                            value: minimized,
-                        });
-                    }
-                    if maximized != was_maximized {
-                        kinds.push(EventKind::StateChanged {
-                            flag: StateFlag::Maximized,
-                            value: maximized,
-                        });
-                    }
+                    kinds.extend(visual_state_delta_kinds(prev, v));
                 }
             }
             _ => return Ok(()),
@@ -4568,9 +4667,15 @@ impl IUIAutomationEventHandler_Impl for WatchHandler_Impl {
                 } else {
                     EventKind::WindowClosed
                 };
+                // Reconcile *before* emitting: a consumer that reacts to
+                // WindowOpened by driving the new window (minimize, close)
+                // must find its handlers already attached and its baseline
+                // seeded, or that first transition's event is raised to
+                // nobody. `sync_registrations` is idempotent and serialized
+                // by its own lock, so a concurrent reconcile is safe.
+                sync_registrations(&self.state, &self.cache, &self.ctx, self.ctx.app_pid);
                 let target = self.ctx.snapshot_or_log(el, &self.cache);
                 self.ctx.emit(kind, target);
-                sync_registrations(&self.state, &self.cache, self.ctx.app_pid);
             }
             _ => {}
         }
@@ -4754,6 +4859,7 @@ impl WindowsProvider {
                 window,
                 hwnd,
                 &cache,
+                &ctx,
                 &automation_handler,
                 &property,
                 &structure,
@@ -4793,7 +4899,7 @@ impl WindowsProvider {
         // in the gap is irrelevant: it is gone again. If a watch event fires
         // concurrently with this sync, the reconciliation lock serializes
         // them.)
-        sync_registrations(&state, &cache, pid);
+        sync_registrations(&state, &cache, &ctx, pid);
 
         // Each captured COM interface is wrapped in ComSend so the cancel
         // closure satisfies CancelHandle::new's `Send` bound. See ComSend's
@@ -5877,6 +5983,51 @@ mod tests {
         // verify (tenet 1).
         assert_eq!(window_visual_state_to_flags(3), None);
         assert_eq!(window_visual_state_to_flags(42), None);
+    }
+
+    #[test]
+    fn visual_state_delta_kinds_reports_only_the_flag_that_changed() {
+        // UIA reports the whole visual state on every transition; the delta
+        // helper must claim only the flags whose values differ, so a
+        // Normal→Minimized transition does not also report Maximized cleared.
+        // This is the same derivation `PropertyHandler` and the post-attach
+        // baseline reconciliation both emit.
+        let minimized = |value| EventKind::StateChanged {
+            flag: StateFlag::Minimized,
+            value,
+        };
+        let maximized = |value| EventKind::StateChanged {
+            flag: StateFlag::Maximized,
+            value,
+        };
+        assert_eq!(
+            visual_state_delta_kinds(WindowVisualState_Normal.0, WindowVisualState_Minimized.0),
+            vec![minimized(true)]
+        );
+        assert_eq!(
+            visual_state_delta_kinds(WindowVisualState_Minimized.0, WindowVisualState_Normal.0),
+            vec![minimized(false)]
+        );
+        assert_eq!(
+            visual_state_delta_kinds(WindowVisualState_Normal.0, WindowVisualState_Maximized.0),
+            vec![maximized(true)]
+        );
+        assert_eq!(
+            visual_state_delta_kinds(WindowVisualState_Maximized.0, WindowVisualState_Normal.0),
+            vec![maximized(false)]
+        );
+        // Minimized → Maximized changes both flags, in flag order.
+        assert_eq!(
+            visual_state_delta_kinds(WindowVisualState_Minimized.0, WindowVisualState_Maximized.0),
+            vec![minimized(false), maximized(true)]
+        );
+        // No transition, or an unrecognized state on either side: no delta.
+        assert!(
+            visual_state_delta_kinds(WindowVisualState_Normal.0, WindowVisualState_Normal.0)
+                .is_empty()
+        );
+        assert!(visual_state_delta_kinds(3, WindowVisualState_Normal.0).is_empty());
+        assert!(visual_state_delta_kinds(WindowVisualState_Normal.0, 3).is_empty());
     }
 
     #[test]
