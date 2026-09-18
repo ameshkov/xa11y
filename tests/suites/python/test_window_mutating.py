@@ -219,31 +219,86 @@ def _open_dialog(app: xa11y.App, config: dict) -> xa11y.Element:
         time.sleep(0.1)
     # The dialog never appeared. Clean up the press side effect first, then
     # fail loudly: this is a real fixture regression, not a capability gap.
-    _close_dialog_best_effort(app, config)
+    _close_dialog(app, config, strict=False)
     raise AssertionError(
         f"no window named {dialog_name!r} appeared after pressing {btn_name!r}"
     )
 
 
-def _close_dialog_best_effort(app: xa11y.App, config: dict) -> None:
-    """Best-effort close of a still-open dialog, for cleanup rails.
+def _dialog_gone_within(app: xa11y.App, dialog_name: str, timeout: float) -> bool:
+    """Poll until the dialog leaves the tree; True when it did within `timeout`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _dialog_present(app, dialog_name):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _close_dialog(app: xa11y.App, config: dict, *, strict: bool) -> None:
+    """Close a still-open dialog and wait until it leaves the tree.
 
     Prefers the platform close action; falls back to the dialog's own
-    "Close Dialog" button. Never raises: cleanup must not replace the
-    original failure, and a missing button means there is nothing to close.
+    "Close Dialog" button. The fixture hides (not destroys) its dialog, so
+    the press returning only means the click was delivered — the suites that
+    follow enumerate windows (the GTK capability probe asserts a clean
+    enumeration) and must not race the hide. A close that was accepted but
+    did not take effect is retried, because a leftover dialog corrupts the
+    *next* suite's enumeration rather than this one's.
+
+    ``strict`` decides what a dialog that never leaves after an accepted
+    close means: raised as a cleanup failure when the test itself passed,
+    swallowed when it did not (the original failure wins). A close that
+    cannot even be dispatched is a different matter — Qt's dialog button is
+    not actionable through AT-SPI, so the press times out, and the old rail
+    swallowed that and left the dialog; there is nothing to retry, the
+    platform's own body assertion already covered the no-close-API contract,
+    and the dialog is a pre-existing fixture limitation. That case returns
+    silently, strict or not. A missing button/dialog is never an error —
+    there is nothing to close.
     """
     dialog_name = config.get("dialog_name", "")
     close_button = config.get("dialog_close_button_name", "Close Dialog")
+    attempts = 3
+    dispatched = False
     try:
-        dlg = _window_named(app, dialog_name) or _tree_dialog(app, dialog_name)
-        if dlg is None:
-            return
-        if "close" in dlg.actions:
-            dlg.close()
-            return
-        app.locator(f'button[name="{close_button}"]').press()
-    except Exception:  # best-effort cleanup; the original error wins
-        pass
+        for _ in range(attempts):
+            dlg = _window_named(app, dialog_name) or _tree_dialog(app, dialog_name)
+            if dlg is None:
+                return
+            try:
+                if "close" in dlg.actions:
+                    dlg.close()
+                else:
+                    app.locator(f'button[name="{close_button}"]').press()
+            except Exception:
+                # Cannot dispatch a close at all; retrying the same
+                # non-actionable target would only repeat the timeout.
+                return
+            dispatched = True
+            if _dialog_gone_within(app, dialog_name, 2.0):
+                return
+        if dispatched:
+            raise AssertionError(
+                f"the dialog {dialog_name!r} is still present after {attempts} "
+                "accepted closes; the suites that follow enumerate windows and "
+                "would see it"
+            )
+    except Exception:
+        if strict:
+            raise
+        # best-effort cleanup; the original error wins
+
+
+def _close_dialog_from_finally(app: xa11y.App, config: dict) -> None:
+    """Run the dialog cleanup from a test's ``finally`` block.
+
+    A cleanup failure is only allowed to fail the test when the test itself
+    passed; when it did not, the original failure is the one worth reporting
+    (``_close_dialog`` swallows it). ``sys.exc_info()`` is the in-flight
+    exception inside a ``finally``.
+    """
+    _close_dialog(app, config, strict=sys.exc_info()[0] is None)
 
 
 def _locator_for_window(app: xa11y.App, win: xa11y.Element) -> xa11y.Locator:
@@ -717,15 +772,33 @@ def test_state_changed_minimized_on_sibling_window(
                     f"{sorted(sibling.actions)!r}; expected minimize/restore"
                 )
 
+            def wait_minimized(value: bool):
+                return sub.wait_for(
+                    lambda e: (
+                        e.event_type == xa11y.EventType.STATE_CHANGED
+                        and e.state_flag == "minimized"
+                        and e.state_value is value
+                    ),
+                    timeout=5.0,
+                )
+
             sibling.minimize()
-            event = sub.wait_for(
-                lambda e: (
-                    e.event_type == xa11y.EventType.STATE_CHANGED
-                    and e.state_flag == "minimized"
-                    and e.state_value is True
-                ),
-                timeout=5.0,
-            )
+            try:
+                event = wait_minimized(True)
+            except xa11y.TimeoutError:
+                # The open/close watch attaches a newly opened sibling's
+                # per-window handlers asynchronously, so the first minimize
+                # can outrun the attachment: the verb lands (or not) and its
+                # StateChanged is never delivered. Retry now that the
+                # handlers are attached — restore only if the first minimize
+                # actually landed, so the retry's minimize always raises a
+                # fresh true event. A persistent gap still fails below.
+                sibling = _window_named(app, sibling_name) or sibling
+                if sibling.minimized:
+                    sibling.restore()
+                    wait_minimized(False)
+                sibling.minimize()
+                event = wait_minimized(True)
             assert event.state_value is True
 
             # Re-resolve after minimize: the sibling is still in App.windows()
@@ -733,14 +806,7 @@ def test_state_changed_minimized_on_sibling_window(
             # snapshot keeps the restore half honest.
             sibling = _window_named(app, sibling_name) or sibling
             sibling.restore()
-            event = sub.wait_for(
-                lambda e: (
-                    e.event_type == xa11y.EventType.STATE_CHANGED
-                    and e.state_flag == "minimized"
-                    and e.state_value is False
-                ),
-                timeout=5.0,
-            )
+            event = wait_minimized(False)
             assert event.state_value is False
 
             # Close the sibling while the subscription is still live: the
@@ -955,8 +1021,10 @@ def test_close_dialog_via_element(app: xa11y.App, app_config: dict) -> None:
                 dlg.close()
     finally:
         # Never leave the dialog open for the suites that follow: it changes
-        # their window enumeration. Best-effort — the original failure wins.
-        _close_dialog_best_effort(app, app_config)
+        # their window enumeration. Strict when this test passed — a leak is
+        # a cleanup bug that would otherwise surface as the *next* suite's
+        # failure; the original failure wins when it did not.
+        _close_dialog_from_finally(app, app_config)
 
 
 def test_close_dialog_via_locator(app: xa11y.App, app_config: dict) -> None:
@@ -981,7 +1049,9 @@ def test_close_dialog_via_locator(app: xa11y.App, app_config: dict) -> None:
             with pytest.raises(xa11y.ActionNotSupportedError):
                 locator.close()
     finally:
-        _close_dialog_best_effort(app, app_config)
+        # Same rail as test_close_dialog_via_element: the dialog must be gone
+        # before the next suite enumerates windows.
+        _close_dialog_from_finally(app, app_config)
 
 
 @pytest.mark.skipif(

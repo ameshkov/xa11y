@@ -126,23 +126,46 @@ def _field(line: str, key: str) -> str:
     return ""
 
 
+def _command_chord_seen(log: str) -> bool:
+    """Whether the command-key chord's own events are in `log`.
+
+    Require the chord's tapped key plus the command modifier. A predicate
+    that accepts any key line can be satisfied by the stale
+    `keyup key=a ... mods=-` line that `type_text` leaves in flight, which
+    returned the wait before the chord had been delivered. The modifier is
+    `mods=meta` where the platform routes it into `metaKey`, and the
+    `Super` key name where WebKit-GTK does not.
+    """
+    lines = log.split("\n")
+    return any("key=;" in line for line in lines) and (
+        any("mods=meta" in line for line in lines)
+        or any("key=Super" in line for line in lines)
+    )
+
+
 def _focus_settled(app: xa11y.App, selector: str) -> None:
-    """Focus `selector` and wait until the platform agrees it is focused.
+    """Give `selector` keyboard focus and wait until the platform agrees.
 
     `focus()` auto-waits for the target to be visible and enabled and then
-    issues the focus action; it does not wait for focus to *land*. Synthesised
-    keystrokes go to whatever holds keyboard focus at the moment they are
-    posted, so a test that types immediately after `focus()` can have its first
-    keystroke delivered to the previous holder and dropped.
+    issues the focus action; it does not wait for focus to *land*, and under
+    WebView2 a UIA SetFocus does not reliably move the webview's keyboard
+    focus at all. Synthesised keystrokes go to whatever holds keyboard focus
+    at the moment they are posted, so a test that types immediately after
+    `focus()` can have its keystrokes delivered to the previous holder and
+    dropped — the symptom is an empty event log.
 
-    That is a race the suite loses only occasionally, and only on the first
-    keyboard test after the mouse ones — the rest inherit settled focus, which
-    is why `test_key_press_reports_keydown_keyup` failed alone on Windows with
-    an empty event log while every later keyboard test passed.
+    A real pointer click is what claims keyboard focus: it is delivered to
+    the element rather than to a stale holder, and it settles the webview's
+    focus transition before the first synthetic key. `wait_focused` stays
+    because it verifies the platform saw the focus move; the click follows
+    it so the two cannot race each other.
     """
     locator = app.locator(selector)
     locator.focus()
     locator.wait_focused(timeout=FOCUS_SETTLE_TIMEOUT)
+    rect = locator.element().bounds
+    assert rect is not None, f"{selector} has no bounds to click for keyboard focus"
+    xa11y.input_sim().click((rect.x + rect.width // 2, rect.y + rect.height // 2))
 
 
 def _focus_hit_target(app: xa11y.App) -> None:
@@ -395,7 +418,7 @@ def test_chord_reports_modifier(tauri_input_app, sim):
 
 
 def test_platform_meta_chord(tauri_input_app, sim):
-    """Cmd/Win/Super+A should fire the platform's 'command' key held.
+    """Cmd/Win/Super held across a tap should fire the platform's 'command' key.
 
     The browser surfaces this differently per platform:
       - macOS: Cmd → KeyboardEvent.metaKey (`mods=meta`)
@@ -403,13 +426,20 @@ def test_platform_meta_chord(tauri_input_app, sim):
       - Linux: Super → KeyboardEvent.key == 'Super' (WebKit-GTK doesn't
         route Super into the metaKey flag, so we check for the key name
         on the keydown/keyup events instead).
+
+    The tap is `;`, not a letter: Windows reserves Win+<letter> (Win+A is
+    Quick Settings, Win+E Explorer, and so on) and the shell consumes the
+    letter, so the page never sees the tap. Semicolon is unbound and still
+    proves the modifier is held.
     """
     _clear_log(tauri_input_app)
     _focus_typed_field(tauri_input_app)
     sim.type_text("hello")
-    _clear_log(tauri_input_app)
-    sim.chord("a", ["Meta"])
-    log = _wait_for_log(tauri_input_app, lambda t: "keyup" in t and "key=a" in t)
+    # No second clear: the predicate requires the chord's own `;` events, so
+    # the type_text lines still in flight cannot satisfy the wait, and the
+    # Clear press would move focus off the field right before the chord.
+    sim.chord(";", ["Meta"])
+    log = _wait_for_log(tauri_input_app, _command_chord_seen)
     assert "meta" in log or "Super" in log or "Meta" in log, (
         f"expected platform command modifier in log, got:\n{log}"
     )
@@ -421,28 +451,26 @@ def test_platform_meta_chord(tauri_input_app, sim):
 
 
 def test_type_text_writes_to_focused_input(tauri_input_app, sim):
-    _clear_log(tauri_input_app)
-    _focus_typed_field(tauri_input_app)
-    # Focus the field with a real pointer click as well, not only a11y .focus().
-    # Under WebView2 a UIA SetFocus does not reliably move DOM focus, so the
-    # KEYEVENTF_UNICODE characters type_text injects would land on no focused
-    # element and the field would stay empty — the key-event tests above pass
-    # only because their listener is on `window`, which fires regardless of
-    # focus. A synthesised click sets real DOM focus on every platform.
-    field = tauri_input_app.locator(TYPED_FIELD).element()
-    fr = field.bounds
-    assert fr is not None, "typed field has no bounds"
-    sim.click((fr.x + fr.width // 2, fr.y + fr.height // 2))
-    sim.type_text("hello xa11y")
-    # Poll the typed-text input's value (not the event log) — type_text uses
-    # Unicode / scancode paths that don't always generate synthetic key events
-    # at the DOM level.
-    deadline = time.monotonic() + LOG_SETTLE_TIMEOUT
-    while time.monotonic() < deadline:
-        val = tauri_input_app.locator(TYPED_FIELD).element().value or ""
-        if val == "hello xa11y":
-            return
-        time.sleep(0.05)
+    # `_focus_typed_field` ends with a real pointer click, but the click moves
+    # DOM focus asynchronously: on Linux the first character can be delivered
+    # to the window while the field is still transitioning and not inserted,
+    # leaving the value missing exactly its first character. Retry the whole
+    # focus-and-type with focus already settled rather than asserting on a
+    # half-delivered string. The Clear press resets the typed field too.
+    val = ""
+    for _ in range(3):
+        _clear_log(tauri_input_app)
+        _focus_typed_field(tauri_input_app)
+        sim.type_text("hello xa11y")
+        # Poll the typed-text input's value (not the event log) — type_text
+        # uses Unicode / scancode paths that don't always generate synthetic
+        # key events at the DOM level.
+        deadline = time.monotonic() + LOG_SETTLE_TIMEOUT
+        while time.monotonic() < deadline:
+            val = tauri_input_app.locator(TYPED_FIELD).element().value or ""
+            if val == "hello xa11y":
+                return
+            time.sleep(0.05)
     pytest.fail(f"typed-text field did not receive expected text, got: {val!r}")
 
 
