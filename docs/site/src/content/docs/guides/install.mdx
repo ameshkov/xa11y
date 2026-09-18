@@ -32,7 +32,7 @@ import { Tabs, TabItem } from "@astrojs/starlight/components";
     npm install @crowecawcaw/xa11y
     ```
 
-    Requires Node.js 18+. Pre-built native binaries are published for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).
+    Requires Node.js 18+. Pre-built native binaries are published for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64, aarch64).
   </TabItem>
 </Tabs>
 
@@ -54,7 +54,7 @@ See [CLI](/reference/cli/) for the command reference.
 
 macOS needs two permissions:
 
-1. **Accessibility**, under System Settings → Privacy & Security → Accessibility. Grant permission to your terminal (or IDE).
+1. **Accessibility**, under System Settings → Privacy & Security. The pane is named **Accessibility** through macOS 26 and **Device Control and Data Access** on macOS 27 and newer. Grant permission to your terminal (or IDE).
 2. **Screen & System Audio Recording** (macOS 26+), under System Settings → Privacy & Security → Screen & System Audio Recording. Grant permission to your terminal. Without it, the accessibility API exposes menu bars alone. Window content such as buttons and text fields stays invisible.
 
 After changing permissions, restart your terminal for them to take effect. `App::by_name()` (Rust) or `xa11y.App.by_name()` (Python) will return a `PermissionDenied` error with setup instructions if either permission is missing.

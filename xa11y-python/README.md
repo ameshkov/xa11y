@@ -49,7 +49,7 @@ pip install pytest-xa11y
 ```
 
 > On **macOS**, grant your terminal **two** permissions in **System Settings > Privacy & Security**:
-> 1. **Accessibility**, required for all accessibility API access.
+> 1. **Accessibility**, required for all accessibility API access. On macOS 27 and newer, grant it in **Device Control and Data Access**.
 > 2. **Screen & System Audio Recording** (macOS 26+), required to read window content. Without it, only menu bars are visible.
 >
 > Restart your terminal after changing permissions.
@@ -66,8 +66,8 @@ Query accessibility trees with CSS-like selectors:
 | --- | --- |
 | `button` | Elements with role Button |
 | `button[name='OK']` | Button named exactly "OK" |
-| `textfield[name^='Search']` | Text field whose name starts with "Search" |
-| `textfield[name*='email']` | Text field whose name contains "email" |
+| `text_field[name^='Search']` | Text field whose name starts with "Search" |
+| `text_field[name*='email']` | Text field whose name contains "email" |
 | `group > button` | Buttons that are direct children of a group |
 | `window button` | Buttons anywhere inside a window |
 | `button:nth(2)` | The 2nd button match |
@@ -96,7 +96,7 @@ Query accessibility trees with CSS-like selectors:
 
 ## Ecosystem
 
-- **[strands-xa11y](https://github.com/xa11y/xa11y/tree/main/strands-xa11y)** packages xa11y as a desktop-control tool for [Strands](https://strandsagents.com), AWS's open-source SDK for building AI agents. One tool gives an agent the accessibility tree and the actions on it; a read-only variant covers agents that observe and never act. `pip install strands-xa11y`.
+- **[strands-xa11y](https://github.com/xa11y/xa11y/tree/main/strands-xa11y)** packages xa11y as a desktop-control tool for [Strands](https://strandsagents.com), AWS's open-source SDK for building AI agents. One tool gives an agent the accessibility tree and the actions on it; a read-only variant covers agents that observe and never act. `pip install strands-xa11y` (requires Python 3.10+).
 - **[agent-desktop](https://agent-desktop.dev)** is a CLI built on xa11y for AI agents that read and control desktops.
 
 ## Contributing
@@ -107,7 +107,7 @@ cargo build --workspace
 cargo xtask check   # fmt, lint, test, python bindings
 ```
 
-See the [development docs](https://xa11y.dev/explanation/design/) for architecture and setup.
+See the [development docs](https://xa11y.dev/explanation/design/) for architecture and testing strategy.
 
 ## License
 
