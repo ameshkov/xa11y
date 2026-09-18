@@ -38,7 +38,7 @@ Prebuilt wheels cover macOS, Windows, and Linux; Python 3.10+.
 
 This is where first runs fail, so check here first.
 
-- **macOS** — grant Accessibility to whatever hosts the agent (System Settings › Privacy & Security › Accessibility). Screenshots additionally need Screen & System Audio Recording. Restart the process after granting.
+- **macOS** — grant Accessibility to whatever hosts the agent (System Settings › Privacy & Security). The pane is named **Accessibility** through macOS 26 and **Device Control and Data Access** on macOS 27 and newer. Screenshots additionally need Screen & System Audio Recording. Restart the process after granting.
 - **Linux** — AT-SPI2 must be running (standard on GNOME). Chromium and Electron apps only publish a tree when launched with `--force-renderer-accessibility`. On Wayland, synthesised input needs `/dev/uinput`, which means membership of the `input` group.
 - **Windows** — nothing to grant. If a target app runs elevated, the agent has to as well.
 

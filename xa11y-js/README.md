@@ -45,9 +45,10 @@ Linux (x64/arm64), macOS (x64/arm64), and Windows (x64/arm64).
 
 > **macOS:** Grant your terminal (or the process running Node) two permissions
 > in **System Settings → Privacy & Security**: **Accessibility** *and* **Screen
-> Recording**. The first lets xa11y read the AX tree; the second is needed for
-> some apps that expose their tree only when the screen-recording prompt has
-> been answered.
+> & System Audio Recording** (macOS 26+). Accessibility lets xa11y read the AX
+> tree. The second is required to read window content. Without it, only menu
+> bars are visible. On macOS 27 and newer, the Accessibility grant lives in the
+> **Device Control and Data Access** pane.
 
 ## Async by default
 
