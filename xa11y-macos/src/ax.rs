@@ -327,6 +327,53 @@ fn ax_bool(element: AXUIElementRef, attribute: &str) -> Option<bool> {
     }
 }
 
+/// Whether `window` is the owning process's focused (key) window.
+fn focused_window_is(window: AXUIElementRef, pid: u32) -> bool {
+    let system = AXElement::from_owned(unsafe { safe_ax_create_system_wide() });
+    if system.is_null() {
+        return false;
+    }
+    let focused_app_attribute = CFString::new("AXFocusedApplication");
+    let mut focused_app: CFTypeRef = std::ptr::null();
+    if ffi_copy_attribute_value(
+        system.as_ptr(),
+        focused_app_attribute.as_concrete_TypeRef() as CFTypeRef,
+        &mut focused_app,
+    ) != AX_ERROR_SUCCESS
+        || focused_app.is_null()
+    {
+        return false;
+    }
+    let frontmost_app = AXElement::from_owned(focused_app as AXUIElementRef);
+    let mut focused_pid = 0;
+    if unsafe { safe_ax_get_pid(frontmost_app.as_ptr(), &mut focused_pid) } != AX_ERROR_SUCCESS
+        || focused_pid != pid as i32
+    {
+        return false;
+    }
+    // Query the canonical per-process application element. The object
+    // returned by AXFocusedApplication identifies the frontmost process, but
+    // some accessibility bridges do not vend its application attributes on
+    // that particular proxy. AXUIElementCreateApplication is the stable root
+    // the rest of this provider uses for AXWindows and app-level attributes.
+    let app = AXElement::from_owned(unsafe { safe_ax_create_application(focused_pid) });
+    if app.is_null() {
+        return false;
+    }
+    let attribute = CFString::new("AXFocusedWindow");
+    let mut focused: CFTypeRef = std::ptr::null();
+    let err = ffi_copy_attribute_value(
+        app.as_ptr(),
+        attribute.as_concrete_TypeRef() as CFTypeRef,
+        &mut focused,
+    );
+    if err != AX_ERROR_SUCCESS || focused.is_null() {
+        return false;
+    }
+    let focused = AXElement::from_owned(focused as AXUIElementRef);
+    unsafe { safe_cf_equal(window as CFTypeRef, focused.as_ptr() as CFTypeRef) }
+}
+
 fn ax_number_f64(element: AXUIElementRef, attribute: &str) -> Option<f64> {
     let value = ax_attr(element, attribute)?;
     unsafe {
@@ -2474,7 +2521,7 @@ use xa11y_core::selector::{match_op, SimpleSelector};
 /// ElementData (15-20 AX API calls) for elements that will be discarded.
 #[cfg(test)]
 fn matches_ax(ax: AXUIElementRef, simple: &SimpleSelector) -> bool {
-    matches_ax_with_role(ax, simple, None)
+    matches_ax_with_role(ax, simple, None, None)
 }
 
 /// Attributes the lightweight `matches_ax_with_role` fast path knows how to
@@ -2485,12 +2532,13 @@ fn matches_ax(ax: AXUIElementRef, simple: &SimpleSelector) -> bool {
 /// still match correctly.
 const FAST_PATH_ATTRS: &[&str] = &["role", "name", "value", "description"];
 
-/// Like `matches_ax` but accepts a pre-resolved role to avoid redundant
-/// AX API calls when the caller already fetched the role.
+/// Like `matches_ax` but accepts a pre-resolved role to avoid redundant AX
+/// API calls and the owning pid needed to resolve process-scoped state.
 fn matches_ax_with_role(
     ax: AXUIElementRef,
     simple: &SimpleSelector,
     precomputed_role: Option<Role>,
+    pid: Option<u32>,
 ) -> bool {
     // If any filter targets an attr the fast path can't resolve, fall through
     // to a full snapshot + canonical core matcher. This keeps selectors like
@@ -2506,10 +2554,12 @@ fn matches_ax_with_role(
         }
         // Snapshot handle is 0 — this path is only used to decide whether to
         // keep a candidate; callers re-resolve via the provider cache after
-        // the match set is assembled. A snapshot that cannot be built is a
-        // candidate that does not match (the selector engines treat an
-        // unreadable node as absent, not as a hard failure).
-        let data = match build_snapshot_data(ax, None, 0) {
+        // the match set is assembled. Preserve `pid`: state such as `active`
+        // depends on the owning process and must match the final snapshot. A
+        // snapshot that cannot be built is a candidate that does not match
+        // (the selector engines treat an unreadable node as absent, not as a
+        // hard failure).
+        let data = match build_snapshot_data(ax, pid, 0) {
             Ok(d) => d,
             Err(_) => return false,
         };
@@ -3036,14 +3086,12 @@ fn build_snapshot_data(
                 | Role::Switch
         ) || attrs.focused.is_some();
 
-        // `AXMain` marks the app's main (active) window. Only window-like
-        // elements (Window / Dialog / Sheet — the latter maps to `Role::Dialog`)
-        // carry it, so gate on role to avoid an extra AX IPC round-trip for
-        // every non-window element. `ax_bool` routes through the exception-safe
-        // wrappers and owns its CFRelease; a missing / error / non-boolean
-        // attribute yields `false`, matching how the other state reads degrade.
+        // "Active" means the window currently receiving input, not the main
+        // document window. Cocoa deliberately distinguishes key and main
+        // windows (a floating panel can be key while the document stays main),
+        // so compare against the owning application's AXFocusedWindow.
         let active = matches!(role, Role::Window | Role::Dialog)
-            && ax_bool(element, "AXMain").unwrap_or(false);
+            && pid.is_some_and(|pid| focused_window_is(element, pid));
 
         let states: StateSet = StateParts {
             enabled: attrs.enabled.unwrap_or(true),
@@ -3344,6 +3392,7 @@ impl MacOSProvider {
         parent_role: Role,
         parent_name: Option<&str>,
         clauses: &[&SimpleSelector],
+        pid: Option<u32>,
         depth: u32,
         max_depth: u32,
         limit: Option<usize>,
@@ -3377,7 +3426,7 @@ impl MacOSProvider {
                 let child_role = map_ax_role(&role_str, subrole_str.as_deref());
 
                 for (idx, simple) in clauses.iter().enumerate() {
-                    if matches_ax_with_role(child.as_ptr(), simple, Some(child_role)) {
+                    if matches_ax_with_role(child.as_ptr(), simple, Some(child_role), pid) {
                         child_results.push((idx, child.clone()));
                     }
                 }
@@ -3389,6 +3438,7 @@ impl MacOSProvider {
                     child_role,
                     child_name.as_deref(),
                     clauses,
+                    pid,
                     depth + 1,
                     max_depth,
                     limit,
@@ -3940,6 +3990,7 @@ impl Provider for MacOSProvider {
                 root_data.role,
                 root_data.name.as_deref(),
                 &firsts,
+                root_data.pid,
                 0,
                 max_depth_val,
                 walk_limit,
