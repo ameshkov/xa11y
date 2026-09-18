@@ -751,11 +751,16 @@ def test_state_changed_minimized_on_sibling_window(
             except xa11y.TimeoutError:
                 pytest.skip(f"no button named {sibling_btn!r} in this app's tree")
 
-            sibling = _window_named(app, sibling_name)
+            # Minimize as soon as the window is enumerable: the provider
+            # attaches the new window's handlers asynchronously, so this is
+            # the race the seed→attach baseline reconciliation exists for. A
+            # slow poll would let the attach win and stop exercising it.
+            sibling = None
             deadline = time.monotonic() + 5.0
             while sibling is None and time.monotonic() < deadline:
-                time.sleep(0.1)
                 sibling = _window_named(app, sibling_name)
+                if sibling is None:
+                    time.sleep(0.01)
             if sibling is None:
                 raise AssertionError(
                     f"no window named {sibling_name!r} appeared after "
